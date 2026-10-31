@@ -17,10 +17,11 @@ import {
   existsSync,
   readFileSync,
   unlinkSync,
+  statSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   isMuxAvailable,
   createSurface,
@@ -307,4 +308,40 @@ export function uniqueId(): string {
  */
 export function trackTempFile(env: TestEnv, path: string): void {
   env.tempFiles.push(path);
+}
+
+/**
+ * The session file a subagent spawn recorded under `name`, found by scanning
+ * every `subagent-registry.json` under the pi sessions directory. Returns the
+ * most recently written match, or null when no registry knows the name.
+ */
+export function findRegisteredSessionFile(name: string): string | null {
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const root = join(agentDir, "sessions");
+  const found: { best: { file: string; mtime: number } | null } = { best: null };
+  const walk = (dir: string, depth: number) => {
+    if (depth > 6) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(path, depth + 1);
+      } else if (entry.name === "subagent-registry.json") {
+        try {
+          const file = JSON.parse(readFileSync(path, "utf8"))?.[name]?.sessionFile;
+          const mtime = statSync(path).mtimeMs;
+          if (typeof file === "string" && (!found.best || mtime > found.best.mtime)) {
+            found.best = { file, mtime };
+          }
+        } catch {}
+      }
+    }
+  };
+  walk(root, 0);
+  return found.best?.file ?? null;
 }
