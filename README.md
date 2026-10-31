@@ -194,7 +194,7 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) 1.4 or later (earlier versions work, but don't report OSC 7501 program status)
+- [pi](https://github.com/badlogic/pi-mono) 1.1 or later for OSC 7501 program status (older versions work, but the `agent_blocked` check and Rex's tab status indicators need it). pi 1.4 adds Rex hyperlinks, truecolor and inline images.
 - [Rex](https://www.superlogical.com/rex/docs/installation), with the `rex` CLI on your `PATH`. The extension needs `REX_SESSION` and `REX_BLOCK`, which Rex sets in every terminal it opens.
 
 Start `pi` in any Rex tab or pane. Running pi outside Rex disables the `subagent` tools with a setup hint.
