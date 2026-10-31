@@ -7,10 +7,10 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [Rex](
 ## Installation
 
 ```bash
-pi install npm:@gerritwanderer/pi-interactive-subagents
+pi install git:github.com/GerritWanderer/pi-interactive-subagents
 ```
 
-Add `-l` to install for the current project only (`.pi/settings.json`). Update later with `pi update`.
+This installs from the `main` branch; the package is not on npm yet. Add `-l` to install for the current project only (`.pi/settings.json`). Update later with `pi update`.
 
 ## How it works
 
@@ -194,7 +194,7 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) 1.4 or later (earlier versions work, but don't report OSC 7501 program status)
+- [pi](https://github.com/badlogic/pi-mono) 1.1 or later for OSC 7501 program status (older versions work, but the `agent_blocked` check and Rex's tab status indicators need it). pi 1.4 adds Rex hyperlinks, truecolor and inline images.
 - [Rex](https://www.superlogical.com/rex/docs/installation), with the `rex` CLI on your `PATH`. The extension needs `REX_SESSION` and `REX_BLOCK`, which Rex sets in every terminal it opens.
 
 Start `pi` in any Rex tab or pane. Running pi outside Rex disables the `subagent` tools with a setup hint.
