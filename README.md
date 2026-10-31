@@ -7,10 +7,10 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [Rex](
 ## Installation
 
 ```bash
-pi install npm:@gerritwanderer/pi-interactive-subagents
+pi install git:github.com/GerritWanderer/pi-interactive-subagents
 ```
 
-Add `-l` to install for the current project only (`.pi/settings.json`). Update later with `pi update`.
+This installs from the `main` branch; the package is not on npm yet. Add `-l` to install for the current project only (`.pi/settings.json`). Update later with `pi update`.
 
 ## How it works
 
