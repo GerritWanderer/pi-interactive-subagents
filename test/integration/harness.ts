@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether Herdr is available
+ * - Detect whether Rex is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in Herdr panes
+ * - Start real pi sessions in Rex blocks
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -33,9 +33,12 @@ import {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
-} from "../../pi-extension/subagents/herdr.ts";
+  surfaceBlock,
+  sendMessage,
+  pollForExit,
+} from "../../pi-extension/subagents/rex.ts";
 
-// Re-export Herdr primitives for tests
+// Re-export Rex primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -47,6 +50,9 @@ export {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
+  surfaceBlock,
+  sendMessage,
+  pollForExit,
 };
 
 // ── Paths ──
@@ -79,11 +85,11 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether Herdr is available in the current environment.
- * Returns ["herdr"] or [].
+ * Detect whether Rex is available in the current environment.
+ * Returns ["rex"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["herdr"] : [];
+  return isMuxAvailable() ? ["rex"] : [];
 }
 
 export async function waitForFocusedSurface(
@@ -97,7 +103,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused Herdr pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused Rex block ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }

@@ -2,13 +2,13 @@
  * Integration tests for the full subagent lifecycle.
  *
  * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a Herdr pane, runs pi with a task that uses the subagent
+ * Each test creates a Rex block, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
  * Costs: ~$0.01-0.05 per test run (haiku).
  * Duration: ~30-90s per test.
  *
- * Run from a shell inside a Herdr pane:
+ * Run from a shell inside a Rex terminal:
  *   npm run test:integration
  *
  * Configuration:
@@ -37,8 +37,8 @@ import {
 const backends = getAvailableBackends();
 
 if (backends.length === 0) {
-  console.log("⚠️  Herdr is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside a Herdr pane to enable these tests.");
+  console.log("⚠️  Rex is not available — skipping subagent lifecycle integration tests");
+  console.log("   Run inside a Rex terminal to enable these tests.");
 }
 
 for (const backend of backends) {

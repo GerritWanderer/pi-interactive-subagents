@@ -25,7 +25,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./herdr.ts";
+} from "./rex.ts";
 
 import {
   countSessionEntryLines,
@@ -552,10 +552,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require Herdr. ${muxSetupHint()}`,
+        text: `Subagents require Rex. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "herdr not available" },
+    details: { error: "rex not available" },
   };
 }
 
@@ -1054,7 +1054,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
+        `Failed to deliver message to subagent "${running.name}" via Rex: ` +
         `${error?.message ?? String(error)}`,
     };
   }
