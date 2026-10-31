@@ -1,7 +1,7 @@
 {
-  "name": "@jordyvanvorselen/pi-interactive-subagents",
-  "version": "1.2.0",
-  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Herdr panes",
+  "name": "@gerritwanderer/pi-interactive-subagents",
+  "version": "2.0.0",
+  "description": "Interactive subagents for pi - spawn, orchestrate, and manage sub-agent sessions in Rex panes",
   "keywords": [
     "pi-package"
   ],
@@ -9,7 +9,7 @@
   "author": "Amos Blomqvist",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jordyvanvorselen/pi-interactive-subagents.git"
+    "url": "git+https://github.com/GerritWanderer/pi-interactive-subagents.git"
   },
   "type": "module",
   "scripts": {

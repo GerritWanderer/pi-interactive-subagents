@@ -30,7 +30,6 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -57,17 +56,17 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
-import { __pollForExitTest__, __layoutTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
+  __pollForExitTest__,
+  __layoutTest__,
+  createArgs,
   exitStateOf,
-  freshTabId,
-  isHerdrDesktopEnv,
+  isRexAvailable,
   lastLines,
-  launchArgv,
-  runArgs,
-  terminalName,
-  uniqueTerminalName,
-} from "../pi-extension/subagents/herdr-desktop.ts";
+  rexSplitDirection,
+  shellEscape,
+  surfaceHandle,
+} from "../pi-extension/subagents/rex.ts";
 
 // --- Helpers ---
 
@@ -1855,7 +1854,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("herdr.ts interpretExitSidecar", () => {
+describe("rex.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
@@ -2576,39 +2575,17 @@ describe("subagent status renderer", () => {
 });
 
 describe("subagent startup delay", () => {
-  // The delay only applies outside the Herdr desktop app, which these tests may run in.
-  const originalTerminalId = process.env.HC_TERMINAL_ID;
-  beforeEach(() => {
-    delete process.env.HC_TERMINAL_ID;
-  });
-  after(() => {
-    if (originalTerminalId != null) process.env.HC_TERMINAL_ID = originalTerminalId;
-  });
-
-  it("defaults to 500ms when no env var is set", () => {
+  it("never waits for a shell, because Rex starts blocks directly on the launch script", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
     const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
     try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
+      delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      assert.equal(testApi.getShellReadyDelayMs(), 0);
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+      assert.equal(testApi.getShellReadyDelayMs(), 0, "the env var is moot without a shell to wait for");
     } finally {
       if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
       else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
@@ -2777,102 +2754,83 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("herdr.ts layout", () => {
-  const { planEvenSplits, chooseSplitDirection, chooseSurfaceKind } = __layoutTest__;
-  const rect = (x: number, y: number, width: number, height: number) => ({ x, y, width, height });
-  const pane = (pane_id: string, r: ReturnType<typeof rect>) => ({ pane_id, focused: false, rect: r });
+describe("rex.ts layout", () => {
+  const { planEvenSplits, chooseSplitDirection, chooseSurfaceKind, findWindowOfBlock } = __layoutTest__;
+  const leaf = (block_id: string) => ({ block_id });
+  const split = (
+    direction: "horizontal" | "vertical",
+    ratio: number,
+    before: any,
+    after: any,
+  ) => ({ split: { split_id: `split:${Math.random()}`, direction, ratio, before, after } });
 
-  // Real snapshot shape from `herdr pane layout` after splitting w1:p1 right
-  // three times: panes 18/18/24/60 wide, tree left-nested under the root.
-  const lopsided = {
-    zoomed: false,
-    area: rect(0, 0, 120, 40),
-    focused_pane_id: "w1:p1",
-    panes: [
-      pane("w1:p1", rect(0, 0, 18, 40)),
-      pane("w1:p4", rect(18, 0, 18, 40)),
-      pane("w1:p3", rect(36, 0, 24, 40)),
-      pane("w1:p2", rect(60, 0, 60, 40)),
-    ],
-    splits: [
-      { id: "split_0_root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) },
-      { id: "split_1_0", direction: "right" as const, ratio: 0.6, rect: rect(0, 0, 60, 40) },
-      { id: "split_2_00", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 36, 40) },
-    ],
-  };
+  // Real shape from `rex session inspect --json` after splitting b1 right,
+  // then splitting the new block right again: 50% / 25% / 25%.
+  const lopsided = split("horizontal", 0.5, leaf("b1"), split("horizontal", 0.5, leaf("b2"), leaf("b3")));
 
   describe("planEvenSplits", () => {
-    it("targets the pane whose right edge sits on each split boundary, with a ratio delta", () => {
-      const steps = planEvenSplits(lopsided);
-      // root: 3 of 4 columns on the left -> 0.75 (grow from 0.5, owner p3)
-      // split_1_0: 2 of 3 columns -> 0.667 (grow from 0.6, owner p4)
-      // split_2_00: 1 of 2 columns -> 0.5 (already even, skipped)
-      assert.deepEqual(
-        steps.map((s) => [s.pane, s.direction, Number(s.amount.toFixed(3))]),
-        [
-          ["w1:p3", "right", 0.25],
-          ["w1:p4", "right", 0.067],
-        ],
+    it("gives each column an equal share, resizing across the blocks that touch each border", () => {
+      assert.deepEqual(planEvenSplits(lopsided), [
+        { direction: "horizontal", beforeBlock: "b1", afterBlock: "b2", ratio: 1 / 3 },
+      ]);
+    });
+
+    it("picks the blocks adjacent to the border when both sides are nested", () => {
+      const nested = split(
+        "horizontal",
+        0.5,
+        split("horizontal", 0.5, leaf("a1"), leaf("a2")),
+        leaf("b1"),
       );
+      assert.deepEqual(planEvenSplits(nested), [
+        { direction: "horizontal", beforeBlock: "a2", afterBlock: "b1", ratio: 2 / 3 },
+      ]);
     });
 
-    it("shrinks with `left` when the first side is too wide, since herdr ignores the sign of --amount", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 90, 40)), pane("w1:p2", rect(90, 0, 30, 40))],
-        splits: [{ id: "root", direction: "right", ratio: 0.75, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "left", amount: 0.25 }]);
+    it("counts stacked blocks as one column so a vertical split inside a column does not skew the share", () => {
+      const layout = split("horizontal", 0.5, leaf("b1"), split("vertical", 0.5, leaf("b2"), leaf("b3")));
+      assert.deepEqual(planEvenSplits(layout), []);
     });
 
-    it("balances vertical splits with up/down", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 120, 10)), pane("w1:p2", rect(0, 10, 120, 30))],
-        splits: [{ id: "root", direction: "down", ratio: 0.25, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "down", amount: 0.25 }]);
+    it("balances vertical splits too", () => {
+      const layout = split("vertical", 0.25, leaf("top"), leaf("bottom"));
+      assert.deepEqual(planEvenSplits(layout), [
+        { direction: "vertical", beforeBlock: "top", afterBlock: "bottom", ratio: 0.5 },
+      ]);
     });
 
-    it("counts stacked panes as one column so a down split inside a column does not skew the share", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [
-          pane("w1:p1", rect(0, 0, 60, 40)),
-          pane("w1:p2", rect(60, 0, 60, 20)),
-          pane("w1:p3", rect(60, 20, 60, 20)),
+    it("leaves a window alone when every split is already even, or holds one block", () => {
+      assert.deepEqual(planEvenSplits(split("horizontal", 0.5, leaf("b1"), leaf("b2"))), []);
+      assert.deepEqual(planEvenSplits(leaf("b1")), []);
+      assert.deepEqual(planEvenSplits(null), []);
+    });
+  });
+
+  describe("findWindowOfBlock", () => {
+    it("finds the window whose tiled layer holds a block", () => {
+      const view = {
+        windows: [
+          { window_id: "w1", layers: [{ kind: "tiled", layout: leaf("b0") }] },
+          { window_id: "w2", layers: [{ kind: "floating", layout: leaf("b3") }, { kind: "tiled", layout: lopsided }] },
         ],
-        splits: [
-          { id: "root", direction: "right", ratio: 0.5, rect: rect(0, 0, 120, 40) },
-          { id: "col", direction: "down", ratio: 0.5, rect: rect(60, 0, 60, 40) },
-        ],
-      });
-      assert.deepEqual(steps, []);
-    });
-
-    it("leaves a tab alone when every split is already even", () => {
-      const even = {
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 60, 40)), pane("w1:p2", rect(60, 0, 60, 40))],
-        splits: [{ id: "root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) }],
       };
-      assert.deepEqual(planEvenSplits(even), []);
+      assert.equal(findWindowOfBlock(view, "b3")?.windowId, "w2");
+      assert.equal(findWindowOfBlock(view, "b0")?.windowId, "w1");
+      assert.equal(findWindowOfBlock(view, "nope"), null);
     });
   });
 
   describe("chooseSplitDirection", () => {
-    it("splits a wide pane right and a narrow or tall pane down (herdr geometry rule; cells are ~2:1)", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "auto"), "down"); // 60x40
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "auto"), "down"); // 18x40
-      const wide = { ...lopsided, panes: [pane("w1:p1", rect(0, 0, 175, 64))] };
-      assert.equal(chooseSplitDirection(wide, "w1:p1", "auto"), "right");
+    it("splits a wide block right and a narrow or tall block down (cells are ~2:1)", () => {
+      assert.equal(chooseSplitDirection({ columns: 200, rows: 50 }, "auto"), "right");
+      assert.equal(chooseSplitDirection({ columns: 80, rows: 50 }, "auto"), "down");
     });
 
-    it("honours an explicit setting and falls back to right without a layout", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "right"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "down"), "down");
-      assert.equal(chooseSplitDirection(undefined, "w1:p1", "auto"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p99", "auto"), "right");
+    it("honours an explicit setting and falls back to right without a size", () => {
+      assert.equal(chooseSplitDirection({ columns: 80, rows: 50 }, "right"), "right");
+      assert.equal(chooseSplitDirection({ columns: 200, rows: 50 }, "down"), "down");
+      assert.equal(chooseSplitDirection(undefined, "auto"), "right");
+      assert.equal(chooseSplitDirection({ columns: 80, rows: 0 }, "auto"), "right");
     });
   });
 
@@ -2901,7 +2859,7 @@ describe("herdr.ts layout", () => {
   });
 });
 
-describe("herdr.ts", () => {
+describe("rex.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -2924,68 +2882,48 @@ describe("herdr.ts", () => {
       assert.ok(escaped.includes("$world"));
     });
   });
-});
 
-describe("herdr-desktop.ts", () => {
-  it("detects the desktop app by the HC_TERMINAL_ID herdr-core exports", () => {
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: "t2" }), true);
-    assert.equal(isHerdrDesktopEnv({ HERDR_ENV: "1" }), false);
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: " " }), false);
+  it("detects Rex by the REX_SESSION and REX_BLOCK it exports into every terminal", () => {
+    assert.equal(isRexAvailable({}), false);
+    assert.equal(isRexAvailable({ REX_SESSION: "session:1" }), false, "a block is needed to split beside");
+    assert.equal(isRexAvailable({ REX_SESSION: " ", REX_BLOCK: "block:1" }), false);
   });
 
-  it("turns a subagent name into a valid hc terminal name", () => {
-    assert.equal(terminalName("Scout: Map the API!"), "scout-map-the-api");
-    assert.equal(terminalName("worker_2"), "worker_2");
-    assert.equal(terminalName("a".repeat(40))?.length, 32, "hc caps names at 32 characters");
-    assert.equal(terminalName("x".repeat(31) + "-y"), "x".repeat(31), "no trailing dash after the cut");
-    assert.equal(terminalName("!!!"), null, "nothing usable is left");
-  });
-
-  it("skips names live terminals already hold, within hc's 32 characters", () => {
-    assert.equal(uniqueTerminalName("scout", new Set()), "scout");
-    assert.equal(uniqueTerminalName("scout", new Set(["scout", "scout-2"])), "scout-3");
-    const long = "x".repeat(32);
-    assert.equal(uniqueTerminalName(long, new Set([long])), "x".repeat(30) + "-2");
-  });
-
-  it("starts subagents without notes, focus or a tie to the parent's lifetime", () => {
-    const args = runArgs({
-      cwd: "/repo", space: "sp1", tab: "tb1", name: "scout", argv: ["bash", "/s.sh"],
-    });
-    assert.deepEqual(args, [
-      "run", "--bg", "--keep", "--no-notify", "--outlive-parent",
-      "--cwd", "/repo", "--name", "scout",
-      "--label", "herdr.space=sp1", "--label", "herdr.tab=tb1",
-      "--", "bash", "/s.sh",
-    ]);
-  });
-
-  it("runs the launch script through the login shell, so the child gets the person's PATH", () => {
+  it("opens a top-level subagent in an unfocused window that stays open for its exit status", () => {
     assert.deepEqual(
-      launchArgv("/tmp/it's.sh", { shell: "/bin/zsh", platform: "darwin" }),
-      ["/bin/zsh", "-l", "-i", "-c", "exec bash '/tmp/it'\\''s.sh'"],
+      createArgs({ session: "s1", kind: "tab", label: "map-auth", cwd: "/repo", argv: ["bash", "/s.sh"] }),
+      ["window", "new", "-s", "s1", "map-auth", "--focus=false", "--keep-open", "-c", "/repo", "--json", "--", "bash", "/s.sh"],
     );
-    assert.equal(launchArgv("/s.sh", { platform: "linux" })[0], "/bin/sh", "no $SHELL falls back to sh");
-    assert.deepEqual(launchArgv("C:\\s.sh", { platform: "win32" }), ["bash", "C:\\s.sh"]);
   });
 
-  it("knows a subagent ended from herdr-core's record, not its screen", () => {
-    assert.deepEqual(exitStateOf({ state: "live" }), { finished: false });
-    assert.deepEqual(exitStateOf({ state: "finished", exit_code: 0 }), { finished: true, exitCode: 0 });
+  it("splits a nested subagent off its parent's block in rex's direction words", () => {
     assert.deepEqual(
-      exitStateOf({ state: "finished", exit_code: null }),
+      createArgs({ session: "s1", kind: "pane", label: "scout", cwd: "/repo", anchor: "block:p", direction: "down" }),
+      ["split", "-s", "s1", "-b", "block:p", "--split", "below", "--label", "scout", "--focus=false", "--keep-open", "-c", "/repo", "--json"],
+    );
+    assert.equal(rexSplitDirection("up"), "above");
+    assert.equal(rexSplitDirection("left"), "left");
+  });
+
+  it("hands out reservation handles that cannot be mistaken for block ids", () => {
+    const handle = surfaceHandle("Scout: Map the API!");
+    assert.match(handle, /^rex-surface:scout-map-the-api-[0-9a-f]{8}$/);
+    assert.notEqual(handle, surfaceHandle("Scout: Map the API!"));
+    assert.match(surfaceHandle("!!!"), /^rex-surface:subagent-/);
+  });
+
+  it("knows a subagent ended from the block's exit record, not its screen", () => {
+    assert.deepEqual(exitStateOf({ last_exit: null, child: { pid: 1 } }), { finished: false });
+    assert.deepEqual(exitStateOf({ last_exit: { exit_code: 0 } }), { finished: true, exitCode: 0 });
+    assert.deepEqual(exitStateOf({ last_exit: { exit_code: 7, error: "exit status 7" } }), { finished: true, exitCode: 7 });
+    assert.deepEqual(
+      exitStateOf({ last_exit: { exit_code: -1, error: "signal: killed" } }),
       { finished: true, exitCode: 1 },
-      "a killed terminal has no exit code and counts as a failure",
+      "a program ended by a signal has no exit code and counts as a failure",
     );
   });
 
-  it("makes a tab id the app has not seen, so it opens a new tab", () => {
-    const id = freshTabId();
-    assert.match(id, /^tb[0-9a-f]{32}$/);
-    assert.notEqual(id, freshTabId());
-  });
-
-  it("keeps only the last lines of what hc read prints", () => {
+  it("keeps only the last lines of a capture", () => {
     const screen = "one\ntwo\nthree\n__SUBAGENT_DONE_0__\n\n\n";
     assert.equal(lastLines(screen, 2), "three\n__SUBAGENT_DONE_0__\n");
     assert.equal(lastLines(screen, 0), "__SUBAGENT_DONE_0__\n", "at least one line");
