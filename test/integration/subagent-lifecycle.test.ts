@@ -1,11 +1,11 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
+ * These tests spawn REAL pi sessions with REAL LLM calls (gemini-3.8-flash by default).
  * Each test creates a Rex block, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
+ * Costs: ~$0.01-0.05 per test run (gemini-3.8-flash).
  * Duration: ~30-90s per test.
  *
  * Run from a shell inside a Rex terminal:
@@ -237,36 +237,58 @@ for (const backend of backends) {
       assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
     });
 
-    // ── caller_ping ──
+    // ── ask_question ──
 
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    it("subagent ask_question round-trips through the parent's subagent_message", async () => {
       const id = uniqueId();
+      const name = `Ask-${id}`;
+      const answer = `ANSWER_${id}`;
+      const markerFile = `/tmp/pi-integ-ask-${id}.txt`;
+      trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = createTrackedSurface(env, `ask-${id}`);
       await sleep(1000);
 
+      // The answer appears only in the parent's prompt, so it can reach the
+      // file only via question -> parent -> subagent_message -> child.
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
+        `  name: "${name}"`,
+        `  agent: "test-ask"`,
+        `  task: "Write the answer to the file ${markerFile}"`,
+        `The sub-agent will ask you a question. Answer it by calling subagent_message`,
+        `with name "${name}" and message "${answer}". Do not do anything else yourself.`,
+        `After you receive the sub-agent's result, say ASK_COMPLETE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
+      const content = await waitForFile(markerFile, PI_TIMEOUT, new RegExp(answer));
+      assert.equal(content.trim(), answer, "the child should write exactly the parent's reply");
 
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
+      // The child's session shows the question, then the reply as its next
+      // user message (delivered into the still-open session, not a resume).
+      const sessionFile = findRegisteredSessionFile(name);
+      assert.ok(sessionFile && existsSync(sessionFile), `${name} should have a registered session file`);
+      const messages = readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l))
+        .filter((e) => e.type === "message")
+        .map((e) => e.message);
+      const askIndex = messages.findIndex(
+        (m) => m.role === "assistant" && m.content?.some((c: any) => c.type === "toolCall" && c.name === "ask_question"),
       );
+      assert.ok(askIndex >= 0, "the child should have called ask_question");
+      const replyIndex = messages.findIndex(
+        (m, i) =>
+          i > askIndex &&
+          m.role === "user" &&
+          m.content?.some((c: any) => c.type === "text" && c.text.includes(answer)),
+      );
+      assert.ok(replyIndex > askIndex, "the parent's reply should arrive as a user message after the question");
+
+      await waitForScreen(surface, /ASK_COMPLETE/, PI_TIMEOUT);
     });
 
     // ── Agent discovery ──
