@@ -32,6 +32,7 @@ import {
   readScreen,
   PI_TIMEOUT,
   type TestEnv,
+  findRegisteredSessionFile,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
@@ -200,10 +201,9 @@ for (const backend of backends) {
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
+        `  agent: "test-fork"`,
         `  name: "Fork-${id}"`,
-        `  fork: true`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
@@ -220,22 +220,21 @@ for (const backend of backends) {
         PI_TIMEOUT,
       );
 
-      // Verify: the forked session has a parent link
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
+      // Verify: the forked session has a parent link. Every spawn records
+      // name -> session file in the parent's subagent-registry.json.
+      const sessionFile = findRegisteredSessionFile(`Fork-${id}`);
+      assert.ok(sessionFile, `Fork-${id} should be in a subagent registry`);
+      assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
 
-        const entries = readFileSync(sessionFile, "utf8")
-          .trim()
-          .split("\n")
-          .map((l) => JSON.parse(l));
-        const header = entries[0];
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.parentSession, "Fork session should have parentSession field");
-        // Fork sessions include parent context (model_change entries etc.)
-        assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
-      }
+      const entries = readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      const header = entries[0];
+      assert.equal(header.type, "session", "First entry should be session header");
+      assert.ok(header.parentSession, "Fork session should have parentSession field");
+      // Fork sessions include parent context (model_change entries etc.)
+      assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
     });
 
     // ── caller_ping ──
