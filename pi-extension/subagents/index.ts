@@ -25,7 +25,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./herdr.ts";
+} from "./rex.ts";
 
 import {
   countSessionEntryLines,
@@ -552,10 +552,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require Herdr. ${muxSetupHint()}`,
+        text: `Subagents require Rex. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "herdr not available" },
+    details: { error: "rex not available" },
   };
 }
 
@@ -1054,7 +1054,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
+        `Failed to deliver message to subagent "${running.name}" via Rex: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1248,12 +1248,7 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
   const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
 
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
@@ -1328,6 +1323,7 @@ async function launchSubagent(
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
     sendLongCommand(surface, command, {
+      cwd: targetCwdForSession,
       scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
@@ -1469,6 +1465,7 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
+    cwd: targetCwdForSession,
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -2201,7 +2198,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2275,6 +2271,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
         sendLongCommand(surface, command, {
+          cwd: loadout.cwd ?? undefined,
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,

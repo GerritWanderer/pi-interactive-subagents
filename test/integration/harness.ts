@@ -33,7 +33,7 @@ import {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
-} from "../../pi-extension/subagents/herdr.ts";
+} from "../../pi-extension/subagents/rex.ts";
 
 // Re-export Herdr primitives for tests
 export {
@@ -79,11 +79,11 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether Herdr is available in the current environment.
- * Returns ["herdr"] or [].
+ * Detect whether Rex is available in the current environment.
+ * Returns ["rex"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["herdr"] : [];
+  return isMuxAvailable() ? ["rex"] : [];
 }
 
 export async function waitForFocusedSurface(
@@ -97,7 +97,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused Herdr pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused Rex pane ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
