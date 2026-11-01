@@ -127,27 +127,36 @@ export function lostObservationMarkerPath(sessionFile: string): string {
   return `${sessionFile}.lost-observation`;
 }
 
-/** Persist a lost-observation marker beside the subagent's session file. */
+/** Persist a lost-observation marker beside the subagent's session file.
+ * Throws if the marker cannot be written.
+ */
 export function writeLostObservationMarker(sessionFile: string): void {
-  try {
-    writeFileSync(lostObservationMarkerPath(sessionFile), JSON.stringify({ lostAt: new Date().toISOString() }), "utf8");
-  } catch {}
+  writeFileSync(lostObservationMarkerPath(sessionFile), JSON.stringify({ lostAt: new Date().toISOString() }), "utf8");
 }
 
-/** Check whether a lost-observation marker exists beside the session file. */
+/** Check whether a lost-observation marker exists beside the session file.
+ * Fails closed: if checking marker existence throws an unexpected error (permission/corrupt), returns true.
+ */
 export function hasLostObservationMarker(sessionFile: string): boolean {
+  const marker = lostObservationMarkerPath(sessionFile);
   try {
-    return existsSync(lostObservationMarkerPath(sessionFile));
-  } catch {
-    return false;
+    return existsSync(marker);
+  } catch (err) {
+    // Fail closed: treat unreadable / error as potentially unsafe
+    console.error(`Failed to check lost-observation marker at ${marker}, failing closed:`, err);
+    return true;
   }
 }
 
-/** Clear the lost-observation marker beside the session file. */
+/** Clear the lost-observation marker beside the session file.
+ * Also removes the session from the in-memory lost-observation set if provided.
+ */
 export function clearLostObservationMarker(sessionFile: string): void {
   try {
     rmSync(lostObservationMarkerPath(sessionFile), { force: true });
-  } catch {}
+  } catch (err) {
+    console.error(`Failed to clear lost-observation marker for ${sessionFile}:`, err);
+  }
 }
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */

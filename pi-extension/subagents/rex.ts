@@ -624,18 +624,23 @@ export function validateTrustworthyProgramStatus(
     };
   }
 
-  // 1. Check for any blocked dialog (attributed or unattributed), or error attributed to expectedApp or unattributed
+  // 1. Check for any blocked dialog (attributed to expectedApp or unattributed), or error attributed to expectedApp or unattributed
   for (const r of records) {
     if (!r) continue;
+    const app = (r as any).effective_app ?? r.app;
     if (r.state === "blocked") {
-      const dialogKind = r.kind ? `${r.kind} ` : "";
-      return {
-        ok: false,
-        error: `Subagent is blocked on a ${dialogKind}dialog (${r.msg || r.state}). Steering refused.`,
-      };
+      // Reject blocked records only if attributed to expectedApp or unattributed.
+      // If a blocked record is explicitly attributed to another application (app !== expectedApp),
+      // do not let it block a healthy expectedApp process.
+      if (!app || app === expectedApp) {
+        const dialogKind = r.kind ? `${r.kind} ` : "";
+        return {
+          ok: false,
+          error: `Subagent is blocked on a ${dialogKind}dialog (${r.msg || r.state}). Steering refused.`,
+        };
+      }
     }
     if (r.state === "error") {
-      const app = (r as any).effective_app ?? r.app;
       // Refuse steering if the error is attributed to expectedApp or unattributed.
       // If specifically attributed to another app, do not block unless expectedApp itself has no healthy status.
       if (!app || app === expectedApp) {
@@ -941,12 +946,13 @@ export async function pollForExit(
         consecutiveErrors = 0; // reset only on valid process response
         if (proc.last_exit !== null && proc.last_exit !== undefined) {
           if (cachedSidecarResult) {
-            // Sidecar payload recorded earlier: if process had an error code and sidecar had none, propagate process code
-            if (proc.last_exit.exit_code !== 0 && cachedSidecarResult.exitCode === 0) {
+            // If process exited with a non-zero code, preserve the real exit code
+            // while retaining the sidecar's error message/reason
+            if (proc.last_exit.exit_code !== 0) {
               return {
                 reason: "error",
                 exitCode: proc.last_exit.exit_code,
-                errorMessage: proc.last_exit.error || cachedSidecarResult.errorMessage,
+                errorMessage: cachedSidecarResult.errorMessage || proc.last_exit.error,
               };
             }
             return cachedSidecarResult;

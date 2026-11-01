@@ -115,7 +115,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 - **Terminal Result**: When the subagent run completes, the parent automatically receives a single terminal result steered into the conversation as a `subagent_result` message that triggers a new turn. The result carries:
   - `outcome`: `"success"`, `"failure"`, or `"interrupted"`.
   - `summary`: Final assistant response, error message, or interruption diagnostic.
-  - `exitCode`: Real agent exit status.
+  - `exitCode`: Real agent exit status (synthetic `1` is assigned for interruption and observation failure).
   - `sessionFile` / `sessionId`: Linkage for subsequent follow-up.
 - **Safe-Steering Limitations**:
   - Program status (`OSC 7501`) is checked before submitting input. If the child is blocked on a permission, question, or authentication dialog, delivery is refused with an actionable error and NO input is sent.

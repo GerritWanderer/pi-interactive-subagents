@@ -132,7 +132,8 @@ for (const backend of backends) {
       } finally {
         if (savedNestedName === undefined) delete process.env.PI_SUBAGENT_NAME;
         else process.env.PI_SUBAGENT_NAME = savedNestedName;
-        process.env.REX_BLOCK = savedBlock;
+        if (savedBlock === undefined) delete process.env.REX_BLOCK;
+        else process.env.REX_BLOCK = savedBlock;
       }
     });
 
@@ -243,7 +244,8 @@ for (const backend of backends) {
       } finally {
         if (savedNestedName === undefined) delete process.env.PI_SUBAGENT_NAME;
         else process.env.PI_SUBAGENT_NAME = savedNestedName;
-        process.env.REX_BLOCK = savedBlock;
+        if (savedBlock === undefined) delete process.env.REX_BLOCK;
+        else process.env.REX_BLOCK = savedBlock;
       }
 
       const childHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(child);

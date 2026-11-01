@@ -702,6 +702,12 @@ const runningSubagents = new Map<string, RunningSubagent>();
 /** Set of resolved session file paths whose process observation was lost and not confirmed exited. */
 const lostObservationSessions = new Set<string>();
 
+/** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended. */
+export function confirmProcessEnded(sessionFile: string): void {
+  clearLostObservationMarker(sessionFile);
+  lostObservationSessions.delete(resolve(sessionFile));
+}
+
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
 // same process and needs to know whether this session still has children in
@@ -1257,6 +1263,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   lostObservationSessions,
+  confirmProcessEnded,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1783,19 +1790,29 @@ async function watchSubagent(
     if (isRexInfrastructureError(err)) {
       // Sustained infrastructure failure observing the process.
       // Do NOT kill or close a potentially live agent!
+      let markerError: any = null;
       if (sessionFile) {
         lostObservationSessions.add(resolve(sessionFile));
-        writeLostObservationMarker(sessionFile);
+        try {
+          writeLostObservationMarker(sessionFile);
+        } catch (mErr: any) {
+          markerError = mErr;
+          console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, mErr);
+        }
       }
       runningSubagents.delete(running.id);
+      const errorMsg = markerError
+        ? `${err?.message ?? String(err)} (and failed to persist safety marker: ${markerError?.message ?? String(markerError)})`
+        : (err?.message ?? String(err));
       return {
         name,
         task,
-        summary: `Infrastructure observation failure: ${err?.message ?? String(err)}. Pane was kept open.`,
+        summary: `Infrastructure observation failure: ${errorMsg}. Pane was kept open.`,
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: err?.message ?? String(err),
+        error: errorMsg,
         outcome: "failure",
+        ...(sessionFile ? { sessionFile } : {}),
       };
     }
 
@@ -2389,7 +2406,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           // so the resumed process resolves the same agents/extensions and keeps
           // the same nested-spawn restriction it originally ran with.
           const resumeEnvParts: string[] = [];
-          const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
+          const resumeAgentDir = loadout.agentDir === null ? null : (loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null);
           if (resumeAgentDir) {
             resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
           }
