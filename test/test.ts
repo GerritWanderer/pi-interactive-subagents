@@ -3075,40 +3075,87 @@ describe("rex.ts unit tests", () => {
 
   it("validateAnchorBlock throws actionable error for nonexistent anchor", async () => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
-    assert.throws(
-      () => __rexTest__.validateAnchorBlock("block:nonexistent", "session:01a1915d-7bc9-7daa-8d0e-818c6e25377d"),
-      /Target Rex block "block:nonexistent" does not exist/,
-    );
+    __rexTest__.setRexContextOverride({
+      server: "unix:///tmp/mock.sock",
+      session: "session:mock-session",
+      block: "block:mock-anchor",
+    });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    __rexTest__.setRexExecutor((args) => {
+      if (args[0] === "block" && args[1] === "inspect" && args.includes("block:nonexistent")) {
+        throw new Error('block target "block:nonexistent" not found');
+      }
+      return "{}";
+    });
+
+    try {
+      assert.throws(
+        () => __rexTest__.validateAnchorBlock("block:nonexistent", "session:mock-session"),
+        /Target Rex block "block:nonexistent" does not exist/,
+      );
+    } finally {
+      __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
+    }
   });
 
   it("closeSurface closes only the block for split handles and respects nested blocks in tab handles", async () => {
-    const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
-    // Tab handle
-    registerSurfaceHandle({
-      id: "test-tab-handle",
-      kind: "tab",
-      name: "tab-agent",
-      sessionId: "session:test",
-      windowId: "window:test-win",
-      blockId: "block:test-block-1",
-      status: "launched",
+    const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const executed: string[][] = [];
+    __rexTest__.setRexContextOverride({
+      server: "unix:///tmp/mock.sock",
+      session: "session:test",
+      block: "block:test-block-1",
     });
-    // Split handle
-    registerSurfaceHandle({
-      id: "test-split-handle",
-      kind: "split",
-      name: "split-agent",
-      sessionId: "session:test",
-      windowId: "window:test-win", // windowId might be cached by getSurfaceTab
-      blockId: "block:test-block-2",
-      status: "launched",
+    __rexTest__.setCommandAvailabilityOverride(true);
+    __rexTest__.setRexExecutor((args) => {
+      executed.push(args);
+      if (args[0] === "window" && args[1] === "inspect") {
+        return JSON.stringify({
+          layers: [{ blocks: [{ block_id: "block:test-block-1" }, { block_id: "block:test-block-2" }] }],
+        });
+      }
+      return "{}";
     });
 
-    closeSurface("test-split-handle");
-    assert.equal(getSurfaceHandle("test-split-handle"), undefined);
+    try {
+      // Tab handle
+      registerSurfaceHandle({
+        id: "test-tab-handle",
+        kind: "tab",
+        name: "tab-agent",
+        sessionId: "session:test",
+        windowId: "window:test-win",
+        blockId: "block:test-block-1",
+        status: "launched",
+      });
+      // Split handle
+      registerSurfaceHandle({
+        id: "test-split-handle",
+        kind: "split",
+        name: "split-agent",
+        sessionId: "session:test",
+        windowId: "window:test-win", // windowId might be cached by getSurfaceTab
+        blockId: "block:test-block-2",
+        status: "launched",
+      });
 
-    closeSurface("test-tab-handle");
-    assert.equal(getSurfaceHandle("test-tab-handle"), undefined);
+      closeSurface("test-split-handle");
+      assert.equal(getSurfaceHandle("test-split-handle"), undefined);
+      assert.ok(executed.some((c) => c[0] === "block" && c[1] === "close" && c.includes("block:test-block-2")));
+
+      closeSurface("test-tab-handle");
+      assert.equal(getSurfaceHandle("test-tab-handle"), undefined);
+      // Because window has 2 blocks, tab handle close closes only block 1
+      assert.ok(executed.some((c) => c[0] === "block" && c[1] === "close" && c.includes("block:test-block-1")));
+    } finally {
+      unregisterSurfaceHandle("test-tab-handle");
+      unregisterSurfaceHandle("test-split-handle");
+      __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
+    }
   });
 
   it("validateTrustworthyProgramStatus rejects mixed or unattributed blocked/error records", async () => {
@@ -3131,16 +3178,26 @@ describe("rex.ts unit tests", () => {
   });
 
   it("createSurfaceSplit resolves fromSurface handle string to its blockId", async () => {
-    const { registerSurfaceHandle, unregisterSurfaceHandle, createSurfaceSplit, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
-    const parentBlock = process.env.REX_BLOCK;
-    if (!parentBlock) return;
+    const { registerSurfaceHandle, unregisterSurfaceHandle, createSurfaceSplit, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    __rexTest__.setRexContextOverride({
+      server: "unix:///tmp/mock.sock",
+      session: "session:mock-session",
+      block: "block:mock-anchor",
+    });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    __rexTest__.setRexExecutor((args) => {
+      if (args[0] === "block" && args[1] === "inspect") {
+        return JSON.stringify({ block: { block_id: args[args.length - 1] } });
+      }
+      return "{}";
+    });
 
     registerSurfaceHandle({
       id: "parent-handle-id",
       kind: "tab",
       name: "parent-handle",
-      sessionId: process.env.REX_SESSION!,
-      blockId: parentBlock,
+      sessionId: "session:mock-session",
+      blockId: "block:parent-blk-1",
       status: "launched",
     });
 
@@ -3148,7 +3205,7 @@ describe("rex.ts unit tests", () => {
       id: "unlaunched-parent-id",
       kind: "tab",
       name: "unlaunched-parent",
-      sessionId: process.env.REX_SESSION!,
+      sessionId: "session:mock-session",
       status: "reserved",
     });
 
@@ -3156,7 +3213,7 @@ describe("rex.ts unit tests", () => {
       const splitHandleId = createSurfaceSplit("child-split-test", "right", "parent-handle-id");
       const splitHandle = getSurfaceHandle(splitHandleId);
       assert.ok(splitHandle);
-      assert.equal(splitHandle.anchorBlockId, parentBlock, "fromSurface handle string should resolve to parent's blockId");
+      assert.equal(splitHandle.anchorBlockId, "block:parent-blk-1", "fromSurface handle string should resolve to parent's blockId");
 
       assert.throws(
         () => createSurfaceSplit("child-fail-test", "right", "unlaunched-parent-id"),
@@ -3165,6 +3222,9 @@ describe("rex.ts unit tests", () => {
     } finally {
       unregisterSurfaceHandle("parent-handle-id");
       unregisterSurfaceHandle("unlaunched-parent-id");
+      __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
     }
   });
 
@@ -3265,6 +3325,7 @@ describe("rex.ts unit tests", () => {
         session: "session:mock-session",
         block: "block:mock-anchor",
       });
+      __rexTest__.setCommandAvailabilityOverride(true);
 
       // (a) Absent/missing status report rejects delivery and sends zero input events
       __rexTest__.setRexExecutor((args) => {
@@ -3345,8 +3406,9 @@ describe("rex.ts unit tests", () => {
       assert.equal(enterPayload.event.payload.key, "enter");
     } finally {
       unregisterSurfaceHandle("steer-handle-test");
-      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
     }
   });
 
@@ -3363,8 +3425,10 @@ describe("rex.ts unit tests", () => {
         session: "session:mock-session",
         block: "block:mock-anchor",
       });
+      __rexTest__.setCommandAvailabilityOverride(true);
 
       // Force an error where error.stdout contains JSON with window_id and block_ids
+      // while error.message contains unrelated/extraneous JSON
       __rexTest__.setRexExecutor((args) => {
         executedCommands.push(args);
         if (args[0] === "block" && args[1] === "inspect") {
@@ -3376,7 +3440,7 @@ describe("rex.ts unit tests", () => {
           });
         }
         if (args[0] === "window" && args[1] === "new") {
-          const err = new Error("rex window new failed with nonzero exit code");
+          const err = new Error('rex window new failed: {"message_extra_json": "ignore_me"}');
           (err as any).stdout = JSON.stringify({
             window_id: "window:stdout-win",
             block_ids: ["block:stdout-blk"],
@@ -3407,8 +3471,9 @@ describe("rex.ts unit tests", () => {
         "closeSurface should have closed the created window extracted from error.stdout",
       );
     } finally {
-      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
     }
   });
 
@@ -3425,6 +3490,7 @@ describe("rex.ts unit tests", () => {
         session: "session:mock-session",
         block: "block:mock-anchor",
       });
+      __rexTest__.setCommandAvailabilityOverride(true);
 
       // Force an error after Rex creation (e.g. by intercepting launch)
       __rexTest__.setRexExecutor((args) => {
@@ -3465,8 +3531,9 @@ describe("rex.ts unit tests", () => {
         "closeSurface should have closed the created window after launch failure",
       );
     } finally {
-      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
     }
   });
 
@@ -3478,6 +3545,7 @@ describe("rex.ts unit tests", () => {
       session: "session:mock-session",
       block: "block:mock-anchor",
     });
+    __rexTest__.setCommandAvailabilityOverride(true);
 
     __rexTest__.setRexExecutor((args) => {
       if (args[0] === "block" && args[1] === "inspect") {
@@ -3517,8 +3585,9 @@ describe("rex.ts unit tests", () => {
     } finally {
       unregisterSurfaceHandle("parent-handle-stub");
       unregisterSurfaceHandle("unlaunched-parent-stub");
-      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
     }
   });
 });

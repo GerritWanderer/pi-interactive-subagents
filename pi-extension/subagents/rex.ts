@@ -22,8 +22,16 @@ export interface RexContext {
 }
 
 const commandAvailability = new Map<string, boolean>();
+let commandAvailabilityOverride: boolean | null | undefined = undefined;
+
+export function setCommandAvailabilityOverride(override: boolean | null | undefined): void {
+  commandAvailabilityOverride = override;
+}
 
 function hasCommand(command: string): boolean {
+  if (commandAvailabilityOverride !== undefined && commandAvailabilityOverride !== null) {
+    return commandAvailabilityOverride;
+  }
   if (commandAvailability.has(command)) {
     return commandAvailability.get(command)!;
   }
@@ -425,6 +433,38 @@ export function sendLongCommand(
   return scriptPath;
 }
 
+function extractResourceIdsFromError(err: any): { windowId?: string; blockId?: string } {
+  // Inspect err.stdout independently first
+  if (typeof err?.stdout === "string" && err.stdout.trim()) {
+    try {
+      const match = err.stdout.match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        const windowId = typeof parsed?.window_id === "string" ? parsed.window_id : undefined;
+        const blockId = Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0 ? parsed.block_ids[0] : undefined;
+        if (windowId || blockId) {
+          return { windowId, blockId };
+        }
+      }
+    } catch {}
+  }
+
+  // Only if stdout yields nothing, inspect err.message
+  if (typeof err?.message === "string" && err.message.trim()) {
+    try {
+      const match = err.message.match(/\{[\s\S]*\}/);
+      if (match) {
+        const parsed = JSON.parse(match[0]);
+        const windowId = typeof parsed?.window_id === "string" ? parsed.window_id : undefined;
+        const blockId = Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0 ? parsed.block_ids[0] : undefined;
+        return { windowId, blockId };
+      }
+    } catch {}
+  }
+
+  return {};
+}
+
 function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: string): void {
   const sessionId = handle.sessionId;
   const label = handle.name;
@@ -441,16 +481,9 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     try {
       res = rexJson(args);
     } catch (err: any) {
-      // Try to parse partial response from error.stdout, error.message, or attached json
-      try {
-        const textToSearch = `${err?.stdout ?? ""} ${err?.message ?? ""}`;
-        const match = textToSearch.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          if (parsed?.window_id) handle.windowId = parsed.window_id;
-          if (Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0) handle.blockId = parsed.block_ids[0];
-        }
-      } catch {}
+      const extracted = extractResourceIdsFromError(err);
+      if (extracted.windowId) handle.windowId = extracted.windowId;
+      if (extracted.blockId) handle.blockId = extracted.blockId;
       throw err;
     }
 
@@ -490,14 +523,8 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     try {
       res = rexJson(args);
     } catch (err: any) {
-      try {
-        const textToSearch = `${err?.stdout ?? ""} ${err?.message ?? ""}`;
-        const match = textToSearch.match(/\{[\s\S]*\}/);
-        if (match) {
-          const parsed = JSON.parse(match[0]);
-          if (Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0) handle.blockId = parsed.block_ids[0];
-        }
-      } catch {}
+      const extracted = extractResourceIdsFromError(err);
+      if (extracted.blockId) handle.blockId = extracted.blockId;
       throw err;
     }
 
@@ -890,4 +917,5 @@ export const __rexTest__ = {
   validateAnchorBlock,
   setRexExecutor,
   setRexContextOverride,
+  setCommandAvailabilityOverride,
 };
