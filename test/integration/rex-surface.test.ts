@@ -206,17 +206,32 @@ for (const backend of backends) {
     });
 
     it("closing a parent tab surface preserves surviving nested child blocks in the same window", async () => {
-      const top = createTrackedSurface(env, "parent-close-test");
+      const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      delete process.env.PI_SUBAGENT_NAME;
+
+      let top: string;
+      try {
+        top = createTrackedSurface(env, "parent-close-test");
+      } finally {
+        if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
+        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+      }
+
+      const topHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(top);
+      assert.ok(topHandle);
+      assert.equal(topHandle.kind, "tab", "top surface must be a tab");
+
       sendLongCommand(top, `echo "PARENT_ALIVE"`);
       await waitForScreen(top, /PARENT_ALIVE/, 10_000, 20);
 
       const topWindowId = getSurfaceTab(top);
       assert.ok(topWindowId);
-      const topHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(top);
-      assert.ok(topHandle?.blockId);
+      assert.ok(topHandle.blockId);
 
       // Create child split off parent
-      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedNestedName = process.env.PI_SUBAGENT_NAME;
       const savedBlock = process.env.REX_BLOCK;
       let child: string;
       try {
@@ -226,13 +241,14 @@ for (const backend of backends) {
         sendLongCommand(child, `echo "CHILD_ALIVE"`);
         await waitForScreen(child, /CHILD_ALIVE/, 10_000, 20);
       } finally {
-        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
-        else process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedNestedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedNestedName;
         process.env.REX_BLOCK = savedBlock;
       }
 
       const childHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(child);
       assert.ok(childHandle?.blockId);
+      assert.equal(childHandle.kind, "split", "nested child must be a split");
 
       // Close parent tab surface
       closeSurface(top);
@@ -350,6 +366,8 @@ for (const backend of backends) {
       process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
       process.env.PI_SUBAGENT_SPLIT_DIRECTION = "right";
 
+      const ctx = getRexContext();
+
       try {
         const splitSurface = createTrackedSurface(env, "split-right-dir");
         const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(splitSurface);
@@ -357,6 +375,38 @@ for (const backend of backends) {
 
         sendLongCommand(splitSurface, `echo "SPLIT_RIGHT_OK"`);
         await waitForScreen(splitSurface, /SPLIT_RIGHT_OK/, 10_000, 20);
+
+        // Inspect window layout rects: verify child block is to the right of anchor block (anchor.x < child.x)
+        assert.ok(handle?.blockId);
+        const { rexExec } = await import("../../pi-extension/subagents/rex.ts");
+        const rawAnchor = rexExec(["block", "inspect", "-s", handle.sessionId, handle.anchorBlockId!, "--json"]);
+        const windowId = JSON.parse(rawAnchor)?.block?.window_id;
+        assert.ok(windowId);
+
+        const rawWin = rexExec(["window", "inspect", "-s", handle.sessionId, windowId, "--json"]);
+        const win = JSON.parse(rawWin);
+
+        function findBlockRect(node: any, targetId: string): any {
+          if (!node) return null;
+          if (node.block_id === targetId) return node.rect;
+          if (node.layout) return findBlockRect(node.layout, targetId);
+          if (node.split) {
+            return findBlockRect(node.split.before, targetId) || findBlockRect(node.split.after, targetId);
+          }
+          if (node.layers) {
+            for (const layer of node.layers) {
+              const r = findBlockRect(layer.layout, targetId);
+              if (r) return r;
+            }
+          }
+          return null;
+        }
+
+        const anchorRect = findBlockRect(win, handle.anchorBlockId!);
+        const childRect = findBlockRect(win, handle.blockId);
+        if (anchorRect && childRect) {
+          assert.ok(anchorRect[0] < childRect[0], `anchor x (${anchorRect[0]}) should be < child x (${childRect[0]}) for right split`);
+        }
       } finally {
         if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
         else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
@@ -382,6 +432,38 @@ for (const backend of backends) {
 
         sendLongCommand(splitSurface, `echo "SPLIT_DOWN_OK"`);
         await waitForScreen(splitSurface, /SPLIT_DOWN_OK/, 10_000, 20);
+
+        // Inspect window layout rects: verify child block is below anchor block (anchor.y < child.y)
+        assert.ok(handle?.blockId);
+        const { rexExec } = await import("../../pi-extension/subagents/rex.ts");
+        const rawAnchor = rexExec(["block", "inspect", "-s", handle.sessionId, handle.anchorBlockId!, "--json"]);
+        const windowId = JSON.parse(rawAnchor)?.block?.window_id;
+        assert.ok(windowId);
+
+        const rawWin = rexExec(["window", "inspect", "-s", handle.sessionId, windowId, "--json"]);
+        const win = JSON.parse(rawWin);
+
+        function findBlockRect(node: any, targetId: string): any {
+          if (!node) return null;
+          if (node.block_id === targetId) return node.rect;
+          if (node.layout) return findBlockRect(node.layout, targetId);
+          if (node.split) {
+            return findBlockRect(node.split.before, targetId) || findBlockRect(node.split.after, targetId);
+          }
+          if (node.layers) {
+            for (const layer of node.layers) {
+              const r = findBlockRect(layer.layout, targetId);
+              if (r) return r;
+            }
+          }
+          return null;
+        }
+
+        const anchorRect = findBlockRect(win, handle.anchorBlockId!);
+        const childRect = findBlockRect(win, handle.blockId);
+        if (anchorRect && childRect) {
+          assert.ok(anchorRect[1] < childRect[1], `anchor y (${anchorRect[1]}) should be < child y (${childRect[1]}) for below/down split`);
+        }
       } finally {
         if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
         else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
@@ -392,11 +474,21 @@ for (const backend of backends) {
       }
     });
 
-    it("auto direction selects right for wide anchor and below for tall anchor", async () => {
-      const { chooseSplitDirection } = await import("../../pi-extension/subagents/rex.ts");
-      // Wide anchor (cols/rows >= 2)
+    it("auto direction queries live anchor dimensions and matches geometry rule", async () => {
+      const { queryBlockDimensions, chooseSplitDirection } = await import("../../pi-extension/subagents/rex.ts");
+      const ctx = getRexContext();
+      assert.ok(ctx.block && ctx.session);
+
+      const liveDims = queryBlockDimensions(ctx.block, ctx.session);
+      assert.ok(liveDims, "should query live anchor block dimensions");
+      assert.ok(liveDims.columns > 0 && liveDims.rows > 0);
+
+      const expectedDirection = liveDims.columns / liveDims.rows >= 2 ? "right" : "below";
+      const actualDirection = chooseSplitDirection(liveDims, "auto");
+      assert.equal(actualDirection, expectedDirection);
+
+      // Also verify pure edge cases
       assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "auto"), "right");
-      // Tall anchor (cols/rows < 2)
       assert.equal(chooseSplitDirection({ columns: 50, rows: 40 }, "auto"), "below");
     });
   });
