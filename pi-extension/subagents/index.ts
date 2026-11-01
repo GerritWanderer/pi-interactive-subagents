@@ -696,6 +696,9 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/** Set of resolved session file paths whose process observation was lost and not confirmed exited. */
+const lostObservationSessions = new Set<string>();
+
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
 // same process and needs to know whether this session still has children in
@@ -1250,6 +1253,7 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  lostObservationSessions,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1771,6 +1775,9 @@ async function watchSubagent(
     if (isRexInfrastructureError(err)) {
       // Sustained infrastructure failure observing the process.
       // Do NOT kill or close a potentially live agent!
+      if (sessionFile) {
+        lostObservationSessions.add(resolve(sessionFile));
+      }
       runningSubagents.delete(running.id);
       return {
         name,
@@ -2291,6 +2298,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const err =
             `Subagent "${requestedName}" is registered but its session file is gone ` +
             `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // Guard: refuse resume if observation of the previous process was lost and not confirmed exited.
+        if (lostObservationSessions.has(resolve(sessionPath))) {
+          const err =
+            `Cannot resume subagent "${requestedName}": observation of its previous run was lost and ` +
+            `the process may still be active in its open pane. Resuming could corrupt the session file.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 

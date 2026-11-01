@@ -1,7 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -3177,13 +3177,21 @@ describe("rex.ts unit tests", () => {
     assert.equal(mixedRes.ok, false);
     assert.match(mixedRes.error, /blocked on a auth dialog/);
 
-    // Another app's error record alongside working pi record must also reject delivery
+    // An unattributed error record alongside working pi record must reject delivery
+    const unattributedError = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "working", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+      { state: "error", updated_at: "2026-11-01T00:00:00Z", msg: "crash" },
+    ], "pi");
+    assert.equal(unattributedError.ok, false);
+    assert.match(unattributedError.error, /in an error state/);
+
+    // Another app's error record (e.g. bash) alongside working pi record must NOT block steering
     const otherAppError = __rexTest__.validateTrustworthyProgramStatus([
       { state: "working", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
       { state: "error", app: "bash", updated_at: "2026-11-01T00:00:00Z", msg: "crash" },
     ], "pi");
-    assert.equal(otherAppError.ok, false);
-    assert.match(otherAppError.error, /in an error state/);
+    assert.equal(otherAppError.ok, true);
+    assert.equal(otherAppError.targetRecord.state, "working");
   });
 
   it("createSurfaceSplit resolves fromSurface handle string to its blockId", async () => {
@@ -3842,6 +3850,42 @@ describe("rex.ts unit tests", () => {
           assert.equal(raceRes.reason, "error");
           assert.equal(raceRes.exitCode, 1);
           assert.equal(raceRes.errorMessage, "Early error");
+
+          // Sidecar read while process is alive, then pane closed externally (not_found) => reason: "interrupted"
+          const sidecarSessionFile = join(dir, "sidecar-interrupt.jsonl");
+          writeFileSync(sidecarSessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+          const exitSidecarPath = `${sidecarSessionFile}.exit`;
+          writeFileSync(exitSidecarPath, JSON.stringify({ type: "done" }));
+
+          registerSurfaceHandle({
+            id: "poll-sidecar-surface",
+            kind: "split",
+            name: "sidecar-interrupt",
+            sessionId: "session:mock",
+            blockId: "block:sidecar-block",
+            status: "launched",
+          });
+
+          let queryCount = 0;
+          __rexTest__.setRexExecutor((args) => {
+            if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+              queryCount++;
+              if (queryCount === 1) {
+                // First query: process still alive, sidecar file will be read
+                return JSON.stringify({ last_exit: null, child: { pid: 9999, name: "pi" } });
+              }
+              // Second query: pane was closed externally
+              throw new Error('block "block:sidecar-block" not found');
+            }
+            return "{}";
+          });
+
+          const sidecarInterruptRes = await __rexTest__.pollForExit("poll-sidecar-surface", abortCtrl.signal, {
+            interval: 5,
+            sessionFile: sidecarSessionFile,
+          });
+          assert.equal(sidecarInterruptRes.reason, "interrupted", "pane closed externally after reading sidecar must report interrupted");
+          unregisterSurfaceHandle("poll-sidecar-surface");
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
@@ -3876,6 +3920,7 @@ describe("rex.ts unit tests", () => {
         status: "launched",
       });
 
+      const dir = createTestDir();
       try {
         // closeSurface must be idempotent and not throw even if the target is already absent
         assert.doesNotThrow(() => closeSurface("cleanup-res-surface"));
@@ -3989,10 +4034,29 @@ describe("rex.ts unit tests", () => {
           task: "task",
           surface: "cleanup-res-surface",
           startTime: Date.now(),
-          sessionFile: "/tmp/nonexistent-session.jsonl",
+          sessionFile: join(dir, "infra-session.jsonl"),
           interactive: false,
           statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
         };
+        writeFileSync(infraRunning.sessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+        writeSubagentLoadout(infraRunning.sessionFile, {
+          agent: "worker",
+          toolAllowlist: "read",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: dir,
+          agentDir: null,
+        });
+        const parentArtDir = join(dir, "artifacts", "main-sess");
+        mkdirSync(parentArtDir, { recursive: true });
+        registerName(parentArtDir, "infra-agent", {
+          sessionFile: infraRunning.sessionFile,
+          sessionId: "sess-infra",
+        });
 
         __rexTest__.setRexExecutor((args) => {
           if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
@@ -4017,9 +4081,39 @@ describe("rex.ts unit tests", () => {
         assert.match(infraRes.summary, /Infrastructure observation failure/);
         assert.match(infraRes.summary, /Pane was kept open/);
         assert.ok(getSurfaceHandle("cleanup-res-surface"), "surface must remain open and tracked on infrastructure error");
+
+        // Verify finding 1: lost-observation session cannot be resumed
+        assert.ok(testApi.lostObservationSessions.has(resolve(infraRunning.sessionFile)));
+        __rexTest__.setCommandAvailabilityOverride(true);
+        __rexTest__.setRexContextOverride({
+          server: "unix:///tmp/mock.sock",
+          session: "session:mock",
+          block: "block:mock-anchor",
+        });
+        const { api: infraApi, registeredTools: infraTools } = createMockExtensionApi();
+        (subagentsModule as any).default(infraApi);
+        const infraMsgTool = infraTools.find((t: any) => t.name === "subagent_message");
+        const resumeInfraRes = await infraMsgTool.execute(
+          "msg-call-infra",
+          { name: "infra-agent", message: "try resume" },
+          undefined,
+          undefined,
+          {
+            sessionManager: {
+              getSessionDir: () => dir,
+              getSessionId: () => "main-sess",
+              getSessionFile: () => join(dir, "main.jsonl"),
+            },
+          },
+        );
+        assert.match(resumeInfraRes.content[0].text, /observation of its previous run was lost/);
+        assert.match(resumeInfraRes.content[0].text, /process may still be active/);
       } finally {
         unregisterSurfaceHandle("cleanup-res-surface");
         __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
       }
     });
 
@@ -4172,14 +4266,53 @@ describe("rex.ts unit tests", () => {
         const rootLoaded = readSubagentLoadout(rootSessionFile);
         assert.equal(rootLoaded?.cwd, "/path/from/parent/context/cwd");
 
-        const partsDefault: string[] = ["pi", "--session", rootSessionFile];
-        testApi.applySandboxToParts(partsDefault, defaultCwdLoadout, { artifactDir: join(dir, "artifacts"), name: "scout" });
-        assert.equal(defaultCwdLoadout.cwd, "/path/from/parent/context/cwd");
+        let resumedCwd: string | undefined;
+        let resumedScriptContent = "";
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "window" && args[1] === "new") {
+            return JSON.stringify({ window_id: "win:resume-win", block_ids: ["blk:resume-blk"] });
+          }
+          if (args[0] === "split") {
+            return JSON.stringify({ block_ids: ["blk:resume-blk"] });
+          }
+          if (args[0] === "block" && args[1] === "inspect") {
+            return JSON.stringify({ block: { block_id: "blk:resume-blk" } });
+          }
+          if (args[0] === "block" && args[1] === "send") {
+            // Check script execution cwd from command line or wrapper script
+            return "{}";
+          }
+          return "{}";
+        });
+
+        const resumeMsgRes = await messageTool.execute(
+          "msg-call-resume",
+          { name: "default-cwd-agent", message: "resume task" },
+          undefined,
+          undefined,
+          mockCtx,
+        );
+        assert.equal(resumeMsgRes.details?.status, "started");
+        assert.ok(resumeMsgRes.details?.launchScriptFile);
+        resumedScriptContent = readFileSync(resumeMsgRes.details.launchScriptFile, "utf8");
+        assert.ok(
+          resumedScriptContent.includes("cd '/path/from/parent/context/cwd'"),
+          `resume script must cd to the snapshot's effective cwd (/path/from/parent/context/cwd). Found:\n${resumedScriptContent}`,
+        );
 
         // Verify preparation failure releases surface reservation
         let prepFailedSurface = "";
+        let splitAnchorChecked = false;
         __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "window" && args[1] === "new") {
+            prepFailedSurface = "rex-surface:prep-fail-agent";
+            return JSON.stringify({ window_id: "win:prep-fail-win", block_ids: ["blk:prep-fail-blk"] });
+          }
+          if (args[0] === "split") {
+            return JSON.stringify({ block_ids: ["blk:prep-fail-blk"] });
+          }
           if (args[0] === "block" && args[1] === "inspect") {
+            splitAnchorChecked = true;
             return JSON.stringify({ block: { block_id: "block:mock-anchor" } });
           }
           return "{}";
@@ -4201,9 +4334,27 @@ describe("rex.ts unit tests", () => {
           },
         );
 
-        // Ensure no surface handle is leaked in runningSubagents
+        // Ensure no surface handle is leaked in runningSubagents and surface handle registry is cleaned up
         assert.equal(testApi.runningSubagents.has("prep-fail-agent"), false);
+        const leakedHandle = Object.values(testApi.runningSubagents).find((r: any) => r.name === "prep-fail-agent");
+        assert.equal(leakedHandle, undefined);
+        const surfaces = Array.from((await import("../pi-extension/subagents/rex.ts")).getSurfaceHandle("rex-surface:prep-fail-agent") ? ["found"] : []);
+        assert.deepEqual(surfaces, [], "surface handle must be unregistered on launch/preparation failure");
         } finally {
+          for (const [_id, agent] of testApi.runningSubagents) {
+            agent.abortController?.abort();
+          }
+          testApi.runningSubagents.clear();
+          const prevInterval = (globalThis as any)[Symbol.for("pi-subagents/widget-interval")];
+          if (prevInterval) {
+            clearInterval(prevInterval);
+            (globalThis as any)[Symbol.for("pi-subagents/widget-interval")] = null;
+          }
+          const prevStatusInterval = (globalThis as any)[Symbol.for("pi-subagents/status-interval")];
+          if (prevStatusInterval) {
+            clearInterval(prevStatusInterval);
+            (globalThis as any)[Symbol.for("pi-subagents/status-interval")] = null;
+          }
           __rexTest__.setCommandAvailabilityOverride(undefined);
           __rexTest__.setRexContextOverride(undefined);
         }

@@ -622,22 +622,27 @@ export function validateTrustworthyProgramStatus(
     };
   }
 
-  // 1. If ANY record on the block is blocked or in error (even unattributed or another app), refuse immediately
-  const anyProblematic = records.find(
-    (r) => r && (r.state === "blocked" || r.state === "error"),
-  );
-  if (anyProblematic) {
-    if (anyProblematic.state === "blocked") {
-      const dialogKind = anyProblematic.kind ? `${anyProblematic.kind} ` : "";
+  // 1. Check for any blocked dialog (attributed or unattributed), or error attributed to expectedApp or unattributed
+  for (const r of records) {
+    if (!r) continue;
+    if (r.state === "blocked") {
+      const dialogKind = r.kind ? `${r.kind} ` : "";
       return {
         ok: false,
-        error: `Subagent is blocked on a ${dialogKind}dialog (${anyProblematic.msg || anyProblematic.state}). Steering refused.`,
+        error: `Subagent is blocked on a ${dialogKind}dialog (${r.msg || r.state}). Steering refused.`,
       };
     }
-    return {
-      ok: false,
-      error: `Subagent is in an error state (${anyProblematic.msg || anyProblematic.state}). Steering refused.`,
-    };
+    if (r.state === "error") {
+      const app = (r as any).effective_app ?? r.app;
+      // Refuse steering if the error is attributed to expectedApp or unattributed.
+      // If specifically attributed to another app, do not block unless expectedApp itself has no healthy status.
+      if (!app || app === expectedApp) {
+        return {
+          ok: false,
+          error: `Subagent is in an error state (${r.msg || r.state}). Steering refused.`,
+        };
+      }
+    }
   }
 
   // 2. Positively verify that a valid, non-blocked target record (e.g. pi) exists
@@ -918,8 +923,6 @@ export async function pollForExit(
         const proc = queryBlockProcess(currentBlockId, currentSessionId);
         consecutiveErrors = 0; // reset on successful transport query
         if (proc === "not_found") {
-          if (cachedSidecarResult) return cachedSidecarResult;
-          if (cachedSentinel) return { reason: "sentinel", exitCode: 0 };
           return {
             reason: "interrupted",
             exitCode: 1,
@@ -963,8 +966,6 @@ export async function pollForExit(
       }
     } else {
       // Surface was closed or unmapped without a block ID
-      if (cachedSidecarResult) return cachedSidecarResult;
-      if (cachedSentinel) return { reason: "sentinel", exitCode: 0 };
       return {
         reason: "interrupted",
         exitCode: 1,
