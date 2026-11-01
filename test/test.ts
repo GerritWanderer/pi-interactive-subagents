@@ -3688,11 +3688,17 @@ describe("rex.ts unit tests", () => {
         assert.equal(emptyError.exitCode, 1);
         assert.match(emptyError.errorMessage ?? "", /no errorMessage/);
 
-        // Unknown sidecar payload
-        assert.deepEqual(
-          __rexTest__.interpretExitSidecar({ type: "unknown" }),
-          { reason: "done", exitCode: 0 },
-        );
+        // Unknown sidecar payload does not report success
+        const unknownSidecar = __rexTest__.interpretExitSidecar({ type: "unknown" });
+        assert.equal(unknownSidecar.reason, "error");
+        assert.equal(unknownSidecar.exitCode, 1);
+        assert.match(unknownSidecar.errorMessage ?? "", /Unrecognized or corrupt/);
+
+        // Corrupt / null / string sidecar payload does not report success
+        const nullSidecar = __rexTest__.interpretExitSidecar(null);
+        assert.equal(nullSidecar.reason, "error");
+        assert.equal(nullSidecar.exitCode, 1);
+        assert.match(nullSidecar.errorMessage ?? "", /Unrecognized or corrupt/);
       } finally {
         if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
         if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
@@ -3783,6 +3789,42 @@ describe("rex.ts unit tests", () => {
           __rexTest__.pollForExit("poll-done-surface", preAborted.signal, { interval: 10 }),
           /Aborted/,
         );
+
+        // 6. Sidecar file race test: if .exit exists while last_exit is null, polling continues until process exit
+        const dir = createTestDir();
+        const testSessionFile = join(dir, "race-test.jsonl");
+        writeFileSync(testSessionFile, "");
+        writeFileSync(
+          `${testSessionFile}.exit`,
+          JSON.stringify({ type: "error", errorMessage: "Early error", stopReason: "error" }),
+        );
+
+        let liveChecks = 0;
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            liveChecks++;
+            if (liveChecks < 3) {
+              // Still running when sidecar was first read
+              return JSON.stringify({ last_exit: null, child: { pid: 4321, name: "pi" } });
+            }
+            // Finally terminated
+            return JSON.stringify({ last_exit: { exit_code: 1, error: "Early error" } });
+          }
+          return "{}";
+        });
+
+        try {
+          const raceRes = await __rexTest__.pollForExit("poll-done-surface", abortCtrl.signal, {
+            interval: 5,
+            sessionFile: testSessionFile,
+          });
+          assert.ok(liveChecks >= 3, `polling must continue until process exit (checked ${liveChecks} times)`);
+          assert.equal(raceRes.reason, "error");
+          assert.equal(raceRes.exitCode, 1);
+          assert.equal(raceRes.errorMessage, "Early error");
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
       } finally {
         unregisterSurfaceHandle("poll-done-surface");
         __rexTest__.setRexExecutor(null);
@@ -3822,7 +3864,32 @@ describe("rex.ts unit tests", () => {
         // Second call on already-closed/unregistered surface is also a safe no-op
         assert.doesNotThrow(() => closeSurface("cleanup-res-surface"));
 
-        // Watcher result collection with close failure must not replace collected summary
+        // Transient transport error other than not_found must NOT silently drop tracking
+        let transientExecuted = false;
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "close") {
+            transientExecuted = true;
+            throw new Error("temporary network timeout communicating with server");
+          }
+          return "{}";
+        });
+        registerSurfaceHandle({
+          id: "transient-fail-surface",
+          kind: "split",
+          name: "transient-fail",
+          sessionId: "session:mock",
+          blockId: "block:transient-block",
+          status: "launched",
+        });
+
+        assert.throws(
+          () => closeSurface("transient-fail-surface"),
+          /temporary network timeout/,
+        );
+        assert.equal(transientExecuted, true);
+        // Handle must still remain tracked because cleanup was uncertain
+        assert.ok(getSurfaceHandle("transient-fail-surface"));
+        unregisterSurfaceHandle("transient-fail-surface");
         const fakeRunning = {
           id: "r-cleanup",
           name: "clean-agent",
@@ -3972,6 +4039,25 @@ describe("rex.ts unit tests", () => {
         __rexTest__.setCommandAvailabilityOverride(true);
 
         try {
+          // Verify child command invocation builds restricted tool/model/identity arguments from snapshot
+          const parts: string[] = ["pi", "--session", sampleLoadout.cwd!];
+          const artifactDir = join(dir, "artifacts", "child-sess");
+          mkdirSync(artifactDir, { recursive: true });
+          testApi.applySandboxToParts(parts, sampleLoadout, { artifactDir, name: "worker" });
+
+          assert.ok(parts.includes("--tools"), "parts must include --tools");
+          const toolsIdx = parts.indexOf("--tools");
+          assert.equal(parts[toolsIdx + 1], "'read,write,edit'");
+          assert.ok(parts.includes("--model"), "parts must include --model");
+          const modelIdx = parts.indexOf("--model");
+          assert.equal(parts[modelIdx + 1], "'anthropic/claude-3-5-sonnet:medium'");
+          assert.ok(parts.includes("--append-system-prompt"), "parts must include --append-system-prompt");
+          const idIdx = parts.indexOf("--append-system-prompt");
+          const sysPromptArg = parts[idIdx + 1];
+          // applySandboxToParts writes long or multi-line system prompt to file and passes quoted path
+          const strippedPath = sysPromptArg.replace(/^'|'$/g, "");
+          assert.equal(readFileSync(strippedPath, "utf8"), "You are the worker.");
+
           const executeRes = await messageTool.execute(
             "msg-call-1",
             { name: "missing-snapshot-agent", message: "continue" },
@@ -3990,17 +4076,83 @@ describe("rex.ts unit tests", () => {
       }
     });
 
-    it("Task 3.6: interactive and pending-work auto-exit policy and clean exit", () => {
+    it("Task 3.6: interactive and pending-work auto-exit policy and clean exit", async () => {
       // 1. Interactive agent (autoExit: false) does not auto-exit on completion
       assert.equal(shouldAutoExitOnAgentEnd(false, [{ role: "assistant", stopReason: "end_turn" }]), true);
-      // But in subagent-done agent_end handler, autoExit flag must be true to trigger exit.
-      // If autoExit is false, agent_end keeps session open.
 
-      // 2. Unanswered ask_question (awaitingAnswer = true) suppresses exit
-      // Tested in subagent-done.ts ask_question unit test
+      // Verify subagent-done agent_end handler directly:
+      // (a) autoExit: false keeps session open
+      const dir = createTestDir();
+      try {
+        const sessionFile = join(dir, "interactive.jsonl");
+        writeFileSync(sessionFile, "");
+        const handlers = new Map<string, Array<(...args: any[]) => void>>();
+        const mockApi = {
+          on(evt: string, fn: any) {
+            if (!handlers.has(evt)) handlers.set(evt, []);
+            handlers.get(evt)!.push(fn);
+          },
+          registerTool() {}, registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
+          sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
+        } as any;
 
-      // 3. Running children count > 0 suppresses exit
-      // runningChildrenCount() is checked in subagent-done.ts
+        const savedEnv = {
+          session: process.env.PI_SUBAGENT_SESSION,
+          autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+          name: process.env.PI_SUBAGENT_NAME,
+        };
+        process.env.PI_SUBAGENT_SESSION = sessionFile;
+        delete process.env.PI_SUBAGENT_AUTO_EXIT; // interactive / auto-exit off
+        process.env.PI_SUBAGENT_NAME = "interactive-agent";
+
+        subagentDoneExtension(mockApi);
+        const emit = (evt: string, ...args: any[]) => (handlers.get(evt) ?? []).forEach((h) => h(...args));
+
+        let shutdownCalled = false;
+        emit("agent_start");
+        emit("agent_end", { messages: [{ role: "assistant", stopReason: "end_turn" }] }, { shutdown() { shutdownCalled = true; } });
+        assert.equal(shutdownCalled, false, "interactive agent (autoExit=false) must not shutdown on completion");
+
+        // (b) autoExit: true with unanswered ask_question suppresses exit
+        process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+        const askTools: any[] = [];
+        mockApi.registerTool = (t: any) => askTools.push(t);
+        subagentDoneExtension(mockApi);
+        const askTool = askTools.find((t) => t.name === "ask_question");
+        assert.ok(askTool);
+
+        emit("agent_start");
+        await askTool.execute("q1", { question: "What now?" }, undefined, undefined, { shutdown() {} });
+        let qShutdown = false;
+        emit("agent_end", { messages: [{ role: "assistant", stopReason: "end_turn" }] }, { shutdown() { qShutdown = true; } });
+        assert.equal(qShutdown, false, "unanswered ask_question must suppress auto-exit");
+
+        // (c) autoExit: true with user abort (stopReason: 'aborted') suppresses exit
+        let abortShutdown = false;
+        emit("input"); // answers question
+        emit("agent_start");
+        emit("agent_end", { messages: [{ role: "assistant", stopReason: "aborted" }] }, { shutdown() { abortShutdown = true; } });
+        assert.equal(abortShutdown, false, "user abort must suppress auto-exit");
+
+        // (d) autoExit: true with pending children suppresses exit
+        let childShutdown = false;
+        const countKey = Symbol.for("pi-subagents/running-children-count");
+        (globalThis as any)[countKey] = () => 2;
+        try {
+          emit("agent_start");
+          emit("agent_end", { messages: [{ role: "assistant", stopReason: "end_turn" }] }, { shutdown() { childShutdown = true; } });
+          assert.equal(childShutdown, false, "running children > 0 must suppress auto-exit");
+        } finally {
+          delete (globalThis as any)[countKey];
+        }
+
+        // Restore env
+        restoreEnvVar("PI_SUBAGENT_SESSION", savedEnv.session);
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", savedEnv.autoExit);
+        restoreEnvVar("PI_SUBAGENT_NAME", savedEnv.name);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
 
       // 4. User abort (stopReason: "aborted") does not auto exit
       assert.equal(

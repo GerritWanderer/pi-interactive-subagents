@@ -786,11 +786,19 @@ export function closeSurface(surface: string): void {
     } else if (handle.blockId) {
       rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
     }
-  } catch {
-    // Already gone or cannot close; idempotent cleanup
-  } finally {
     handle.status = "closed";
     unregisterSurfaceHandle(surface);
+  } catch (closeError: any) {
+    const msg = closeError?.message || String(closeError);
+    const stderr = closeError?.stderr || "";
+    if (/not found/i.test(msg) || /not found/i.test(stderr) || /already closed/i.test(msg) || /already gone/i.test(msg)) {
+      // Target is confirmed already gone; safe idempotent cleanup
+      handle.status = "closed";
+      unregisterSurfaceHandle(surface);
+    } else {
+      // Transient transport failure: do not drop tracking silently
+      throw closeError;
+    }
   }
 }
 
@@ -822,14 +830,24 @@ export function queryBlockProcess(blockId: string, session: string): RexProcessO
 }
 
 function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
+  if (data && typeof data === "object") {
+    if (data.type === "error") {
+      const errorMessage =
+        typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
+          ? data.errorMessage
+          : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
+      return { reason: "error", exitCode: 1, errorMessage };
+    }
+    if (data.type === "done") {
+      return { reason: "done", exitCode: 0 };
+    }
   }
-  return { reason: "done", exitCode: 0 };
+  // Unrecognized or corrupt payload - do not report success
+  return {
+    reason: "error",
+    exitCode: 1,
+    errorMessage: `Unrecognized or corrupt subagent exit sidecar payload: ${JSON.stringify(data)}`,
+  };
 }
 
 export async function pollForExit(
@@ -849,29 +867,31 @@ export async function pollForExit(
   const start = Date.now();
   let consecutiveErrors = 0;
   const maxErrors = options.maxConsecutiveErrors ?? 10;
+  let cachedSidecarResult: PollResult | null = null;
+  let cachedSentinel = false;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // 1. Check sidecar .exit file
-    if (options.sessionFile) {
+    // 1. Check sidecar .exit file (record payload, wait for process termination before returning)
+    if (options.sessionFile && !cachedSidecarResult) {
       try {
         const exitFile = `${options.sessionFile}.exit`;
         if (existsSync(exitFile)) {
           const data = JSON.parse(readFileSync(exitFile, "utf-8"));
           rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
+          cachedSidecarResult = interpretExitSidecar(data);
         }
       } catch {}
     }
 
     // 2. Check sentinel file (e.g. Claude)
-    if (options.sentinelFile) {
+    if (options.sentinelFile && !cachedSentinel) {
       try {
         if (existsSync(options.sentinelFile)) {
-          return { reason: "sentinel", exitCode: 0 };
+          cachedSentinel = true;
         }
       } catch {}
     }
@@ -884,6 +904,8 @@ export async function pollForExit(
         const proc = queryBlockProcess(currentBlockId, currentSessionId);
         consecutiveErrors = 0; // reset on successful transport query
         if (proc === "not_found") {
+          if (cachedSidecarResult) return cachedSidecarResult;
+          if (cachedSentinel) return { reason: "sentinel", exitCode: 0 };
           return {
             reason: "interrupted",
             exitCode: 1,
@@ -891,6 +913,24 @@ export async function pollForExit(
           };
         }
         if (proc.last_exit !== null && proc.last_exit !== undefined) {
+          if (cachedSidecarResult) {
+            // Sidecar payload recorded earlier: if process had an error code and sidecar had none, propagate process code
+            if (proc.last_exit.exit_code !== 0 && cachedSidecarResult.exitCode === 0) {
+              return {
+                reason: "error",
+                exitCode: proc.last_exit.exit_code,
+                errorMessage: proc.last_exit.error || cachedSidecarResult.errorMessage,
+              };
+            }
+            return cachedSidecarResult;
+          }
+          if (cachedSentinel) {
+            return {
+              reason: "sentinel",
+              exitCode: proc.last_exit.exit_code,
+              ...(proc.last_exit.error ? { errorMessage: proc.last_exit.error } : {}),
+            };
+          }
           const code = proc.last_exit.exit_code;
           return {
             reason: code === 0 ? "done" : "error",
@@ -909,6 +949,8 @@ export async function pollForExit(
       }
     } else {
       // Surface was closed or unmapped without a block ID
+      if (cachedSidecarResult) return cachedSidecarResult;
+      if (cachedSentinel) return { reason: "sentinel", exitCode: 0 };
       return {
         reason: "interrupted",
         exitCode: 1,
