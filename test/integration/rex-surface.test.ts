@@ -404,9 +404,9 @@ for (const backend of backends) {
 
         const anchorRect = findBlockRect(win, handle.anchorBlockId!);
         const childRect = findBlockRect(win, handle.blockId);
-        if (anchorRect && childRect) {
-          assert.ok(anchorRect[0] < childRect[0], `anchor x (${anchorRect[0]}) should be < child x (${childRect[0]}) for right split`);
-        }
+        assert.ok(Array.isArray(anchorRect) && anchorRect.length >= 2, "anchorRect must be found");
+        assert.ok(Array.isArray(childRect) && childRect.length >= 2, "childRect must be found");
+        assert.ok(anchorRect[0] < childRect[0], `anchor x (${anchorRect[0]}) should be < child x (${childRect[0]}) for right split`);
       } finally {
         if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
         else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
@@ -461,9 +461,9 @@ for (const backend of backends) {
 
         const anchorRect = findBlockRect(win, handle.anchorBlockId!);
         const childRect = findBlockRect(win, handle.blockId);
-        if (anchorRect && childRect) {
-          assert.ok(anchorRect[1] < childRect[1], `anchor y (${anchorRect[1]}) should be < child y (${childRect[1]}) for below/down split`);
-        }
+        assert.ok(Array.isArray(anchorRect) && anchorRect.length >= 2, "anchorRect must be found");
+        assert.ok(Array.isArray(childRect) && childRect.length >= 2, "childRect must be found");
+        assert.ok(anchorRect[1] < childRect[1], `anchor y (${anchorRect[1]}) should be < child y (${childRect[1]}) for below/down split`);
       } finally {
         if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
         else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
@@ -486,6 +486,69 @@ for (const backend of backends) {
       const expectedDirection = liveDims.columns / liveDims.rows >= 2 ? "right" : "below";
       const actualDirection = chooseSplitDirection(liveDims, "auto");
       assert.equal(actualDirection, expectedDirection);
+
+      // Launch an actual split with PI_SUBAGENT_SPLIT_DIRECTION = "auto"
+      const savedOverride = process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+      const savedSurface = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
+      process.env.PI_SUBAGENT_SPLIT_DIRECTION = "auto";
+
+      try {
+        const splitSurface = createTrackedSurface(env, "split-auto-dir");
+        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(splitSurface);
+        assert.ok(handle);
+        assert.equal(handle.direction, expectedDirection, `handle.direction must match expectedDirection (${expectedDirection})`);
+
+        sendLongCommand(splitSurface, `echo "SPLIT_AUTO_OK"`);
+        await waitForScreen(splitSurface, /SPLIT_AUTO_OK/, 10_000, 20);
+
+        assert.ok(handle.blockId, "handle.blockId must be assigned after launch");
+
+        // Inspect window layout rects and verify coordinate ordering
+        const { rexExec } = await import("../../pi-extension/subagents/rex.ts");
+        const rawAnchor = rexExec(["block", "inspect", "-s", handle.sessionId, handle.anchorBlockId!, "--json"]);
+        const windowId = JSON.parse(rawAnchor)?.block?.window_id;
+        assert.ok(windowId);
+
+        const rawWin = rexExec(["window", "inspect", "-s", handle.sessionId, windowId, "--json"]);
+        const win = JSON.parse(rawWin);
+
+        function findBlockRect(node: any, targetId: string): any {
+          if (!node) return null;
+          if (node.block_id === targetId) return node.rect;
+          if (node.layout) return findBlockRect(node.layout, targetId);
+          if (node.split) {
+            return findBlockRect(node.split.before, targetId) || findBlockRect(node.split.after, targetId);
+          }
+          if (node.layers) {
+            for (const layer of node.layers) {
+              const r = findBlockRect(layer.layout, targetId);
+              if (r) return r;
+            }
+          }
+          return null;
+        }
+
+        const anchorRect = findBlockRect(win, handle.anchorBlockId!);
+        const childRect = findBlockRect(win, handle.blockId);
+        assert.ok(Array.isArray(anchorRect) && anchorRect.length >= 2, "anchorRect must be found");
+        assert.ok(Array.isArray(childRect) && childRect.length >= 2, "childRect must be found");
+
+        if (expectedDirection === "right") {
+          assert.ok(anchorRect[0] < childRect[0], `anchor x (${anchorRect[0]}) should be < child x (${childRect[0]}) for right split`);
+        } else {
+          assert.ok(anchorRect[1] < childRect[1], `anchor y (${anchorRect[1]}) should be < child y (${childRect[1]}) for below split`);
+        }
+      } finally {
+        if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+        else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
+        if (savedSurface === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+        else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedSurface;
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedName;
+      }
 
       // Also verify pure edge cases
       assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "auto"), "right");
