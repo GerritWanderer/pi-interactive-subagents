@@ -3048,6 +3048,18 @@ describe("rex.ts unit tests", () => {
     ], "pi");
     assert.equal(blockedRes.ok, false);
     assert.match(blockedRes.error, /blocked on a permission dialog/);
+
+    const blockedCustomRes = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "blocked", kind: "custom_kind", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+    ], "pi");
+    assert.equal(blockedCustomRes.ok, false);
+    assert.match(blockedCustomRes.error, /blocked on a custom_kind dialog/);
+
+    const errorRes = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "error", app: "pi", updated_at: "2026-11-01T00:00:00Z", msg: "Process failed" },
+    ], "pi");
+    assert.equal(errorRes.ok, false);
+    assert.match(errorRes.error, /in an error state/);
   });
 
   it("validateTrustworthyProgramStatus accepts valid unblocked target report", async () => {
@@ -3069,7 +3081,7 @@ describe("rex.ts unit tests", () => {
     );
   });
 
-  it("closeSurface closes only the block for split handles and the window for tab handles", async () => {
+  it("closeSurface closes only the block for split handles and respects nested blocks in tab handles", async () => {
     const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
     // Tab handle
     registerSurfaceHandle({
@@ -3097,6 +3109,27 @@ describe("rex.ts unit tests", () => {
 
     closeSurface("test-tab-handle");
     assert.equal(getSurfaceHandle("test-tab-handle"), undefined);
+  });
+
+  it("sendMessage refuses delivery when safety status check fails", async () => {
+    const { registerSurfaceHandle, sendMessage, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    registerSurfaceHandle({
+      id: "test-send-handle",
+      kind: "tab",
+      name: "send-agent",
+      sessionId: "session:test",
+      blockId: "block:nonexistent-send",
+      status: "launched",
+    });
+
+    try {
+      assert.throws(
+        () => sendMessage("test-send-handle", "hello"),
+        /unable to query program status|Cannot deliver message safely/,
+      );
+    } finally {
+      unregisterSurfaceHandle("test-send-handle");
+    }
   });
 });
 

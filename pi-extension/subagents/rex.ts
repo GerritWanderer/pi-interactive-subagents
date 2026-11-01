@@ -56,7 +56,7 @@ export function getRexContext(): RexContext {
   };
 }
 
-export function isRexAvailable(): boolean {
+export function isMuxAvailable(): boolean {
   if (process.platform === "win32") {
     // Windows native host deferred per spec
     return false;
@@ -65,13 +65,17 @@ export function isRexAvailable(): boolean {
   if (!ctx.session || !ctx.block) {
     return false;
   }
-  if (!hasCommand(rexBin())) {
+  return hasCommand(rexBin());
+}
+
+export function isRexAvailable(): boolean {
+  if (!isMuxAvailable()) {
     return false;
   }
-
+  const ctx = getRexContext();
   // Validate that the session and anchor block exist
   try {
-    const raw = rexExec(["block", "inspect", ctx.block, "-s", ctx.session, "--json"]);
+    const raw = rexExec(["block", "inspect", ctx.block!, "-s", ctx.session!, "--json"]);
     const parsed = JSON.parse(raw);
     if (!parsed || (parsed.error && parsed.error.code)) {
       return false;
@@ -93,10 +97,6 @@ export function validateAnchorBlock(blockId: string, session: string): void {
   } catch (error: any) {
     throw new Error(`Target Rex block "${blockId}" does not exist in session "${session}": ${error?.message || String(error)}`);
   }
-}
-
-export function isMuxAvailable(): boolean {
-  return isRexAvailable();
 }
 
 export function muxSetupHint(): string {
@@ -530,17 +530,21 @@ export function validateTrustworthyProgramStatus(
     };
   }
 
-  // Check if any matching record is blocked on permission, question, or auth
-  const blocked = matching.find(
-    (r) =>
-      r.state === "blocked" &&
-      (r.kind === "permission" || r.kind === "question" || r.kind === "auth"),
+  // Check if any matching record is blocked on dialog or in error state
+  const problematic = matching.find(
+    (r) => r.state === "blocked" || r.state === "error",
   );
 
-  if (blocked) {
+  if (problematic) {
+    if (problematic.state === "blocked") {
+      return {
+        ok: false,
+        error: `Subagent is blocked on a ${problematic.kind ?? "dialog"} dialog (${problematic.msg || problematic.state}). Steering refused.`,
+      };
+    }
     return {
       ok: false,
-      error: `Subagent is blocked on a ${blocked.kind ?? "dialog"} dialog (${blocked.msg || blocked.state}). Steering refused.`,
+      error: `Subagent is in an error state (${problematic.msg || problematic.state}). Steering refused.`,
     };
   }
 
@@ -613,7 +617,7 @@ export function getSurfaceTab(surface: string): string | null {
   if (!handle?.blockId) return null;
 
   try {
-    const raw = rexExec(["block", "inspect", handle.blockId, "--json"]);
+    const raw = rexExec(["block", "inspect", "-s", handle.sessionId, handle.blockId, "--json"]);
     const parsed = JSON.parse(raw);
     const windowId = parsed?.block?.window_id || parsed?.window || parsed?.window_id || null;
     if (windowId && !handle.windowId) {
@@ -648,7 +652,23 @@ export function closeSurface(surface: string): void {
 
   try {
     if (handle.kind === "tab" && handle.windowId) {
-      rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
+      // Check if other blocks still exist in this window before closing the whole window
+      let windowHasOtherBlocks = false;
+      try {
+        const raw = rexExec(["window", "inspect", "-s", handle.sessionId, handle.windowId, "--json"]);
+        const win = JSON.parse(raw);
+        const layers = Array.isArray(win?.layers) ? win.layers : [];
+        const blocks = layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
+        if (blocks.length > 1) {
+          windowHasOtherBlocks = true;
+        }
+      } catch {}
+
+      if (windowHasOtherBlocks && handle.blockId) {
+        rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
+      } else {
+        rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
+      }
     } else if (handle.blockId) {
       rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
     }

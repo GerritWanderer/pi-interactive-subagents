@@ -170,5 +170,46 @@ for (const backend of backends) {
 
       await waitForScreen(surface, /SPECIAL: arg with spaces and 'quotes'/, 10_000, 20);
     });
+
+    it("closing a parent tab surface preserves surviving nested child blocks in the same window", async () => {
+      const top = createTrackedSurface(env, "parent-close-test");
+      sendLongCommand(top, `echo "PARENT_ALIVE"`);
+      await waitForScreen(top, /PARENT_ALIVE/, 10_000, 20);
+
+      const topWindowId = getSurfaceTab(top);
+      assert.ok(topWindowId);
+      const topHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(top);
+      assert.ok(topHandle?.blockId);
+
+      // Create child split off parent
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedBlock = process.env.REX_BLOCK;
+      let child: string;
+      try {
+        process.env.PI_SUBAGENT_NAME = "parent-close-test";
+        process.env.REX_BLOCK = topHandle.blockId;
+        child = createTrackedSurface(env, "child-survivor");
+        sendLongCommand(child, `echo "CHILD_ALIVE"`);
+        await waitForScreen(child, /CHILD_ALIVE/, 10_000, 20);
+      } finally {
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedName;
+        process.env.REX_BLOCK = savedBlock;
+      }
+
+      const childHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(child);
+      assert.ok(childHandle?.blockId);
+
+      // Close parent tab surface
+      closeSurface(top);
+      await sleep(500);
+
+      // Verify that parent block is gone but child block survives
+      const parentProc = queryBlockProcess(topHandle.blockId, topHandle.sessionId);
+      assert.equal(parentProc, "not_found", "parent block should be closed");
+
+      const childProc = queryBlockProcess(childHandle.blockId, childHandle.sessionId);
+      assert.notEqual(childProc, "not_found", "child block must survive parent cleanup");
+    });
   });
 }
