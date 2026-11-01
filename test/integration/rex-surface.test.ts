@@ -77,7 +77,22 @@ for (const backend of backends) {
       const ctx = getRexContext();
       assert.ok(ctx.block, "expected REX_BLOCK");
 
-      const top = createTrackedSurface(env, "tab-top-level");
+      const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      delete process.env.PI_SUBAGENT_NAME;
+
+      let top: string;
+      try {
+        top = createTrackedSurface(env, "tab-top-level");
+      } finally {
+        if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
+        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+      }
+
+      const topHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(top);
+      assert.equal(topHandle?.kind, "tab", "top-level handle must be a tab");
+
       const topMarker = uniqueId();
       sendLongCommand(top, `echo "TOP_${topMarker}"`);
       await waitForScreen(top, new RegExp(`TOP_${topMarker}`), 10_000, 20);
@@ -85,17 +100,29 @@ for (const backend of backends) {
       const topTab = getSurfaceTab(top);
       assert.ok(topTab, "expected to read top surface window id");
 
+      // Verify top-level window is different from the spawner's window
+      const rexModule = await import("../../pi-extension/subagents/rex.ts");
+      const spawnerWindow = (() => {
+        const raw = rexModule.rexExec(["block", "inspect", "-s", ctx.session!, ctx.block!, "--json"]);
+        return JSON.parse(raw)?.block?.window_id;
+      })();
+      if (spawnerWindow) {
+        assert.notEqual(topTab, spawnerWindow, "top-level subagent must open a distinct window from its spawner");
+      }
+
       // Spawning nested subagent with PI_SUBAGENT_NAME set
-      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedNestedName = process.env.PI_SUBAGENT_NAME;
       const savedBlock = process.env.REX_BLOCK;
       try {
         process.env.PI_SUBAGENT_NAME = "tab-top-level";
         // simulate nested spawner inside top surface's block
-        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(top);
-        assert.ok(handle?.blockId, "top handle should have a blockId");
-        process.env.REX_BLOCK = handle.blockId;
+        assert.ok(topHandle?.blockId, "top handle should have a blockId");
+        process.env.REX_BLOCK = topHandle.blockId;
 
         const nested = createTrackedSurface(env, "tab-nested-child");
+        const nestedHandle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(nested);
+        assert.equal(nestedHandle?.kind, "split", "nested subagent handle must be a split");
+
         const nestedMarker = uniqueId();
         sendLongCommand(nested, `echo "NESTED_${nestedMarker}"`);
         await waitForScreen(nested, new RegExp(`NESTED_${nestedMarker}`), 10_000, 20);
@@ -103,8 +130,8 @@ for (const backend of backends) {
         const nestedTab = getSurfaceTab(nested);
         assert.equal(nestedTab, topTab, "nested child must share its parent's window");
       } finally {
-        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
-        else process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedNestedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedNestedName;
         process.env.REX_BLOCK = savedBlock;
       }
     });
@@ -148,18 +175,22 @@ for (const backend of backends) {
 
     it("placement override forces top-level pane split instead of tab", async () => {
       const savedOverride = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
       process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
       try {
         const topPane = createTrackedSurface(env, "top-pane-override");
+        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(topPane);
+        assert.equal(handle?.kind, "split", "override should create split instead of tab");
+
         const marker = uniqueId();
         sendLongCommand(topPane, `echo "TOP_PANE_${marker}"`);
         await waitForScreen(topPane, new RegExp(`TOP_PANE_${marker}`), 10_000, 20);
-
-        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(topPane);
-        assert.equal(handle?.kind, "split", "override should create split instead of tab");
       } finally {
         if (savedOverride === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
         else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedOverride;
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedName;
       }
     });
 
@@ -218,7 +249,9 @@ for (const backend of backends) {
     it("closing a lone tab surface closes the entire Rex window", async () => {
       // Ensure we simulate a top-level spawner so createSurface creates a tab
       const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
       delete process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
       let surface: string;
       try {
         surface = createTrackedSurface(env, "lone-tab-close");
@@ -226,10 +259,12 @@ for (const backend of backends) {
         await waitForScreen(surface, /LONE_TAB/, 10_000, 20);
       } finally {
         if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
       }
 
       const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(surface);
       assert.ok(handle?.blockId && handle?.windowId);
+      assert.equal(handle.kind, "tab");
       const windowId = handle.windowId;
 
       closeSurface(surface);
@@ -305,6 +340,64 @@ for (const backend of backends) {
 
       // Handle should have been closed/cleaned up
       assert.equal(getSurfaceHandle(surface), undefined);
+    });
+
+    it("placement override forces right split direction", async () => {
+      const savedOverride = process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+      const savedSurface = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
+      process.env.PI_SUBAGENT_SPLIT_DIRECTION = "right";
+
+      try {
+        const splitSurface = createTrackedSurface(env, "split-right-dir");
+        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(splitSurface);
+        assert.equal(handle?.direction, "right", "split direction should be right");
+
+        sendLongCommand(splitSurface, `echo "SPLIT_RIGHT_OK"`);
+        await waitForScreen(splitSurface, /SPLIT_RIGHT_OK/, 10_000, 20);
+      } finally {
+        if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+        else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
+        if (savedSurface === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+        else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedSurface;
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedName;
+      }
+    });
+
+    it("placement override forces down/below split direction", async () => {
+      const savedOverride = process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+      const savedSurface = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
+      process.env.PI_SUBAGENT_SPLIT_DIRECTION = "down";
+
+      try {
+        const splitSurface = createTrackedSurface(env, "split-down-dir");
+        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(splitSurface);
+        assert.equal(handle?.direction, "below", "split direction should map down to below");
+
+        sendLongCommand(splitSurface, `echo "SPLIT_DOWN_OK"`);
+        await waitForScreen(splitSurface, /SPLIT_DOWN_OK/, 10_000, 20);
+      } finally {
+        if (savedOverride === undefined) delete process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+        else process.env.PI_SUBAGENT_SPLIT_DIRECTION = savedOverride;
+        if (savedSurface === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+        else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedSurface;
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+        else process.env.PI_SUBAGENT_NAME = savedName;
+      }
+    });
+
+    it("auto direction selects right for wide anchor and below for tall anchor", async () => {
+      const { chooseSplitDirection } = await import("../../pi-extension/subagents/rex.ts");
+      // Wide anchor (cols/rows >= 2)
+      assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "auto"), "right");
+      // Tall anchor (cols/rows < 2)
+      assert.equal(chooseSplitDirection({ columns: 50, rows: 40 }, "auto"), "below");
     });
   });
 }
