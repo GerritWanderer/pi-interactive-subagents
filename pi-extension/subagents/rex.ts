@@ -316,10 +316,27 @@ export function createSurfaceSplit(
 ): string {
   requireMux();
   const ctx = getRexContext();
-  const sessionId = ctx.session!;
-  const resolvedAnchor = fromSurface
-    ? (getSurfaceHandle(fromSurface)?.blockId ?? fromSurface)
-    : ctx.block!;
+  let sessionId = ctx.session!;
+  let resolvedAnchor: string;
+
+  if (fromSurface) {
+    if (fromSurface.startsWith("rex-surface:") || getSurfaceHandle(fromSurface)) {
+      const parentHandle = getSurfaceHandle(fromSurface);
+      if (!parentHandle) {
+        throw new Error(`Target surface handle "${fromSurface}" not found`);
+      }
+      if (!parentHandle.blockId) {
+        throw new Error(`Target surface "${fromSurface}" has not been launched yet; no block ID available to split`);
+      }
+      resolvedAnchor = parentHandle.blockId;
+      sessionId = parentHandle.sessionId;
+    } else {
+      resolvedAnchor = fromSurface;
+    }
+  } else {
+    resolvedAnchor = ctx.block!;
+  }
+
   validateAnchorBlock(resolvedAnchor, sessionId);
 
   const dir: "right" | "below" =
@@ -652,17 +669,20 @@ export function closeSurface(surface: string): void {
 
   try {
     if (handle.kind === "tab" && handle.windowId) {
-      // Default to safe behavior: close window ONLY if inspection positively succeeds
-      // AND confirms that exactly one block (or 0) remains in the window.
-      // If inspection fails or throws, or if multiple blocks exist, close only handle.blockId!
+      // Default to safe behavior: close window ONLY if inspection explicitly succeeds,
+      // layers is a non-empty array, and extracting all blocks across all layers results
+      // in an array containing EXACTLY ONE block whose block_id matches handle.blockId.
+      // In ALL OTHER CASES (missing layers, empty layers, 0 blocks found, > 1 blocks found,
+      // any other block_id present, or inspection thrown/failed), close ONLY handle.blockId!
       let canCloseWindowSafely = false;
       try {
         const raw = rexExec(["window", "inspect", "-s", handle.sessionId, handle.windowId, "--json"]);
         const win = JSON.parse(raw);
-        const layers = Array.isArray(win?.layers) ? win.layers : [];
-        const blocks = layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
-        if (blocks.length <= 1) {
-          canCloseWindowSafely = true;
+        if (Array.isArray(win?.layers) && win.layers.length > 0) {
+          const blocks = win.layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
+          if (blocks.length === 1 && blocks[0]?.block_id === handle.blockId) {
+            canCloseWindowSafely = true;
+          }
         }
       } catch {
         // Inspection failed or window target not found; do NOT close the entire window

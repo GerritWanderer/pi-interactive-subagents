@@ -3144,17 +3144,31 @@ describe("rex.ts unit tests", () => {
       status: "launched",
     });
 
+    registerSurfaceHandle({
+      id: "unlaunched-parent-id",
+      kind: "tab",
+      name: "unlaunched-parent",
+      sessionId: process.env.REX_SESSION!,
+      status: "reserved",
+    });
+
     try {
       const splitHandleId = createSurfaceSplit("child-split-test", "right", "parent-handle-id");
       const splitHandle = getSurfaceHandle(splitHandleId);
       assert.ok(splitHandle);
       assert.equal(splitHandle.anchorBlockId, parentBlock, "fromSurface handle string should resolve to parent's blockId");
+
+      assert.throws(
+        () => createSurfaceSplit("child-fail-test", "right", "unlaunched-parent-id"),
+        /has not been launched yet; no block ID available to split/,
+      );
     } finally {
       unregisterSurfaceHandle("parent-handle-id");
+      unregisterSurfaceHandle("unlaunched-parent-id");
     }
   });
 
-  it("closeSurface closes only blockId when window inspection fails or throws", async () => {
+  it("closeSurface closes only blockId when window inspection fails, throws, or layout is malformed/has multiple blocks", async () => {
     const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
     registerSurfaceHandle({
       id: "test-inspect-fail-handle",
