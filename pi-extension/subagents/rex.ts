@@ -424,15 +424,31 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     }
     args.push("--", "bash", "-l", scriptPath);
 
-    const res = rexJson(args);
+    let res: any;
+    try {
+      res = rexJson(args);
+    } catch (err: any) {
+      // Try to parse partial response from error message if available
+      try {
+        const match = err?.message?.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (parsed?.window_id) handle.windowId = parsed.window_id;
+          if (Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0) handle.blockId = parsed.block_ids[0];
+        }
+      } catch {}
+      throw err;
+    }
+
     const windowId = res?.window_id;
     const blockIds = res?.block_ids;
+    if (windowId) handle.windowId = windowId;
+    if (Array.isArray(blockIds) && blockIds.length > 0) handle.blockId = blockIds[0];
+
     if (!windowId || !Array.isArray(blockIds) || blockIds.length === 0) {
       throw new Error(`Failed to create Rex window for subagent: unexpected output ${JSON.stringify(res)}`);
     }
 
-    handle.windowId = windowId;
-    handle.blockId = blockIds[0];
     handle.status = "launched";
   } else {
     // rex split -s SESSION -b ANCHOR --split=DIRECTION --label=LABEL --focus=false --keep-open --json -- COMMAND...
@@ -456,13 +472,27 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     }
     args.push("--", "bash", "-l", scriptPath);
 
-    const res = rexJson(args);
+    let res: any;
+    try {
+      res = rexJson(args);
+    } catch (err: any) {
+      try {
+        const match = err?.message?.match(/\{[\s\S]*\}/);
+        if (match) {
+          const parsed = JSON.parse(match[0]);
+          if (Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0) handle.blockId = parsed.block_ids[0];
+        }
+      } catch {}
+      throw err;
+    }
+
     const blockIds = res?.block_ids;
+    if (Array.isArray(blockIds) && blockIds.length > 0) handle.blockId = blockIds[0];
+
     if (!Array.isArray(blockIds) || blockIds.length === 0) {
       throw new Error(`Failed to split Rex block for subagent: unexpected output ${JSON.stringify(res)}`);
     }
 
-    handle.blockId = blockIds[0];
     handle.status = "launched";
   }
 }

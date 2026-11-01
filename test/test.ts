@@ -3172,86 +3172,226 @@ describe("rex.ts unit tests", () => {
     const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
     const executedCommands: string[][] = [];
 
-    // 1. Lone block tab -> window close
-    __rexTest__.setRexExecutor((args) => {
-      executedCommands.push(args);
-      if (args[0] === "window" && args[1] === "inspect") {
-        return JSON.stringify({
-          layers: [{ blocks: [{ block_id: "block:lone-1" }] }],
-        });
+    try {
+      // 1. Lone block tab -> window close
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({
+            layers: [{ blocks: [{ block_id: "block:lone-1" }] }],
+          });
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-lone",
+        kind: "tab",
+        name: "lone",
+        sessionId: "session:test",
+        windowId: "window:w1",
+        blockId: "block:lone-1",
+        status: "launched",
+      });
+
+      closeSurface("tab-lone");
+      assert.deepEqual(executedCommands[executedCommands.length - 1], [
+        "window", "close", "-s", "session:test", "window:w1",
+      ]);
+
+      // 2. Multi-block tab -> block close
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({
+            layers: [{ blocks: [{ block_id: "block:parent" }, { block_id: "block:child" }] }],
+          });
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-multi",
+        kind: "tab",
+        name: "multi",
+        sessionId: "session:test",
+        windowId: "window:w1",
+        blockId: "block:parent",
+        status: "launched",
+      });
+
+      closeSurface("tab-multi");
+      assert.deepEqual(executedCommands[executedCommands.length - 1], [
+        "block", "close", "-s", "session:test", "block:parent",
+      ]);
+
+      // 3. Inspection throws error -> block close
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          throw new Error("transport error");
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-err",
+        kind: "tab",
+        name: "err",
+        sessionId: "session:test",
+        windowId: "window:w1",
+        blockId: "block:err-1",
+        status: "launched",
+      });
+
+      closeSurface("tab-err");
+      assert.deepEqual(executedCommands[executedCommands.length - 1], [
+        "block", "close", "-s", "session:test", "block:err-1",
+      ]);
+    } finally {
+      __rexTest__.setRexExecutor(null);
+    }
+  });
+
+  it("sendMessage deterministically checks safety status and sends paste + enter events", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, sendMessage, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const executedCommands: string[][] = [];
+
+    try {
+      // (a) Absent/missing status report rejects delivery and sends zero input events
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "program_status") {
+          return JSON.stringify({ records: [] });
+        }
+        return "{}";
+      });
+
+      registerSurfaceHandle({
+        id: "steer-handle-test",
+        kind: "tab",
+        name: "steer-test",
+        sessionId: "session:test",
+        blockId: "block:steer-1",
+        status: "launched",
+      });
+
+      assert.throws(
+        () => sendMessage("steer-handle-test", "hello"),
+        /No program status records available/,
+      );
+      assert.equal(
+        executedCommands.some((c) => c.includes("block.event")),
+        false,
+        "no input events should be sent when status is missing",
+      );
+
+      // (b) Blocked/error status report rejects delivery and sends zero input events
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "program_status") {
+          return JSON.stringify({
+            records: [
+              { state: "blocked", kind: "permission", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+            ],
+          });
+        }
+        return "{}";
+      });
+
+      assert.throws(
+        () => sendMessage("steer-handle-test", "hello"),
+        /blocked on a permission dialog/,
+      );
+      assert.equal(
+        executedCommands.some((c) => c.includes("block.event")),
+        false,
+        "no input events should be sent when subagent is blocked",
+      );
+
+      // (c) Valid unblocked Pi status report delivers paste event followed by Enter key event
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "program_status") {
+          return JSON.stringify({
+            records: [
+              { state: "working", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+            ],
+          });
+        }
+        return "{}";
+      });
+
+      sendMessage("steer-handle-test", "hello world\n");
+      const apiCalls = executedCommands.filter((c) => c[0] === "api" && c[1] === "call");
+      assert.equal(apiCalls.length, 2, "expected paste event followed by enter key event");
+
+      const pastePayload = JSON.parse(apiCalls[0][3]);
+      assert.equal(pastePayload.event.type, "paste");
+      assert.equal(pastePayload.event.payload.text, "hello world");
+
+      const enterPayload = JSON.parse(apiCalls[1][3]);
+      assert.equal(enterPayload.event.type, "key");
+      assert.equal(enterPayload.event.payload.key, "enter");
+    } finally {
+      unregisterSurfaceHandle("steer-handle-test");
+      __rexTest__.setRexExecutor(null);
+    }
+  });
+
+  it("launch failure cleans up created resources if Rex returns IDs but post-processing fails", async () => {
+    const { createSurface, sendLongCommand, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const executedCommands: string[][] = [];
+
+    try {
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
+
+      // Force an error after Rex creation (e.g. by intercepting launch)
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "block" && args[1] === "inspect") {
+          return JSON.stringify({ block: { block_id: "block:anchor" } });
+        }
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({
+            layers: [{ blocks: [{ block_id: "block:partial-blk" }] }],
+          });
+        }
+        if (args[0] === "window" && args[1] === "new") {
+          // returns malformed JSON that has a partial window_id in error message
+          throw new Error('rex window new failed: {"window_id":"window:partial-win","block_ids":["block:partial-blk"]}');
+        }
+        return "{}";
+      });
+
+      let surfaceId: string;
+      try {
+        surfaceId = createSurface("fail-test");
+      } finally {
+        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
       }
-      return "";
-    });
+      const handle = getSurfaceHandle(surfaceId);
+      assert.ok(handle);
+      assert.equal(handle.kind, "tab");
 
-    registerSurfaceHandle({
-      id: "tab-lone",
-      kind: "tab",
-      name: "lone",
-      sessionId: "session:test",
-      windowId: "window:w1",
-      blockId: "block:lone-1",
-      status: "launched",
-    });
+      assert.throws(() => {
+        sendLongCommand(surfaceId, "echo fail");
+      });
 
-    closeSurface("tab-lone");
-    assert.deepEqual(executedCommands[executedCommands.length - 1], [
-      "window", "close", "-s", "session:test", "window:w1",
-    ]);
-
-    // 2. Multi-block tab -> block close
-    executedCommands.length = 0;
-    __rexTest__.setRexExecutor((args) => {
-      executedCommands.push(args);
-      if (args[0] === "window" && args[1] === "inspect") {
-        return JSON.stringify({
-          layers: [{ blocks: [{ block_id: "block:parent" }, { block_id: "block:child" }] }],
-        });
-      }
-      return "";
-    });
-
-    registerSurfaceHandle({
-      id: "tab-multi",
-      kind: "tab",
-      name: "multi",
-      sessionId: "session:test",
-      windowId: "window:w1",
-      blockId: "block:parent",
-      status: "launched",
-    });
-
-    closeSurface("tab-multi");
-    assert.deepEqual(executedCommands[executedCommands.length - 1], [
-      "block", "close", "-s", "session:test", "block:parent",
-    ]);
-
-    // 3. Inspection throws error -> block close
-    executedCommands.length = 0;
-    __rexTest__.setRexExecutor((args) => {
-      executedCommands.push(args);
-      if (args[0] === "window" && args[1] === "inspect") {
-        throw new Error("transport error");
-      }
-      return "";
-    });
-
-    registerSurfaceHandle({
-      id: "tab-err",
-      kind: "tab",
-      name: "err",
-      sessionId: "session:test",
-      windowId: "window:w1",
-      blockId: "block:err-1",
-      status: "launched",
-    });
-
-    closeSurface("tab-err");
-    assert.deepEqual(executedCommands[executedCommands.length - 1], [
-      "block", "close", "-s", "session:test", "block:err-1",
-    ]);
-
-    // Reset executor
-    __rexTest__.setRexExecutor(null);
+      // Assert that closeSurface cleaned up the captured partial window
+      assert.equal(getSurfaceHandle(surfaceId), undefined);
+      assert.ok(
+        executedCommands.some((c) => c[0] === "window" && c[1] === "close" && c.includes("window:partial-win")),
+        "closeSurface should have closed the created window after launch failure",
+      );
+    } finally {
+      __rexTest__.setRexExecutor(null);
+    }
   });
 
   it("createSurfaceSplit parent-handle resolution runs deterministically with stubbed inspection", async () => {

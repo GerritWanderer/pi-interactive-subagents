@@ -166,9 +166,12 @@ for (const backend of backends) {
     it("launches command with special-character arguments and paths", async () => {
       const surface = createTrackedSurface(env, "special-chars");
       const specialArg = "arg with spaces and 'quotes' & $METACHARED";
-      sendLongCommand(surface, `echo "SPECIAL: ${specialArg}"`);
+      // Escape for inclusion in the wrapper script: printf '%s\n' 'arg with spaces and '\''quotes'\'' & $METACHARED'
+      const { shellEscape } = await import("../../pi-extension/subagents/rex.ts");
+      sendLongCommand(surface, `printf '%s\\n' ${shellEscape(specialArg)}`);
 
-      await waitForScreen(surface, /SPECIAL: arg with spaces and 'quotes'/, 10_000, 20);
+      const screen = await waitForScreen(surface, /arg with spaces and 'quotes' & \$METACHARED/, 10_000, 20);
+      assert.match(screen, /arg with spaces and 'quotes' & \$METACHARED/, "exact literal argument must appear in screen output");
     });
 
     it("closing a parent tab surface preserves surviving nested child blocks in the same window", async () => {
@@ -245,26 +248,34 @@ for (const backend of backends) {
 
     it("sendMessage exercises full safety check and delivery against running process", async () => {
       const surface = createTrackedSurface(env, "send-msg-test");
-      // Run a shell that sets a status or reads input
-      sendLongCommand(surface, `bash`);
+      // 1. In a raw bash process without OSC 7501 status, sendMessage must fail safety check
+      sendLongCommand(surface, `cat`);
       await sleep(1000);
 
-      // If program_status reports no records yet, sendMessage throws safely
-      try {
-        sendMessage(surface, "echo HELLO_STEER");
-        await waitForScreen(surface, /HELLO_STEER/, 5000, 20);
-      } catch (err: any) {
-        // Confirms safety refusal when status is absent/untrusted
-        assert.match(err.message, /No program status records available|Cannot deliver message safely/);
-      }
+      assert.throws(
+        () => sendMessage(surface, "echo HELLO_STEER"),
+        /No program status records available|Cannot deliver message safely/,
+        "sendMessage must refuse delivery when no trustworthy Pi status exists",
+      );
+
+      // 2. In a process that emits Pi program status (OSC 7501), sendMessage succeeds and delivers paste + enter
+      const statusSurface = createTrackedSurface(env, "status-send-test");
+      // Emit OSC 7501 status sequence for pi: \x1b]7501;state=working:app=pi\x1b\\
+      sendLongCommand(statusSurface, `printf '\\033]7501;state=working:app=pi\\033\\\\'; cat`);
+      await sleep(1000);
+
+      sendMessage(statusSurface, "echo STATUS_VERIFIED");
+      const screen = await waitForScreen(statusSurface, /echo STATUS_VERIFIED/, 10_000, 20);
+      assert.match(screen, /echo STATUS_VERIFIED/);
     });
 
     it("launches command with special-character cwd and script path", async () => {
-      const { mkdirSync } = await import("node:fs");
+      const { mkdirSync, realpathSync } = await import("node:fs");
       const { join } = await import("node:path");
 
       const specialCwd = join(env.dir, "cwd with 'quotes' & spaces");
       mkdirSync(specialCwd, { recursive: true });
+      const canonicalCwd = realpathSync(specialCwd);
 
       const surface = createTrackedSurface(env, "special-cwd");
       const specialScript = join(specialCwd, "test 'special' script.sh");
@@ -274,7 +285,8 @@ for (const backend of backends) {
         scriptPath: specialScript,
       });
 
-      await waitForScreen(surface, /SPECIAL_CWD_OK/, 10_000, 20);
+      const screen = await waitForScreen(surface, /SPECIAL_CWD_OK/, 10_000, 20);
+      assert.match(screen, new RegExp(canonicalCwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "screen must show exact cwd path");
     });
 
     it("cleans up reservations and resources on launch failure", async () => {
