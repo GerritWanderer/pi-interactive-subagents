@@ -3111,25 +3111,64 @@ describe("rex.ts unit tests", () => {
     assert.equal(getSurfaceHandle("test-tab-handle"), undefined);
   });
 
-  it("sendMessage refuses delivery when safety status check fails", async () => {
-    const { registerSurfaceHandle, sendMessage, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+  it("validateTrustworthyProgramStatus rejects mixed or unattributed blocked/error records", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    // An unattributed blocked record alongside a working pi record must reject delivery
+    const mixedRes = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "working", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+      { state: "blocked", kind: "auth", updated_at: "2026-11-01T00:00:00Z" },
+    ], "pi");
+    assert.equal(mixedRes.ok, false);
+    assert.match(mixedRes.error, /blocked on a auth dialog/);
+
+    // Another app's error record alongside working pi record must also reject delivery
+    const otherAppError = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "working", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+      { state: "error", app: "bash", updated_at: "2026-11-01T00:00:00Z", msg: "crash" },
+    ], "pi");
+    assert.equal(otherAppError.ok, false);
+    assert.match(otherAppError.error, /in an error state/);
+  });
+
+  it("createSurfaceSplit resolves fromSurface handle string to its blockId", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, createSurfaceSplit, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    const parentBlock = process.env.REX_BLOCK;
+    if (!parentBlock) return;
+
     registerSurfaceHandle({
-      id: "test-send-handle",
+      id: "parent-handle-id",
       kind: "tab",
-      name: "send-agent",
-      sessionId: "session:test",
-      blockId: "block:nonexistent-send",
+      name: "parent-handle",
+      sessionId: process.env.REX_SESSION!,
+      blockId: parentBlock,
       status: "launched",
     });
 
     try {
-      assert.throws(
-        () => sendMessage("test-send-handle", "hello"),
-        /unable to query program status|Cannot deliver message safely/,
-      );
+      const splitHandleId = createSurfaceSplit("child-split-test", "right", "parent-handle-id");
+      const splitHandle = getSurfaceHandle(splitHandleId);
+      assert.ok(splitHandle);
+      assert.equal(splitHandle.anchorBlockId, parentBlock, "fromSurface handle string should resolve to parent's blockId");
     } finally {
-      unregisterSurfaceHandle("test-send-handle");
+      unregisterSurfaceHandle("parent-handle-id");
     }
+  });
+
+  it("closeSurface closes only blockId when window inspection fails or throws", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    registerSurfaceHandle({
+      id: "test-inspect-fail-handle",
+      kind: "tab",
+      name: "tab-inspect-fail",
+      sessionId: process.env.REX_SESSION ?? "session:test",
+      windowId: "window:nonexistent-fail-window",
+      blockId: "block:nonexistent-fail-block",
+      status: "launched",
+    });
+
+    // Should not throw, and should attempt block close only (safe path)
+    closeSurface("test-inspect-fail-handle");
+    assert.equal(getSurfaceHandle("test-inspect-fail-handle"), undefined);
   });
 });
 

@@ -317,8 +317,10 @@ export function createSurfaceSplit(
   requireMux();
   const ctx = getRexContext();
   const sessionId = ctx.session!;
-  const anchorBlock = fromSurface ?? ctx.block!;
-  validateAnchorBlock(anchorBlock, sessionId);
+  const resolvedAnchor = fromSurface
+    ? (getSurfaceHandle(fromSurface)?.blockId ?? fromSurface)
+    : ctx.block!;
+  validateAnchorBlock(resolvedAnchor, sessionId);
 
   const dir: "right" | "below" =
     direction === "below" || direction === "down" ? "below" : "right";
@@ -329,7 +331,7 @@ export function createSurfaceSplit(
     kind: "split",
     name,
     sessionId,
-    anchorBlockId: anchorBlock,
+    anchorBlockId: resolvedAnchor,
     direction: dir,
     status: "reserved",
   };
@@ -505,7 +507,7 @@ export function sendEnterKeyEvent(blockId: string, session: string): void {
 
 export function validateTrustworthyProgramStatus(
   records: ProgramStatusRecord[],
-  expectedApp?: string,
+  expectedApp = "pi",
 ): { ok: true; targetRecord: ProgramStatusRecord } | { ok: false; error: string } {
   if (!Array.isArray(records) || records.length === 0) {
     return {
@@ -514,41 +516,39 @@ export function validateTrustworthyProgramStatus(
     };
   }
 
-  // Find relevant target record: if expectedApp is given, look for matching app / effective_app, or root record
-  const matching = records.filter((r) => {
-    if (!r || typeof r.state !== "string" || !r.updated_at) return false;
-    if (expectedApp) {
-      return (r as any).effective_app === expectedApp || r.app === expectedApp;
-    }
-    return true;
-  });
-
-  if (matching.length === 0) {
-    return {
-      ok: false,
-      error: `No trustworthy program status found matching application ${expectedApp ?? "target"}.`,
-    };
-  }
-
-  // Check if any matching record is blocked on dialog or in error state
-  const problematic = matching.find(
-    (r) => r.state === "blocked" || r.state === "error",
+  // 1. If ANY record on the block is blocked or in error (even unattributed or another app), refuse immediately
+  const anyProblematic = records.find(
+    (r) => r && (r.state === "blocked" || r.state === "error"),
   );
-
-  if (problematic) {
-    if (problematic.state === "blocked") {
+  if (anyProblematic) {
+    if (anyProblematic.state === "blocked") {
+      const dialogKind = anyProblematic.kind ? `${anyProblematic.kind} ` : "";
       return {
         ok: false,
-        error: `Subagent is blocked on a ${problematic.kind ?? "dialog"} dialog (${problematic.msg || problematic.state}). Steering refused.`,
+        error: `Subagent is blocked on a ${dialogKind}dialog (${anyProblematic.msg || anyProblematic.state}). Steering refused.`,
       };
     }
     return {
       ok: false,
-      error: `Subagent is in an error state (${problematic.msg || problematic.state}). Steering refused.`,
+      error: `Subagent is in an error state (${anyProblematic.msg || anyProblematic.state}). Steering refused.`,
     };
   }
 
-  return { ok: true, targetRecord: matching[0] };
+  // 2. Positively verify that a valid, non-blocked target record (e.g. pi) exists
+  const validTarget = records.find((r) => {
+    if (!r || typeof r.state !== "string" || !r.updated_at) return false;
+    const app = (r as any).effective_app ?? r.app;
+    return app === expectedApp && (r.state === "working" || r.state === "idle" || r.state === "done");
+  });
+
+  if (!validTarget) {
+    return {
+      ok: false,
+      error: `No trustworthy program status found confirming ${expectedApp} is running. Steering refused.`,
+    };
+  }
+
+  return { ok: true, targetRecord: validTarget };
 }
 
 export function sendMessage(surface: string, message: string): void {
@@ -652,22 +652,27 @@ export function closeSurface(surface: string): void {
 
   try {
     if (handle.kind === "tab" && handle.windowId) {
-      // Check if other blocks still exist in this window before closing the whole window
-      let windowHasOtherBlocks = false;
+      // Default to safe behavior: close window ONLY if inspection positively succeeds
+      // AND confirms that exactly one block (or 0) remains in the window.
+      // If inspection fails or throws, or if multiple blocks exist, close only handle.blockId!
+      let canCloseWindowSafely = false;
       try {
         const raw = rexExec(["window", "inspect", "-s", handle.sessionId, handle.windowId, "--json"]);
         const win = JSON.parse(raw);
         const layers = Array.isArray(win?.layers) ? win.layers : [];
         const blocks = layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
-        if (blocks.length > 1) {
-          windowHasOtherBlocks = true;
+        if (blocks.length <= 1) {
+          canCloseWindowSafely = true;
         }
-      } catch {}
+      } catch {
+        // Inspection failed or window target not found; do NOT close the entire window
+        canCloseWindowSafely = false;
+      }
 
-      if (windowHasOtherBlocks && handle.blockId) {
-        rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
-      } else {
+      if (canCloseWindowSafely) {
         rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
+      } else if (handle.blockId) {
+        rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
       }
     } else if (handle.blockId) {
       rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
