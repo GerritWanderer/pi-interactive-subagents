@@ -804,6 +804,20 @@ export function closeSurface(surface: string): void {
 
 // ── Exit Polling & Process State ──
 
+export class RexInfrastructureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RexInfrastructureError";
+  }
+}
+
+export function isRexInfrastructureError(err: any): boolean {
+  return (
+    err instanceof RexInfrastructureError ||
+    (err && typeof err.message === "string" && err.message.startsWith("Sustained infrastructure failure"))
+  );
+}
+
 export interface PollResult {
   reason: "done" | "sentinel" | "error" | "interrupted";
   exitCode: number;
@@ -942,7 +956,7 @@ export async function pollForExit(
         // Transient error or process query failed
         consecutiveErrors++;
         if (consecutiveErrors >= maxErrors) {
-          throw new Error(
+          throw new RexInfrastructureError(
             `Sustained infrastructure failure observing Rex block ${currentBlockId}: ${err?.message || String(err)}`,
           );
         }
@@ -990,4 +1004,6 @@ export const __rexTest__ = {
   hasCommand,
   queryBlockProcess,
   pollForExit,
+  RexInfrastructureError,
+  isRexInfrastructureError,
 };

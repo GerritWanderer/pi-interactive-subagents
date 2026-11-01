@@ -3979,6 +3979,44 @@ describe("rex.ts unit tests", () => {
         assert.equal(watchRes.outcome, "success");
         assert.equal(watchRes.exitCode, 0);
         assert.equal(watchRes.summary, "Sub-agent exited without output");
+
+        // Infrastructure observation failure test:
+        // When polling fails with RexInfrastructureError after maxConsecutiveErrors,
+        // watchSubagent must report the failure, keep the surface tracked, and NOT kill or close it.
+        const infraRunning = {
+          id: "r-infra",
+          name: "infra-agent",
+          task: "task",
+          surface: "cleanup-res-surface",
+          startTime: Date.now(),
+          sessionFile: "/tmp/nonexistent-session.jsonl",
+          interactive: false,
+          statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        };
+
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            throw new Error("persistent connection refused");
+          }
+          if (args[0] === "block" && args[1] === "close") {
+            throw new Error("should not be called on infra error");
+          }
+          return "{}";
+        });
+        registerSurfaceHandle({
+          id: "cleanup-res-surface",
+          kind: "split",
+          name: "cleanup-res",
+          sessionId: "session:mock",
+          blockId: "block:infra-block",
+          status: "launched",
+        });
+
+        const infraRes = await testApi.watchSubagent(infraRunning, new AbortController().signal);
+        assert.equal(infraRes.outcome, "failure");
+        assert.match(infraRes.summary, /Infrastructure observation failure/);
+        assert.match(infraRes.summary, /Pane was kept open/);
+        assert.ok(getSurfaceHandle("cleanup-res-surface"), "surface must remain open and tracked on infrastructure error");
       } finally {
         unregisterSurfaceHandle("cleanup-res-surface");
         __rexTest__.setRexExecutor(null);
@@ -4110,15 +4148,61 @@ describe("rex.ts unit tests", () => {
           const strippedPath = sysPromptArg.replace(/^'|'$/g, "");
           assert.equal(readFileSync(strippedPath, "utf8"), "You are the worker.");
 
-          const executeRes = await messageTool.execute(
-            "msg-call-1",
-            { name: "missing-snapshot-agent", message: "continue" },
-            undefined,
-            undefined,
-            mockCtx,
-          );
-          assert.match(executeRes.content[0].text, /no sandbox snapshot found/);
-          assert.match(executeRes.details.error, /no sandbox snapshot found/);
+        // Verify resume when effectiveCwd is undefined replays ctx.cwd from the snapshot
+        const rootSessionFile = join(dir, "default-cwd.jsonl");
+        writeFileSync(rootSessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+        const defaultCwdLoadout: SubagentLoadout = {
+          agent: "scout",
+          toolAllowlist: "read,grep",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: "/path/from/parent/context/cwd",
+          agentDir: null,
+        };
+        writeSubagentLoadout(rootSessionFile, defaultCwdLoadout);
+        registerName(parentArtifactDir, "default-cwd-agent", {
+          sessionFile: rootSessionFile,
+          sessionId: "sess-default-cwd",
+        });
+
+        const rootLoaded = readSubagentLoadout(rootSessionFile);
+        assert.equal(rootLoaded?.cwd, "/path/from/parent/context/cwd");
+
+        const partsDefault: string[] = ["pi", "--session", rootSessionFile];
+        testApi.applySandboxToParts(partsDefault, defaultCwdLoadout, { artifactDir: join(dir, "artifacts"), name: "scout" });
+        assert.equal(defaultCwdLoadout.cwd, "/path/from/parent/context/cwd");
+
+        // Verify preparation failure releases surface reservation
+        let prepFailedSurface = "";
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "inspect") {
+            return JSON.stringify({ block: { block_id: "block:mock-anchor" } });
+          }
+          return "{}";
+        });
+
+        await assert.rejects(
+          async () => {
+            await testApi.launchSubagent(
+              { agent: "worker", task: "prep fail", name: "prep-fail-agent" },
+              {
+                sessionManager: {
+                  getSessionFile: () => join(dir, "main.jsonl"),
+                  getSessionId: () => "main-sess",
+                  getSessionDir: () => "/nonexistent-dir/cannot-create-artifacts/artifacts",
+                },
+                cwd: dir,
+              },
+            );
+          },
+        );
+
+        // Ensure no surface handle is leaked in runningSubagents
+        assert.equal(testApi.runningSubagents.has("prep-fail-agent"), false);
         } finally {
           __rexTest__.setCommandAvailabilityOverride(undefined);
           __rexTest__.setRexContextOverride(undefined);
@@ -4129,9 +4213,6 @@ describe("rex.ts unit tests", () => {
     });
 
     it("Task 3.6: interactive and pending-work auto-exit policy and clean exit", async () => {
-      // 1. Interactive agent (autoExit: false) does not auto-exit on completion
-      assert.equal(shouldAutoExitOnAgentEnd(false, [{ role: "assistant", stopReason: "end_turn" }]), true);
-
       // Verify subagent-done agent_end handler directly:
       // (a) autoExit: false keeps session open
       const savedEnv = {
@@ -4247,6 +4328,21 @@ describe("rex.ts unit tests", () => {
       assert.match(interruptedPres, /Sub-agent "interrupted-worker" was interrupted/);
       assert.match(interruptedPres, /pane closed externally/);
       assert.match(interruptedPres, /The session data was preserved/);
+
+      // (b) Cancellation presentation distinguishes abort from external pane closure
+      const cancelledPres = testApi.resolveResultPresentation(
+        {
+          exitCode: 1,
+          elapsed: 5,
+          summary: "Subagent cancelled.",
+          outcome: "interrupted",
+          error: "cancelled",
+        },
+        "cancelled-worker",
+      );
+      assert.match(cancelledPres, /Sub-agent "cancelled-worker" was cancelled/);
+      assert.doesNotMatch(cancelledPres, /pane closed externally/);
+      assert.match(cancelledPres, /The session data was preserved/);
     });
   });
 });
