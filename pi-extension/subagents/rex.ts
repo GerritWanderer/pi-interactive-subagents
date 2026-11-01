@@ -813,7 +813,8 @@ export function queryBlockProcess(blockId: string, session: string): RexProcessO
     return res as RexProcessOutput;
   } catch (error: any) {
     const msg = error?.message || String(error);
-    if (/not found/i.test(msg)) {
+    const stderr = error?.stderr || "";
+    if (/not found/i.test(msg) || /not found/i.test(stderr)) {
       return "not_found";
     }
     throw error;
@@ -839,10 +840,15 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    maxConsecutiveErrors?: number;
   },
 ): Promise<PollResult> {
   const handle = getSurfaceHandle(surface);
+  const blockId = handle?.blockId;
+  const sessionId = handle?.sessionId;
   const start = Date.now();
+  let consecutiveErrors = 0;
+  const maxErrors = options.maxConsecutiveErrors ?? 10;
 
   for (;;) {
     if (signal.aborted) {
@@ -871,9 +877,12 @@ export async function pollForExit(
     }
 
     // 3. Query Rex block process
-    if (handle?.blockId) {
+    const currentBlockId = handle?.blockId ?? blockId;
+    const currentSessionId = handle?.sessionId ?? sessionId;
+    if (currentBlockId && currentSessionId) {
       try {
-        const proc = queryBlockProcess(handle.blockId, handle.sessionId);
+        const proc = queryBlockProcess(currentBlockId, currentSessionId);
+        consecutiveErrors = 0; // reset on successful transport query
         if (proc === "not_found") {
           return {
             reason: "interrupted",
@@ -891,7 +900,20 @@ export async function pollForExit(
         }
       } catch (err: any) {
         // Transient error or process query failed
+        consecutiveErrors++;
+        if (consecutiveErrors >= maxErrors) {
+          throw new Error(
+            `Sustained infrastructure failure observing Rex block ${currentBlockId}: ${err?.message || String(err)}`,
+          );
+        }
       }
+    } else {
+      // Surface was closed or unmapped without a block ID
+      return {
+        reason: "interrupted",
+        exitCode: 1,
+        errorMessage: "Subagent Rex pane was closed externally before completion.",
+      };
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
@@ -924,4 +946,6 @@ export const __rexTest__ = {
   setRexContextOverride,
   setCommandAvailabilityOverride,
   hasCommand,
+  queryBlockProcess,
+  pollForExit,
 };

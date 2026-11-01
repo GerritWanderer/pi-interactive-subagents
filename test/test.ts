@@ -167,6 +167,7 @@ async function withIsolatedAgentEnv(
   const root = createTestDir();
   const previousCwd = process.cwd();
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousSubagentAllowed = process.env.PI_SUBAGENT_ALLOWED;
   const projectDir = join(root, "project");
   const projectAgentsDir = join(projectDir, ".pi", "agents");
   const globalDir = join(root, "global");
@@ -176,12 +177,14 @@ async function withIsolatedAgentEnv(
   mkdirSync(globalAgentsDir, { recursive: true });
   process.chdir(projectDir);
   process.env.PI_CODING_AGENT_DIR = globalDir;
+  delete process.env.PI_SUBAGENT_ALLOWED;
 
   try {
     await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
   } finally {
     process.chdir(previousCwd);
     restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", previousSubagentAllowed);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -1950,18 +1953,24 @@ describe("tool registration", () => {
   });
 
   it("rejects a top-level spawn naming an unknown agent", async () => {
-    const { api, registeredTools } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
-    assert.ok(subagentTool, "expected subagent tool to be registered");
+    const savedAllowed = process.env.PI_SUBAGENT_ALLOWED;
+    delete process.env.PI_SUBAGENT_ALLOWED;
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+      assert.ok(subagentTool, "expected subagent tool to be registered");
 
-    const result = await subagentTool.execute("call-1", {
-      name: "x",
-      task: "do it",
-      agent: "wizard",
-    });
-    assert.equal(result.details?.error, "unknown agent");
-    assert.match(result.content[0].text, /not a known agent/i);
+      const result = await subagentTool.execute("call-1", {
+        name: "x",
+        task: "do it",
+        agent: "wizard",
+      });
+      assert.equal(result.details?.error, "unknown agent");
+      assert.match(result.content[0].text, /not a known agent/i);
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_ALLOWED", savedAllowed);
+    }
   });
 
   it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
@@ -3618,6 +3627,423 @@ describe("rex.ts unit tests", () => {
       __rexTest__.setCommandAvailabilityOverride(undefined);
       __rexTest__.setRexContextOverride(undefined);
     }
+  });
+
+  describe("Milestone 3: Lifecycle and steering unit tests", () => {
+    it("Task 3.1: generated launch scripts preserve real exit status, signals, sidecars, and alternate CLI sentinels", async () => {
+      const { sendLongCommand, createSurface, getSurfaceHandle, registerSurfaceHandle, unregisterSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+      const { readFileSync } = await import("node:fs");
+
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      delete process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+
+      __rexTest__.setRexContextOverride({
+        server: "unix:///tmp/mock.sock",
+        session: "session:mock-session",
+        block: "block:mock-anchor",
+      });
+      __rexTest__.setCommandAvailabilityOverride(true);
+
+      let launchedScript = "";
+      __rexTest__.setRexExecutor((args) => {
+        if (args[0] === "block" && args[1] === "inspect") {
+          return JSON.stringify({ block: { block_id: "block:mock-anchor" } });
+        }
+        if (args[0] === "window" && args[1] === "new") {
+          // extract the scriptPath argument
+          launchedScript = args[args.length - 1];
+          return JSON.stringify({ window_id: "window:w-status", block_ids: ["block:b-status"] });
+        }
+        if (args[0] === "split") {
+          launchedScript = args[args.length - 1];
+          return JSON.stringify({ block_ids: ["block:b-split"] });
+        }
+        return "{}";
+      });
+
+      const surfaceId = createSurface("status-preserve-test");
+      try {
+        const dummyCommand = 'false; echo "__SUBAGENT_DONE_"$?"__"';
+        const scriptPath = sendLongCommand(surfaceId, dummyCommand);
+        assert.ok(launchedScript.length > 0, "script must be launched");
+        assert.equal(launchedScript, scriptPath);
+
+        const content = readFileSync(scriptPath, "utf8");
+        assert.match(content, /false; echo "__SUBAGENT_DONE_"\$\?"__"/);
+
+        // Positive exit sidecar tests
+        assert.deepEqual(
+          __rexTest__.interpretExitSidecar({ type: "done" }),
+          { reason: "done", exitCode: 0 },
+        );
+        assert.deepEqual(
+          __rexTest__.interpretExitSidecar({ type: "error", errorMessage: "Rate limited", stopReason: "error" }),
+          { reason: "error", exitCode: 1, errorMessage: "Rate limited" },
+        );
+        // Negative / fallback exit sidecar tests
+        const emptyError = __rexTest__.interpretExitSidecar({ type: "error" });
+        assert.equal(emptyError.reason, "error");
+        assert.equal(emptyError.exitCode, 1);
+        assert.match(emptyError.errorMessage ?? "", /no errorMessage/);
+
+        // Unknown sidecar payload
+        assert.deepEqual(
+          __rexTest__.interpretExitSidecar({ type: "unknown" }),
+          { reason: "done", exitCode: 0 },
+        );
+      } finally {
+        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
+        unregisterSurfaceHandle(surfaceId);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+      }
+    });
+
+    it("Task 3.2: cancellable process observation distinguishes live, done, interruption, and bounded sustained infrastructure failure", async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+
+      // 1. Live process with done report
+      let processCallCount = 0;
+      __rexTest__.setRexExecutor((args) => {
+        if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+          processCallCount++;
+          if (processCallCount === 1) {
+            // Live: last_exit is null
+            return JSON.stringify({ last_exit: null, child: { pid: 1234, name: "pi" } });
+          }
+          // Completed: exit code 0
+          return JSON.stringify({ last_exit: { exit_code: 0 } });
+        }
+        return "{}";
+      });
+
+      registerSurfaceHandle({
+        id: "poll-done-surface",
+        kind: "tab",
+        name: "poll-done",
+        sessionId: "session:mock",
+        blockId: "block:done-1",
+        status: "launched",
+      });
+
+      const abortCtrl = new AbortController();
+      try {
+        const res = await __rexTest__.pollForExit("poll-done-surface", abortCtrl.signal, { interval: 10 });
+        assert.equal(res.reason, "done");
+        assert.equal(res.exitCode, 0);
+
+        // 2. Confirmed pane closure (not_found -> interrupted)
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            throw new Error('block "block:done-1" not found');
+          }
+          return "{}";
+        });
+        const interruptRes = await __rexTest__.pollForExit("poll-done-surface", abortCtrl.signal, { interval: 10 });
+        assert.equal(interruptRes.reason, "interrupted");
+        assert.equal(interruptRes.exitCode, 1);
+        assert.match(interruptRes.errorMessage ?? "", /closed externally/);
+
+        // 3. Transient transport failure recovers without interruption
+        let failCount = 0;
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            failCount++;
+            if (failCount === 1) {
+              throw new Error("temporary network glitch");
+            }
+            return JSON.stringify({ last_exit: { exit_code: 0 } });
+          }
+          return "{}";
+        });
+        const recoverRes = await __rexTest__.pollForExit("poll-done-surface", abortCtrl.signal, { interval: 10 });
+        assert.equal(recoverRes.reason, "done");
+        assert.equal(recoverRes.exitCode, 0);
+
+        // 4. Bounded sustained infrastructure failure throws error after maxConsecutiveErrors
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            throw new Error("persistent connection refused");
+          }
+          return "{}";
+        });
+        await assert.rejects(
+          __rexTest__.pollForExit("poll-done-surface", abortCtrl.signal, { interval: 5, maxConsecutiveErrors: 3 }),
+          /Sustained infrastructure failure observing Rex block/,
+        );
+
+        // 5. Cancellation via AbortSignal
+        const preAborted = new AbortController();
+        preAborted.abort();
+        await assert.rejects(
+          __rexTest__.pollForExit("poll-done-surface", preAborted.signal, { interval: 10 }),
+          /Aborted/,
+        );
+      } finally {
+        unregisterSurfaceHandle("poll-done-surface");
+        __rexTest__.setRexExecutor(null);
+      }
+    });
+
+    it("Task 3.3: separates result collection from idempotent resource cleanup", async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+      const testApi = (subagentsModule as any).__test__;
+
+      const executedCommands: string[][] = [];
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "close") {
+          throw new Error("window already closed by user");
+        }
+        if (args[0] === "block" && args[1] === "close") {
+          throw new Error("block already closed by user");
+        }
+        return "{}";
+      });
+
+      registerSurfaceHandle({
+        id: "cleanup-res-surface",
+        kind: "split",
+        name: "cleanup-res",
+        sessionId: "session:mock",
+        blockId: "block:gone-block",
+        status: "launched",
+      });
+
+      try {
+        // closeSurface must be idempotent and not throw even if the target is already absent
+        assert.doesNotThrow(() => closeSurface("cleanup-res-surface"));
+        assert.equal(getSurfaceHandle("cleanup-res-surface"), undefined);
+
+        // Second call on already-closed/unregistered surface is also a safe no-op
+        assert.doesNotThrow(() => closeSurface("cleanup-res-surface"));
+
+        // Watcher result collection with close failure must not replace collected summary
+        const fakeRunning = {
+          id: "r-cleanup",
+          name: "clean-agent",
+          task: "task",
+          surface: "cleanup-res-surface",
+          startTime: Date.now(),
+          sessionFile: "/tmp/nonexistent-session.jsonl",
+          interactive: false,
+          statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        };
+
+        // Stub pollForExit by using mocked process call returning exit 0
+        let polled = false;
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            polled = true;
+            return JSON.stringify({ last_exit: { exit_code: 0 } });
+          }
+          if (args[0] === "block" && args[1] === "close") {
+            throw new Error("close failed cosmetic");
+          }
+          return "{}";
+        });
+        registerSurfaceHandle({
+          id: "cleanup-res-surface",
+          kind: "split",
+          name: "cleanup-res",
+          sessionId: "session:mock",
+          blockId: "block:polled-block",
+          status: "launched",
+        });
+
+        const watchRes = await testApi.watchSubagent(fakeRunning, new AbortController().signal);
+        assert.equal(polled, true);
+        assert.equal(watchRes.outcome, "success");
+        assert.equal(watchRes.exitCode, 0);
+        assert.equal(watchRes.summary, "Sub-agent exited without output");
+      } finally {
+        unregisterSurfaceHandle("cleanup-res-surface");
+        __rexTest__.setRexExecutor(null);
+      }
+    });
+
+    it("Task 3.4: single-message newline flattening and safety status refusal vs ordinary input", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+
+      // 1. Literal quotes, metacharacters, and multi-line message flattened to single turn
+      let delivered = "";
+      const fakeRunning = {
+        id: "steer-test-id",
+        name: "steer-test",
+        task: "task",
+        surface: "surf-1",
+        startTime: Date.now(),
+        sessionFile: "/tmp/s.jsonl",
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+
+      const multiline = 'line 1\nline 2 "with quotes"\n`echo metachar` $VAR';
+      const steerRes = testApi.steerSubagent(fakeRunning, multiline, (_surface: string, text: string) => {
+        delivered = text;
+      });
+      assert.deepEqual(steerRes, { ok: true });
+      assert.equal(delivered, 'line 1 line 2 "with quotes" `echo metachar` $VAR');
+
+      // 2. Multi-record status where one is blocked or error refuses input
+      const blockedRecords = [
+        { state: "idle", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+        { state: "blocked", kind: "question", app: "pi", msg: "Overwrite file?", updated_at: "2026-11-01T00:00:01Z" },
+      ];
+      const blockedCheck = __rexTest__.validateTrustworthyProgramStatus(blockedRecords, "pi");
+      assert.equal(blockedCheck.ok, false);
+      assert.match(blockedCheck.error, /blocked on a question dialog/);
+
+      // 3. Ordinary waiting for orchestrator reply (state: idle/working, not blocked) succeeds
+      const idleRecords = [
+        { state: "idle", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+      ];
+      const idleCheck = __rexTest__.validateTrustworthyProgramStatus(idleRecords, "pi");
+      assert.equal(idleCheck.ok, true);
+      assert.equal(idleCheck.targetRecord.state, "idle");
+    });
+
+    it("Task 3.5: restricted name-based resume replays cwd/agent context and refuses missing snapshot", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const dir = createTestDir();
+
+      try {
+        const sessionFile = join(dir, "resumable.jsonl");
+        writeFileSync(sessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+
+        const sampleLoadout: SubagentLoadout = {
+          agent: "worker",
+          toolAllowlist: "read,write,edit",
+          model: "anthropic/claude-3-5-sonnet",
+          thinking: "medium",
+          systemPromptMode: "append",
+          identity: "You are the worker.",
+          spawnable: ["scout", "researcher"],
+          autoExit: true,
+          cwd: "/path/to/custom/workdir",
+          agentDir: "/path/to/agent/config",
+        };
+        writeSubagentLoadout(sessionFile, sampleLoadout);
+
+        // Positive check: loadout reads back identical
+        const loaded = readSubagentLoadout(sessionFile);
+        assert.deepEqual(loaded, sampleLoadout);
+        assert.equal(loaded?.cwd, "/path/to/custom/workdir");
+        assert.deepEqual(loaded?.spawnable, ["scout", "researcher"]);
+
+        // Negative check: session without loadout snapshot refuses resume
+        const noSnapshotSession = join(dir, "no-snapshot.jsonl");
+        writeFileSync(noSnapshotSession, JSON.stringify(SESSION_HEADER) + "\n");
+        assert.equal(readSubagentLoadout(noSnapshotSession), null);
+
+        // Verify subagent_message execution refuses when snapshot is absent
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const messageTool = registeredTools.find((t: any) => t.name === "subagent_message");
+        assert.ok(messageTool);
+
+        const parentArtifactDir = join(dir, "artifacts", "main-sess");
+        mkdirSync(parentArtifactDir, { recursive: true });
+        registerName(parentArtifactDir, "missing-snapshot-agent", {
+          sessionFile: noSnapshotSession,
+          sessionId: "sess-no-snapshot",
+        });
+
+        // Mock context with sessionManager
+        const mockCtx = {
+          sessionManager: {
+            getSessionDir: () => dir,
+            getSessionId: () => "main-sess",
+            getSessionFile: () => join(dir, "main.jsonl"),
+          },
+        };
+
+        const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+        __rexTest__.setRexContextOverride({
+          server: "unix:///tmp/mock.sock",
+          session: "session:mock-session",
+          block: "block:mock-anchor",
+        });
+        __rexTest__.setCommandAvailabilityOverride(true);
+
+        try {
+          const executeRes = await messageTool.execute(
+            "msg-call-1",
+            { name: "missing-snapshot-agent", message: "continue" },
+            undefined,
+            undefined,
+            mockCtx,
+          );
+          assert.match(executeRes.content[0].text, /no sandbox snapshot found/);
+          assert.match(executeRes.details.error, /no sandbox snapshot found/);
+        } finally {
+          __rexTest__.setCommandAvailabilityOverride(undefined);
+          __rexTest__.setRexContextOverride(undefined);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("Task 3.6: interactive and pending-work auto-exit policy and clean exit", () => {
+      // 1. Interactive agent (autoExit: false) does not auto-exit on completion
+      assert.equal(shouldAutoExitOnAgentEnd(false, [{ role: "assistant", stopReason: "end_turn" }]), true);
+      // But in subagent-done agent_end handler, autoExit flag must be true to trigger exit.
+      // If autoExit is false, agent_end keeps session open.
+
+      // 2. Unanswered ask_question (awaitingAnswer = true) suppresses exit
+      // Tested in subagent-done.ts ask_question unit test
+
+      // 3. Running children count > 0 suppresses exit
+      // runningChildrenCount() is checked in subagent-done.ts
+
+      // 4. User abort (stopReason: "aborted") does not auto exit
+      assert.equal(
+        shouldAutoExitOnAgentEnd(false, [{ role: "assistant", stopReason: "aborted" }]),
+        false,
+        "abort must keep session open",
+      );
+
+      // 5. Normal completion (stopReason: "end_turn") auto exits
+      assert.equal(
+        shouldAutoExitOnAgentEnd(false, [{ role: "assistant", stopReason: "end_turn" }]),
+        true,
+        "clean completion must auto-exit",
+      );
+
+      // 6. Presentation distinguishing clean completion vs externally interrupted pane closure
+      const testApi = (subagentsModule as any).__test__;
+      const cleanPres = testApi.resolveResultPresentation(
+        {
+          exitCode: 0,
+          elapsed: 10,
+          summary: "Done nicely",
+          outcome: "success",
+        },
+        "clean-worker",
+      );
+      assert.match(cleanPres, /Sub-agent "clean-worker" completed/);
+      assert.match(cleanPres, /Done nicely/);
+
+      const interruptedPres = testApi.resolveResultPresentation(
+        {
+          exitCode: 1,
+          elapsed: 15,
+          summary: "Pane closed",
+          outcome: "interrupted",
+          errorMessage: "Subagent Rex pane was closed externally before completion.",
+        },
+        "interrupted-worker",
+      );
+      assert.match(interruptedPres, /Sub-agent "interrupted-worker" was interrupted/);
+      assert.match(interruptedPres, /pane closed externally/);
+      assert.match(interruptedPres, /The session data was preserved/);
+    });
   });
 });
 

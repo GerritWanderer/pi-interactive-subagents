@@ -106,8 +106,27 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is validated against the child's live program status and pasted into the live pane (newlines flattened to spaces) followed by Enter submission, without stealing focus. The call returns an immediate acknowledgement; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
+
+### Acknowledgement & Result Semantics
+
+- **Launch Acknowledgement**: Tool calls (`subagent`, `subagent_message`) return an immediate acknowledgement containing the subagent's name and initial status (`started` or `resumed`). They do NOT wait for agent completion.
+- **Terminal Result**: When the subagent run completes, the parent automatically receives a single terminal result steered into the conversation as a `subagent_result` message that triggers a new turn. The result carries:
+  - `outcome`: `"success"`, `"failure"`, or `"interrupted"`.
+  - `summary`: Final assistant response, error message, or interruption diagnostic.
+  - `exitCode`: Real agent exit status.
+  - `sessionFile` / `sessionId`: Linkage for subsequent follow-up.
+- **Safe-Steering Limitations**:
+  - Program status (`OSC 7501`) is checked before submitting input. If the child is blocked on a permission, question, or authentication dialog, delivery is refused with an actionable error and NO input is sent.
+  - If program status is missing, unreadable, or untrustworthy, delivery fails fast rather than blindly sending raw keystrokes.
+  - Ordinary waiting for input (e.g. `ask_question` reply) is distinguished from a blocked dialog and permits safe message delivery.
+- **Provider Failure vs. Interrupted Pane Closure**:
+  - *Provider / Agent Failure*: If an agent encounters an error or exhausts provider retries (e.g., Anthropic 529 overload), the failure is detected via the `.exit` sidecar or process exit code and reported as a provider/agent failure with `outcome: "failure"`.
+  - *Externally Closed Pane*: If a human or external action closes a subagent pane while it is running, process observation detects the missing block (`not_found`) and reports `outcome: "interrupted"`. The session file and name registry are preserved so the work can be resumed.
+- **Exiting Pi vs. Closing a Pane**:
+  - In interactive subagent panes, exiting Pi normally (e.g., `/exit` or Ctrl+D) completes the session cleanly and triggers normal summary collection.
+  - Closing the Rex pane/window externally halts the process abruptly and is classified as an interruption rather than a successful run or an internal provider crash.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 

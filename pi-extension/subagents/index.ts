@@ -275,17 +275,12 @@ function getProviderAuthExtensionPath(model: string | null | undefined): string 
   return existsSync(path) ? path : undefined;
 }
 
-/**
- * When this process was spawned as a restricted subagent, the parent pins the
- * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session, or an unrestricted child).
- */
-const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
+function getSubagentAllowlist(): Set<string> | null {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
   if (!raw) return null;
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? new Set(list) : null;
-})();
+}
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -370,7 +365,8 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   // When this process is itself a restricted subagent, only expose the agents
   // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
   const all = [...agents.values()];
-  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
+  const allowlist = getSubagentAllowlist();
+  return allowlist ? all.filter((a) => allowlist.has(a.name)) : all;
 }
 
 function resolveSubagentPaths(
@@ -593,13 +589,22 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "outcome"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  if (result.outcome === "interrupted") {
+    const detail = result.errorMessage ? `\n\n${result.errorMessage}` : "";
+    return (
+      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
+      `(pane closed externally before completion).${detail}\n\n` +
+      `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -634,6 +639,7 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  outcome?: "success" | "failure" | "interrupted";
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
@@ -1194,6 +1200,8 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  watchSubagent,
+  launchSubagent,
 };
 
 function startWidgetRefresh() {
@@ -1613,10 +1621,27 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      try {
+        closeSurface(surface);
+      } catch {}
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      const outcome: "success" | "failure" | "interrupted" =
+        result.reason === "interrupted"
+          ? "interrupted"
+          : result.exitCode === 0
+            ? "success"
+            : "failure";
+
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        outcome,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1641,8 +1666,17 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    try {
+      closeSurface(surface);
+    } catch {}
     runningSubagents.delete(running.id);
+
+    const outcome: "success" | "failure" | "interrupted" =
+      result.reason === "interrupted"
+        ? "interrupted"
+        : result.exitCode === 0
+          ? "success"
+          : "failure";
 
     return {
       name,
@@ -1652,6 +1686,7 @@ async function watchSubagent(
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
       exitCode: result.exitCode,
       elapsed,
+      outcome,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
     };
@@ -1669,6 +1704,7 @@ async function watchSubagent(
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
+        outcome: "interrupted",
         sessionFile,
       };
     }
@@ -1679,6 +1715,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      outcome: "failure",
     };
   }
 }
@@ -1769,8 +1806,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // top-level `fork: true` clone, which has no role and inherits the
         // caller's own already-trusted toolset. Without this guard a missing or
         // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
+        const allowlist = getSubagentAllowlist();
+        const permittedAgents = allowlist
+          ? [...allowlist]
           : discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
@@ -1794,12 +1832,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 type: "text",
                 text:
                   `You may not spawn the "${params.agent}" agent — it is not ` +
-                  `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
+                  `${allowlist ? "in your allowlist" : "a known agent"}. ` +
                   `Available agents: ${permittedList}.`,
               },
             ],
             details: {
-              error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
+              error: allowlist ? "agent not in allowlist" : "unknown agent",
             },
           };
         }
@@ -1888,6 +1926,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...(result.outcome ? { outcome: result.outcome } : {}),
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
@@ -2334,6 +2373,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
+                  ...(result.outcome ? { outcome: result.outcome } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                 },
               },

@@ -554,5 +554,39 @@ for (const backend of backends) {
       assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "auto"), "right");
       assert.equal(chooseSplitDirection({ columns: 50, rows: 40 }, "auto"), "below");
     });
+
+    it("observes process completion, preserves real non-zero exit code, and handles interruption on closed pane", async () => {
+      const { pollForExit, queryBlockProcess, closeSurface, getSurfaceHandle } = await import("../../pi-extension/subagents/rex.ts");
+
+      // 1. Nonzero exit code propagation
+      const failSurface = createTrackedSurface(env, "fail-exit");
+      sendLongCommand(failSurface, "bash -c 'exit 42'");
+      const failHandle = getSurfaceHandle(failSurface);
+      assert.ok(failHandle?.blockId);
+
+      const failResult = await pollForExit(failSurface, new AbortController().signal, { interval: 50 });
+      assert.equal(failResult.reason, "error");
+      assert.equal(failResult.exitCode, 42, "real non-zero exit code 42 must be preserved");
+
+      // 2. Confirmed pane closure reports interruption
+      const closeSurfaceTest = createTrackedSurface(env, "interrupt-test");
+      sendLongCommand(closeSurfaceTest, "cat"); // Keep running
+      const closeHandle = getSurfaceHandle(closeSurfaceTest);
+      assert.ok(closeHandle?.blockId);
+
+      // Verify running first
+      await sleep(500);
+      const procBefore = queryBlockProcess(closeHandle.blockId, closeHandle.sessionId);
+      assert.notEqual(procBefore, "not_found");
+
+      // Close the surface externally
+      closeSurface(closeSurfaceTest);
+      await sleep(500);
+
+      const interruptResult = await pollForExit(closeSurfaceTest, new AbortController().signal, { interval: 50 });
+      assert.equal(interruptResult.reason, "interrupted");
+      assert.equal(interruptResult.exitCode, 1);
+      assert.match(interruptResult.errorMessage ?? "", /closed externally/);
+    });
   });
 }
