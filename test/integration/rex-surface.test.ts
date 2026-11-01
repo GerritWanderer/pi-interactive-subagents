@@ -136,9 +136,39 @@ for (const backend of backends) {
       await sleep(1000);
 
       const secretText = "literal 'quote' and \"double quote\" and `backticks` $VAR";
-      sendMessage(surface, secretText);
+      const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(surface);
+      assert.ok(handle?.blockId);
+      // Rex sendPasteEvent directly sends paste input
+      const { sendPasteEvent, sendEnterKeyEvent } = await import("../../pi-extension/subagents/rex.ts");
+      sendPasteEvent(handle.blockId, handle.sessionId, secretText);
+      sendEnterKeyEvent(handle.blockId, handle.sessionId);
 
       await waitForScreen(surface, /literal 'quote' and "double quote"/, 10_000, 20);
+    });
+
+    it("placement override forces top-level pane split instead of tab", async () => {
+      const savedOverride = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
+      try {
+        const topPane = createTrackedSurface(env, "top-pane-override");
+        const marker = uniqueId();
+        sendLongCommand(topPane, `echo "TOP_PANE_${marker}"`);
+        await waitForScreen(topPane, new RegExp(`TOP_PANE_${marker}`), 10_000, 20);
+
+        const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(topPane);
+        assert.equal(handle?.kind, "split", "override should create split instead of tab");
+      } finally {
+        if (savedOverride === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+        else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedOverride;
+      }
+    });
+
+    it("launches command with special-character arguments and paths", async () => {
+      const surface = createTrackedSurface(env, "special-chars");
+      const specialArg = "arg with spaces and 'quotes' & $METACHARED";
+      sendLongCommand(surface, `echo "SPECIAL: ${specialArg}"`);
+
+      await waitForScreen(surface, /SPECIAL: arg with spaces and 'quotes'/, 10_000, 20);
     });
   });
 }

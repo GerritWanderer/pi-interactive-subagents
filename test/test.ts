@@ -2992,6 +2992,114 @@ describe("herdr-desktop.ts", () => {
   });
 });
 
+describe("rex.ts unit tests", () => {
+  it("buildRexArgs includes server flag when server is specified or in env", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    assert.deepEqual(
+      __rexTest__.buildRexArgs(["window", "list"], "unix:///tmp/custom.sock"),
+      ["-S", "unix:///tmp/custom.sock", "window", "list"],
+    );
+    const savedServer = process.env.REX_SERVER;
+    delete process.env.REX_SERVER;
+    try {
+      assert.deepEqual(
+        __rexTest__.buildRexArgs(["window", "list"], undefined),
+        ["window", "list"],
+      );
+    } finally {
+      if (savedServer !== undefined) process.env.REX_SERVER = savedServer;
+    }
+  });
+
+  it("chooseSplitDirection maps auto geometry based on 2:1 column-to-row ratio", async () => {
+    const { chooseSplitDirection } = await import("../pi-extension/subagents/rex.ts");
+    assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "auto"), "right"); // 160/40 = 4 >= 2 -> right
+    assert.equal(chooseSplitDirection({ columns: 60, rows: 40 }, "auto"), "below"); // 60/40 = 1.5 < 2 -> below
+    assert.equal(chooseSplitDirection(undefined, "auto"), "right"); // fallback
+    assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "down"), "below"); // explicit override
+    assert.equal(chooseSplitDirection({ columns: 40, rows: 40 }, "right"), "right"); // explicit override
+  });
+
+  it("chooseSurfaceKind respects top-level tab default and nested split", async () => {
+    const { chooseSurfaceKind } = await import("../pi-extension/subagents/rex.ts");
+    assert.equal(chooseSurfaceKind(false, "tab"), "tab");
+    assert.equal(chooseSurfaceKind(false, "pane"), "pane");
+    assert.equal(chooseSurfaceKind(true, "tab"), "pane"); // nested always pane
+    assert.equal(chooseSurfaceKind(true, "pane"), "pane");
+  });
+
+  it("validateTrustworthyProgramStatus rejects empty, malformed, or missing reports", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const emptyRes = __rexTest__.validateTrustworthyProgramStatus([]);
+    assert.equal(emptyRes.ok, false);
+    assert.match(emptyRes.error, /No program status records available/);
+
+    const nonTargetRes = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "working", app: "other", updated_at: "2026-11-01T00:00:00Z" },
+    ], "pi");
+    assert.equal(nonTargetRes.ok, false);
+    assert.match(nonTargetRes.error, /No trustworthy program status found/);
+  });
+
+  it("validateTrustworthyProgramStatus rejects blocked dialog records", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const blockedRes = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "blocked", kind: "permission", app: "pi", updated_at: "2026-11-01T00:00:00Z", msg: "Allow bash execution?" },
+    ], "pi");
+    assert.equal(blockedRes.ok, false);
+    assert.match(blockedRes.error, /blocked on a permission dialog/);
+  });
+
+  it("validateTrustworthyProgramStatus accepts valid unblocked target report", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const okRes = __rexTest__.validateTrustworthyProgramStatus([
+      { state: "working", app: "pi", updated_at: "2026-11-01T00:00:00Z" },
+    ], "pi");
+    assert.equal(okRes.ok, true);
+    if (okRes.ok) {
+      assert.equal(okRes.targetRecord.state, "working");
+    }
+  });
+
+  it("validateAnchorBlock throws actionable error for nonexistent anchor", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    assert.throws(
+      () => __rexTest__.validateAnchorBlock("block:nonexistent", "session:01a1915d-7bc9-7daa-8d0e-818c6e25377d"),
+      /Target Rex block "block:nonexistent" does not exist/,
+    );
+  });
+
+  it("closeSurface closes only the block for split handles and the window for tab handles", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    // Tab handle
+    registerSurfaceHandle({
+      id: "test-tab-handle",
+      kind: "tab",
+      name: "tab-agent",
+      sessionId: "session:test",
+      windowId: "window:test-win",
+      blockId: "block:test-block-1",
+      status: "launched",
+    });
+    // Split handle
+    registerSurfaceHandle({
+      id: "test-split-handle",
+      kind: "split",
+      name: "split-agent",
+      sessionId: "session:test",
+      windowId: "window:test-win", // windowId might be cached by getSurfaceTab
+      blockId: "block:test-block-2",
+      status: "launched",
+    });
+
+    closeSurface("test-split-handle");
+    assert.equal(getSurfaceHandle("test-split-handle"), undefined);
+
+    closeSurface("test-tab-handle");
+    assert.equal(getSurfaceHandle("test-tab-handle"), undefined);
+  });
+});
+
 describe("safe_bash tool", () => {
   function registerSafeBash() {
     const tools: any[] = [];

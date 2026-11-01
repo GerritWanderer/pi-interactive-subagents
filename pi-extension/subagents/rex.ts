@@ -65,7 +65,34 @@ export function isRexAvailable(): boolean {
   if (!ctx.session || !ctx.block) {
     return false;
   }
-  return hasCommand(rexBin());
+  if (!hasCommand(rexBin())) {
+    return false;
+  }
+
+  // Validate that the session and anchor block exist
+  try {
+    const raw = rexExec(["block", "inspect", ctx.block, "-s", ctx.session, "--json"]);
+    const parsed = JSON.parse(raw);
+    if (!parsed || (parsed.error && parsed.error.code)) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
+export function validateAnchorBlock(blockId: string, session: string): void {
+  try {
+    const raw = rexExec(["block", "inspect", blockId, "-s", session, "--json"]);
+    const parsed = JSON.parse(raw);
+    if (!parsed || (parsed.error && parsed.error.code)) {
+      throw new Error(`Stale or invalid Rex block: ${blockId}`);
+    }
+  } catch (error: any) {
+    throw new Error(`Target Rex block "${blockId}" does not exist in session "${session}": ${error?.message || String(error)}`);
+  }
 }
 
 export function isMuxAvailable(): boolean {
@@ -256,6 +283,7 @@ export function createSurface(name: string): string {
   const ctx = getRexContext();
   const sessionId = ctx.session!;
   const parentBlock = ctx.block!;
+  validateAnchorBlock(parentBlock, sessionId);
   const kind = chooseSurfaceKind();
 
   const handleId = `rex-surface:${name}-${Math.random().toString(16).slice(2, 10)}`;
@@ -290,6 +318,7 @@ export function createSurfaceSplit(
   const ctx = getRexContext();
   const sessionId = ctx.session!;
   const anchorBlock = fromSurface ?? ctx.block!;
+  validateAnchorBlock(anchorBlock, sessionId);
 
   const dir: "right" | "below" =
     direction === "below" || direction === "down" ? "below" : "right";
@@ -362,7 +391,7 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     if (cwd) {
       args.push("-c", cwd);
     }
-    args.push("--", "bash", scriptPath);
+    args.push("--", "bash", "-l", scriptPath);
 
     const res = rexJson(args);
     const windowId = res?.window_id;
@@ -394,7 +423,7 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     if (cwd) {
       args.push("-c", cwd);
     }
-    args.push("--", "bash", scriptPath);
+    args.push("--", "bash", "-l", scriptPath);
 
     const res = rexJson(args);
     const blockIds = res?.block_ids;
@@ -450,6 +479,74 @@ export function sendPasteEvent(blockId: string, session: string, text: string): 
   }
 }
 
+export function sendEnterKeyEvent(blockId: string, session: string): void {
+  const payload = JSON.stringify({
+    session_id: session,
+    block_id: blockId,
+    event: {
+      type: "key",
+      payload: {
+        action: "press",
+        key: "enter",
+        mods: "",
+        consumed_mods: "",
+        text: "\r",
+        unshifted_codepoint: 13,
+        composing: false,
+      },
+    },
+  });
+
+  const res = rexJson(["api", "call", "block.event", payload]);
+  if (res && res.error) {
+    throw new Error(`block.event enter key error: ${res.error.message || JSON.stringify(res.error)}`);
+  }
+}
+
+export function validateTrustworthyProgramStatus(
+  records: ProgramStatusRecord[],
+  expectedApp?: string,
+): { ok: true; targetRecord: ProgramStatusRecord } | { ok: false; error: string } {
+  if (!Array.isArray(records) || records.length === 0) {
+    return {
+      ok: false,
+      error: "No program status records available; cannot verify safety before steering.",
+    };
+  }
+
+  // Find relevant target record: if expectedApp is given, look for matching app / effective_app, or root record
+  const matching = records.filter((r) => {
+    if (!r || typeof r.state !== "string" || !r.updated_at) return false;
+    if (expectedApp) {
+      return (r as any).effective_app === expectedApp || r.app === expectedApp;
+    }
+    return true;
+  });
+
+  if (matching.length === 0) {
+    return {
+      ok: false,
+      error: `No trustworthy program status found matching application ${expectedApp ?? "target"}.`,
+    };
+  }
+
+  // Check if any matching record is blocked on permission, question, or auth
+  const blocked = matching.find(
+    (r) =>
+      r.state === "blocked" &&
+      (r.kind === "permission" || r.kind === "question" || r.kind === "auth"),
+  );
+
+  if (blocked) {
+    return {
+      ok: false,
+      error: `Subagent is blocked on a ${blocked.kind ?? "dialog"} dialog (${blocked.msg || blocked.state}). Steering refused.`,
+    };
+  }
+
+  return { ok: true, targetRecord: matching[0] };
+}
+
 export function sendMessage(surface: string, message: string): void {
   requireMux();
   const handle = getSurfaceHandle(surface);
@@ -465,13 +562,17 @@ export function sendMessage(surface: string, message: string): void {
     throw new Error(`Cannot deliver message safely: unable to query program status (${error?.message})`);
   }
 
-  if (isBlockedDialog(records)) {
-    throw new Error("Message refused: subagent is blocked on a permission, question, or authentication dialog.");
+  const safety = validateTrustworthyProgramStatus(records, "pi");
+  if (!safety.ok) {
+    throw new Error(`Cannot deliver message safely: ${safety.error}`);
   }
 
-  // Send paste event with newline to submit
-  const submission = message.endsWith("\n") ? message : `${message}\n`;
-  sendPasteEvent(handle.blockId, handle.sessionId, submission);
+  // 1. Paste normalized text without trailing newline
+  const normalizedText = message.trimEnd();
+  sendPasteEvent(handle.blockId, handle.sessionId, normalizedText);
+
+  // 2. Send separate targeted Enter/Return key submission event
+  sendEnterKeyEvent(handle.blockId, handle.sessionId);
 }
 
 // ── Screen Capture & Observation Primitives ──
@@ -483,7 +584,7 @@ export function readScreen(surface: string, lines = 50): string {
     return "";
   }
   try {
-    const stdout = rexExec(["capture", "-b", handle.blockId, "-s", handle.sessionId, "--trim"]);
+    const stdout = rexExec(["capture", "-b", handle.blockId, "-s", handle.sessionId, "--trim", "--unwrap"]);
     const allLines = stdout.split("\n");
     return allLines.slice(-Math.max(1, lines)).join("\n");
   } catch (error: any) {
@@ -498,7 +599,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
     return "";
   }
   try {
-    const stdout = await rexExecAsync(["capture", "-b", handle.blockId, "-s", handle.sessionId, "--trim"]);
+    const stdout = await rexExecAsync(["capture", "-b", handle.blockId, "-s", handle.sessionId, "--trim", "--unwrap"]);
     const allLines = stdout.split("\n");
     return allLines.slice(-Math.max(1, lines)).join("\n");
   } catch (error: any) {
@@ -546,7 +647,7 @@ export function closeSurface(surface: string): void {
   if (!handle) return;
 
   try {
-    if (handle.windowId) {
+    if (handle.kind === "tab" && handle.windowId) {
       rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
     } else if (handle.blockId) {
       rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
@@ -683,4 +784,6 @@ export const __rexTest__ = {
   chooseSurfaceKind,
   interpretExitSidecar,
   isBlockedDialog,
+  validateTrustworthyProgramStatus,
+  validateAnchorBlock,
 };

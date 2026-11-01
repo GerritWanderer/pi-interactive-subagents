@@ -1,8 +1,8 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [Herdr](https://herdr.dev) panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in [Rex](https://www.superlogical.com/rex) terminals. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**Herdr-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which supports tmux, cmux, zellij, and WezTerm.
+**Rex port.** Supports Linux and macOS hosts.
 
 ## Installation
 
@@ -14,12 +14,12 @@ Add `-l` to install for the current project only (`.pi/settings.json`). Update l
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own Herdr surface, created with `--no-focus` so it never steals keyboard focus:
+`subagent()` returns immediately. The sub-agent runs in its own Rex surface, created with `--focus=false` so it never steals keyboard focus:
 
-- **Spawned by the main session** — a new tab, labelled with the sub-agent's name. One tab per sub-agent keeps the tab bar readable as a list of what is running.
-- **Spawned by another sub-agent** — a split off the parent's pane (`$HERDR_PANE_ID`), so a whole lineage stays inside one tab.
+- **Spawned by the main session** — a new tab (Rex window), labelled with the sub-agent's name. One tab per sub-agent keeps the tab bar readable as a list of what is running.
+- **Spawned by another sub-agent** — a split off the parent's pane (`$REX_BLOCK`), so a whole lineage stays inside one tab.
 
-The pane carries the same name in the Herdr sidebar. Set `PI_SUBAGENT_TOP_LEVEL_SURFACE=pane` to put top-level sub-agents in split panes instead of tabs (the default constant is `SUBAGENT_TOP_LEVEL_SURFACE` in `pi-extension/subagents/herdr.ts`). A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+The pane carries the same name in the Rex window and block list. Set `PI_SUBAGENT_TOP_LEVEL_SURFACE=pane` to put top-level sub-agents in split panes instead of tabs (the default setting is `tab` in `pi-extension/subagents/rex.ts`). A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -30,26 +30,36 @@ The pane carries the same name in the Herdr sidebar. Set `PI_SUBAGENT_TOP_LEVEL_
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Split direction follows the Herdr geometry rule: a wide parent pane splits right, a narrow or tall one splits down. Force one direction with `PI_SUBAGENT_SPLIT_DIRECTION=right|down|auto` (the default constant is `SUBAGENT_SPLIT_DIRECTION` in `pi-extension/subagents/herdr.ts`).
+Split direction follows the anchor block's geometry: a wide parent pane (columns / rows >= 2) splits right, a narrow or tall one splits below. Force one direction with `PI_SUBAGENT_SPLIT_DIRECTION=right|down|auto` (where down maps to Rex's `below`).
 
-Panes are kept evenly sized: after every spawn and exit (debounced) the extension reads `herdr pane layout` and issues `herdr pane resize` calls so each column and row gets an equal share. Herdr has no named layouts, so this is the equivalent of tmux's `even-horizontal`.
+Steering a running sub-agent queries program status first to verify input safety: steering is refused if the subagent is blocked on a permission, question, or authentication dialog, or if trustworthy status cannot be read. Input is submitted using a targeted Rex paste event followed by an Enter key event.
 
-Steering a running sub-agent goes through `herdr agent prompt`, so the message respects bracketed paste and is refused with `agent_blocked` if the child is sitting at an approval or question dialog.
+## Prerequisites & Supported Hosts
 
-### Herdr desktop app
-
-In the Herdr desktop app (`herdr-app`), terminals run in herdr-core and the extension drives the `hc` CLI instead of `herdr`. It detects the app by `HC_TERMINAL_ID`. When pi runs in a Herdr TUI pane inside the app, the TUI path above applies.
-
-- Sub-agents land in the same places: a new named tab for the main session, a split in the parent's tab for nested sub-agents. Neither moves your focus.
-- The app's Agents list nests every sub-agent under the agent that started it, with its status.
-- Nothing is typed into a shell. The launch script runs directly through your login shell, so the pane opens straight into pi with your usual `PATH`. The 500 ms shell-ready delay does not apply.
-- The extension learns that a sub-agent ended from herdr-core, not from its screen. The pane closes when the sub-agent exits.
-- The app chooses the split side, so `PI_SUBAGENT_SPLIT_DIRECTION` and the even pane sizing apply to the TUI only.
-
-If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
+- [pi](https://github.com/badlogic/pi-mono) (1.4.0+ recommended)
+- [Rex](https://www.superlogical.com/rex) running on Linux or macOS (native Windows host is deferred)
+- Rex CLI (`rex`) available in `PATH`
+- Start pi inside a Rex session where `REX_SESSION` and `REX_BLOCK` are exported into the terminal environment.
 
 ```bash
-export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
+# Verify Rex environment
+rex whoami
+# Start pi
+pi
+```
+
+Running pi outside Rex disables the `subagent` tools with a clear diagnostic hint.
+
+## Workspace-Source Testing & Verification
+
+Integration tests exercise the code directly from workspace source rather than any installed package:
+
+```bash
+# Run unit tests
+npm test
+
+# Run no-model Rex surface integration tests (fast & free, exercises Rex CLI/API directly)
+npm run test:surface
 ```
 
 ## Tools
