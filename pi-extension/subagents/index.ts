@@ -40,6 +40,9 @@ import {
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
+  writeLostObservationMarker,
+  hasLostObservationMarker,
+  clearLostObservationMarker,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -1262,6 +1265,7 @@ export const __test__ = {
   widgetIcon,
   watchSubagent,
   launchSubagent,
+  createSurface: (name: string) => createSurface(name),
   wrapLaunchCommand,
   pendingCleanups,
   processPendingCleanups,
@@ -1320,7 +1324,7 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  const surface = options?.surface ?? createSurface(params.name);
+  const surface = options?.surface ?? __test__.createSurface(params.name);
 
   try {
     const launchBehavior = resolveLaunchBehavior(params, agentDefs);
@@ -1569,7 +1573,11 @@ async function launchSubagent(
     return running;
   } catch (launchErr) {
     // Release surface reservation on preparation or launch failure
-    closeSurface(surface);
+    try {
+      safeCloseSurface(surface);
+    } catch {
+      // safeCloseSurface handles enqueueing pendingCleanups; preserve launchErr
+    }
     throw launchErr;
   }
 }
@@ -1777,6 +1785,7 @@ async function watchSubagent(
       // Do NOT kill or close a potentially live agent!
       if (sessionFile) {
         lostObservationSessions.add(resolve(sessionFile));
+        writeLostObservationMarker(sessionFile);
       }
       runningSubagents.delete(running.id);
       return {
@@ -2302,7 +2311,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Guard: refuse resume if observation of the previous process was lost and not confirmed exited.
-        if (lostObservationSessions.has(resolve(sessionPath))) {
+        // Check both in-memory set and persistent marker sidecar across restarts.
+        if (lostObservationSessions.has(resolve(sessionPath)) || hasLostObservationMarker(sessionPath)) {
           const err =
             `Cannot resume subagent "${requestedName}": observation of its previous run was lost and ` +
             `the process may still be active in its open pane. Resuming could corrupt the session file.`;
@@ -2443,7 +2453,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
           runningSubagents.set(id, running);
         } catch (prepErr) {
-          closeSurface(surface);
+          try {
+            safeCloseSurface(surface);
+          } catch {
+            // safeCloseSurface handles enqueueing pendingCleanups; preserve prepErr
+          }
           throw prepErr;
         }
         startWidgetRefresh();

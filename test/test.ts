@@ -3810,6 +3810,18 @@ describe("rex.ts unit tests", () => {
           /Sustained infrastructure failure observing Rex block/,
         );
 
+        // 4b. Malformed empty object process reply triggers RexInfrastructureError without infinite polling
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            return "{}";
+          }
+          return "{}";
+        });
+        await assert.rejects(
+          __rexTest__.pollForExit("poll-done-surface", abortCtrl.signal, { interval: 5, maxConsecutiveErrors: 3 }),
+          /Sustained infrastructure failure observing Rex block/,
+        );
+
         // 5. Cancellation via AbortSignal
         const preAborted = new AbortController();
         preAborted.abort();
@@ -4108,7 +4120,28 @@ describe("rex.ts unit tests", () => {
         );
         assert.match(resumeInfraRes.content[0].text, /observation of its previous run was lost/);
         assert.match(resumeInfraRes.content[0].text, /process may still be active/);
+
+        // Finding 1 restart simulation: clear in-memory set, persistent marker remains
+        testApi.lostObservationSessions.clear();
+        assert.equal(testApi.lostObservationSessions.size, 0);
+        const restartResumeRes = await infraMsgTool.execute(
+          "msg-call-restart",
+          { name: "infra-agent", message: "try resume after restart" },
+          undefined,
+          undefined,
+          {
+            sessionManager: {
+              getSessionDir: () => dir,
+              getSessionId: () => "main-sess",
+              getSessionFile: () => join(dir, "main.jsonl"),
+            },
+          },
+        );
+        assert.match(restartResumeRes.content[0].text, /observation of its previous run was lost/);
+        assert.match(restartResumeRes.content[0].text, /process may still be active/);
       } finally {
+        testApi.lostObservationSessions?.clear();
+        testApi.pendingCleanups?.clear();
         unregisterSurfaceHandle("cleanup-res-surface");
         __rexTest__.setRexExecutor(null);
         __rexTest__.setCommandAvailabilityOverride(undefined);
@@ -4160,6 +4193,7 @@ describe("rex.ts unit tests", () => {
     });
 
     it("Task 3.5: restricted name-based resume replays cwd/agent context and refuses missing snapshot", async () => {
+      const { getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
       const testApi = (subagentsModule as any).__test__;
       const dir = createTestDir();
 
@@ -4301,45 +4335,39 @@ describe("rex.ts unit tests", () => {
         );
 
         // Verify preparation failure releases surface reservation
-        let prepFailedSurface = "";
-        let splitAnchorChecked = false;
-        __rexTest__.setRexExecutor((args) => {
-          if (args[0] === "window" && args[1] === "new") {
-            prepFailedSurface = "rex-surface:prep-fail-agent";
-            return JSON.stringify({ window_id: "win:prep-fail-win", block_ids: ["blk:prep-fail-blk"] });
-          }
-          if (args[0] === "split") {
-            return JSON.stringify({ block_ids: ["blk:prep-fail-blk"] });
-          }
-          if (args[0] === "block" && args[1] === "inspect") {
-            splitAnchorChecked = true;
-            return JSON.stringify({ block: { block_id: "block:mock-anchor" } });
-          }
-          return "{}";
-        });
-
-        await assert.rejects(
-          async () => {
-            await testApi.launchSubagent(
-              { agent: "worker", task: "prep fail", name: "prep-fail-agent" },
-              {
-                sessionManager: {
-                  getSessionFile: () => join(dir, "main.jsonl"),
-                  getSessionId: () => "main-sess",
-                  getSessionDir: () => "/nonexistent-dir/cannot-create-artifacts/artifacts",
+        let createdSurface = "";
+        const origCreateSurface = testApi.createSurface;
+        (testApi as any).createSurface = (name: string) => {
+          createdSurface = origCreateSurface(name);
+          return createdSurface;
+        };
+        try {
+          await assert.rejects(
+            async () => {
+              await testApi.launchSubagent(
+                { agent: "worker", task: "prep fail", name: "prep-fail-agent" },
+                {
+                  sessionManager: {
+                    getSessionFile: () => join(dir, "main.jsonl"),
+                    getSessionId: () => "main-sess",
+                    getSessionDir: () => "/nonexistent-dir/cannot-create-artifacts/artifacts",
+                  },
+                  cwd: dir,
                 },
-                cwd: dir,
-              },
-            );
-          },
-        );
-
-        // Ensure no surface handle is leaked in runningSubagents and surface handle registry is cleaned up
-        assert.equal(testApi.runningSubagents.has("prep-fail-agent"), false);
-        const leakedHandle = Object.values(testApi.runningSubagents).find((r: any) => r.name === "prep-fail-agent");
-        assert.equal(leakedHandle, undefined);
-        const surfaces = Array.from((await import("../pi-extension/subagents/rex.ts")).getSurfaceHandle("rex-surface:prep-fail-agent") ? ["found"] : []);
-        assert.deepEqual(surfaces, [], "surface handle must be unregistered on launch/preparation failure");
+              );
+            },
+            /cannot-create-artifacts|ENOENT|prep fail/i,
+          );
+          assert.ok(createdSurface, "surface must have been created");
+          assert.equal(getSurfaceHandle(createdSurface), undefined, "surface handle must be unregistered on preparation failure");
+          assert.equal(
+            Array.from(testApi.runningSubagents.values()).some((r: any) => r.name === "prep-fail-agent"),
+            false,
+            "failed preparation must not register running subagent",
+          );
+        } finally {
+          (testApi as any).createSurface = origCreateSurface;
+        }
         } finally {
           for (const [_id, agent] of testApi.runningSubagents) {
             agent.abortController?.abort();

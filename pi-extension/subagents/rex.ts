@@ -430,8 +430,10 @@ export function sendLongCommand(
 
     launchRexSurface(handle, scriptPath, options?.cwd);
   } catch (err) {
-    // Release reservation on failure
-    closeSurface(surface);
+    // Release reservation on failure without masking original error
+    try {
+      closeSurface(surface);
+    } catch {}
     throw err;
   }
 
@@ -921,7 +923,6 @@ export async function pollForExit(
     if (currentBlockId && currentSessionId) {
       try {
         const proc = queryBlockProcess(currentBlockId, currentSessionId);
-        consecutiveErrors = 0; // reset on successful transport query
         if (proc === "not_found") {
           return {
             reason: "interrupted",
@@ -929,6 +930,15 @@ export async function pollForExit(
             errorMessage: "Subagent Rex pane was closed externally before completion.",
           };
         }
+        const isValidProc =
+          proc &&
+          typeof proc === "object" &&
+          (proc.last_exit === null ||
+            (proc.last_exit && typeof proc.last_exit === "object" && typeof proc.last_exit.exit_code === "number"));
+        if (!isValidProc) {
+          throw new Error(`Malformed process response for block ${currentBlockId}: ${JSON.stringify(proc)}`);
+        }
+        consecutiveErrors = 0; // reset only on valid process response
         if (proc.last_exit !== null && proc.last_exit !== undefined) {
           if (cachedSidecarResult) {
             // Sidecar payload recorded earlier: if process had an error code and sidecar had none, propagate process code

@@ -9,6 +9,7 @@ import {
   readSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -119,6 +120,34 @@ export interface SubagentLoadout {
 /** Path of the loadout sidecar written next to a subagent session file. */
 export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
+}
+
+/** Path of the lost-observation marker written next to a subagent session file. */
+export function lostObservationMarkerPath(sessionFile: string): string {
+  return `${sessionFile}.lost-observation`;
+}
+
+/** Persist a lost-observation marker beside the subagent's session file. */
+export function writeLostObservationMarker(sessionFile: string): void {
+  try {
+    writeFileSync(lostObservationMarkerPath(sessionFile), JSON.stringify({ lostAt: new Date().toISOString() }), "utf8");
+  } catch {}
+}
+
+/** Check whether a lost-observation marker exists beside the session file. */
+export function hasLostObservationMarker(sessionFile: string): boolean {
+  try {
+    return existsSync(lostObservationMarkerPath(sessionFile));
+  } catch {
+    return false;
+  }
+}
+
+/** Clear the lost-observation marker beside the session file. */
+export function clearLostObservationMarker(sessionFile: string): void {
+  try {
+    rmSync(lostObservationMarkerPath(sessionFile), { force: true });
+  } catch {}
 }
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
