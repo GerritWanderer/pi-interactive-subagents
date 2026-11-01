@@ -7,7 +7,7 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, accessSync, constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -38,12 +38,17 @@ function hasCommand(command: string): boolean {
 
   let available = false;
   try {
-    if (process.platform === "win32") {
+    // If command contains path separators, check executable access directly without shell interpolation
+    if (command.includes("/") || (process.platform === "win32" && command.includes("\\"))) {
+      accessSync(command, constants.X_OK);
+      available = true;
+    } else if (process.platform === "win32") {
       execFileSync("where.exe", [command], { stdio: "ignore" });
+      available = true;
     } else {
-      execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
+      execFileSync("sh", ["-c", 'command -v "$1"', "_", command], { stdio: "ignore" });
+      available = true;
     }
-    available = true;
   } catch {
     available = false;
   }
@@ -918,4 +923,5 @@ export const __rexTest__ = {
   setRexExecutor,
   setRexContextOverride,
   setCommandAvailabilityOverride,
+  hasCommand,
 };

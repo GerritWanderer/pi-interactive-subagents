@@ -3412,14 +3412,47 @@ describe("rex.ts unit tests", () => {
     }
   });
 
+  it("hasCommand and isRexAvailable work with paths containing spaces", async () => {
+    const { rexBin, __rexTest__, isMuxAvailable } = await import("../pi-extension/subagents/rex.ts");
+    const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+
+    const tempDir = mkdtempSync(join(tmpdir(), "rex test spaces-"));
+    const customBin = join(tempDir, "custom rex");
+    writeFileSync(customBin, "#!/bin/sh\nexit 0\n");
+    chmodSync(customBin, 0o755);
+
+    const origBin = process.env.REX_BIN_PATH;
+    process.env.REX_BIN_PATH = customBin;
+
+    try {
+      assert.equal(__rexTest__.hasCommand(customBin), true, "hasCommand should detect executable path with spaces");
+
+      __rexTest__.setRexContextOverride({
+        server: "unix:///tmp/mock.sock",
+        session: "session:mock-session",
+        block: "block:mock-anchor",
+      });
+      assert.equal(isMuxAvailable(), true, "isMuxAvailable should be true when REX_BIN_PATH has spaces");
+    } finally {
+      if (origBin !== undefined) process.env.REX_BIN_PATH = origBin;
+      else delete process.env.REX_BIN_PATH;
+      __rexTest__.setRexContextOverride(undefined);
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("launch failure cleans up created resources if Rex returns IDs on error.stdout", async () => {
     const { createSurface, sendLongCommand, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
     const executedCommands: string[][] = [];
 
-    try {
-      const savedName = process.env.PI_SUBAGENT_NAME;
-      delete process.env.PI_SUBAGENT_NAME;
+    const savedName = process.env.PI_SUBAGENT_NAME;
+    const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+    delete process.env.PI_SUBAGENT_NAME;
+    delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
 
+    try {
       __rexTest__.setRexContextOverride({
         server: "unix:///tmp/mock.sock",
         session: "session:mock-session",
@@ -3450,12 +3483,7 @@ describe("rex.ts unit tests", () => {
         return "{}";
       });
 
-      let surfaceId: string;
-      try {
-        surfaceId = createSurface("stdout-fail-test");
-      } finally {
-        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
-      }
+      const surfaceId = createSurface("stdout-fail-test");
       const handle = getSurfaceHandle(surfaceId);
       assert.ok(handle);
       assert.equal(handle.kind, "tab");
@@ -3471,6 +3499,8 @@ describe("rex.ts unit tests", () => {
         "closeSurface should have closed the created window extracted from error.stdout",
       );
     } finally {
+      if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+      if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
       __rexTest__.setRexExecutor(null);
       __rexTest__.setCommandAvailabilityOverride(undefined);
       __rexTest__.setRexContextOverride(undefined);
@@ -3481,10 +3511,12 @@ describe("rex.ts unit tests", () => {
     const { createSurface, sendLongCommand, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
     const executedCommands: string[][] = [];
 
-    try {
-      const savedName = process.env.PI_SUBAGENT_NAME;
-      delete process.env.PI_SUBAGENT_NAME;
+    const savedName = process.env.PI_SUBAGENT_NAME;
+    const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+    delete process.env.PI_SUBAGENT_NAME;
+    delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
 
+    try {
       __rexTest__.setRexContextOverride({
         server: "unix:///tmp/mock.sock",
         session: "session:mock-session",
@@ -3510,12 +3542,7 @@ describe("rex.ts unit tests", () => {
         return "{}";
       });
 
-      let surfaceId: string;
-      try {
-        surfaceId = createSurface("fail-test");
-      } finally {
-        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
-      }
+      const surfaceId = createSurface("fail-test");
       const handle = getSurfaceHandle(surfaceId);
       assert.ok(handle);
       assert.equal(handle.kind, "tab");
@@ -3531,6 +3558,8 @@ describe("rex.ts unit tests", () => {
         "closeSurface should have closed the created window after launch failure",
       );
     } finally {
+      if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+      if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
       __rexTest__.setRexExecutor(null);
       __rexTest__.setCommandAvailabilityOverride(undefined);
       __rexTest__.setRexContextOverride(undefined);
