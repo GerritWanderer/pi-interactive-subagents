@@ -3633,6 +3633,8 @@ describe("rex.ts unit tests", () => {
     it("Task 3.1: generated launch scripts preserve real exit status, signals, sidecars, and alternate CLI sentinels", async () => {
       const { sendLongCommand, createSurface, getSurfaceHandle, registerSurfaceHandle, unregisterSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
       const { readFileSync } = await import("node:fs");
+      const { spawnSync } = await import("node:child_process");
+      const testApi = (subagentsModule as any).__test__;
 
       const savedName = process.env.PI_SUBAGENT_NAME;
       const savedTopLevel = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
@@ -3665,13 +3667,31 @@ describe("rex.ts unit tests", () => {
 
       const surfaceId = createSurface("status-preserve-test");
       try {
-        const dummyCommand = 'false; echo "__SUBAGENT_DONE_"$?"__"';
-        const scriptPath = sendLongCommand(surfaceId, dummyCommand);
+        // Test production wrapper builder wrapLaunchCommand directly
+        const wrappedSuccess = testApi.wrapLaunchCommand("true");
+        const wrappedFailure = testApi.wrapLaunchCommand("bash -c 'exit 42'");
+        const wrappedSignal = testApi.wrapLaunchCommand("bash -c 'kill -TERM $$'");
+
+        // Execute wrapped scripts through bash and verify exit status and sentinel
+        const runSuccess = spawnSync("bash", ["-c", wrappedSuccess], { encoding: "utf8" });
+        assert.equal(runSuccess.status, 0);
+        assert.match(runSuccess.stdout, /__SUBAGENT_DONE_0__/);
+
+        const runFailure = spawnSync("bash", ["-c", wrappedFailure], { encoding: "utf8" });
+        assert.equal(runFailure.status, 42);
+        assert.match(runFailure.stdout, /__SUBAGENT_DONE_42__/);
+
+        const runSignal = spawnSync("bash", ["-c", wrappedSignal], { encoding: "utf8" });
+        assert.equal(runSignal.status, 143); // 128 + 15
+        assert.match(runSignal.stdout, /__SUBAGENT_DONE_143__/);
+
+        // Verify sendLongCommand writes the wrapped command to the launch script
+        const scriptPath = sendLongCommand(surfaceId, wrappedFailure);
         assert.ok(launchedScript.length > 0, "script must be launched");
         assert.equal(launchedScript, scriptPath);
 
         const content = readFileSync(scriptPath, "utf8");
-        assert.match(content, /false; echo "__SUBAGENT_DONE_"\$\?"__"/);
+        assert.match(content, /status=\$\?; echo "__SUBAGENT_DONE_\$\{status\}__"; exit "\$status"/);
 
         // Positive exit sidecar tests
         assert.deepEqual(
@@ -3890,6 +3910,38 @@ describe("rex.ts unit tests", () => {
         // Handle must still remain tracked because cleanup was uncertain
         assert.ok(getSurfaceHandle("transient-fail-surface"));
         unregisterSurfaceHandle("transient-fail-surface");
+        // Pending cleanup retry queue test:
+        // When safeCloseSurface encounters a transient error, it enqueues the surface in pendingCleanups.
+        // When transport recovers, processPendingCleanups() successfully removes it.
+        let closeAttempts = 0;
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "close") {
+            closeAttempts++;
+            if (closeAttempts === 1) {
+              throw new Error("transient socket glitch");
+            }
+            return "{}";
+          }
+          return "{}";
+        });
+        registerSurfaceHandle({
+          id: "retry-queue-surface",
+          kind: "split",
+          name: "retry-queue",
+          sessionId: "session:mock",
+          blockId: "block:retry-blk",
+          status: "launched",
+        });
+
+        testApi.safeCloseSurface("retry-queue-surface");
+        assert.equal(testApi.pendingCleanups.has("retry-queue-surface"), true, "failed surface must be in pendingCleanups");
+        assert.ok(getSurfaceHandle("retry-queue-surface"), "handle must remain tracked before recovery");
+
+        // Transport recovers on next attempt
+        testApi.processPendingCleanups();
+        assert.equal(testApi.pendingCleanups.has("retry-queue-surface"), false, "recovered surface must be removed from queue");
+        assert.equal(getSurfaceHandle("retry-queue-surface"), undefined, "handle must be closed and unregistered");
+
         const fakeRunning = {
           id: "r-cleanup",
           name: "clean-agent",
@@ -4082,6 +4134,11 @@ describe("rex.ts unit tests", () => {
 
       // Verify subagent-done agent_end handler directly:
       // (a) autoExit: false keeps session open
+      const savedEnv = {
+        session: process.env.PI_SUBAGENT_SESSION,
+        autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        name: process.env.PI_SUBAGENT_NAME,
+      };
       const dir = createTestDir();
       try {
         const sessionFile = join(dir, "interactive.jsonl");
@@ -4096,11 +4153,6 @@ describe("rex.ts unit tests", () => {
           sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
         } as any;
 
-        const savedEnv = {
-          session: process.env.PI_SUBAGENT_SESSION,
-          autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
-          name: process.env.PI_SUBAGENT_NAME,
-        };
         process.env.PI_SUBAGENT_SESSION = sessionFile;
         delete process.env.PI_SUBAGENT_AUTO_EXIT; // interactive / auto-exit off
         process.env.PI_SUBAGENT_NAME = "interactive-agent";
@@ -4147,10 +4199,10 @@ describe("rex.ts unit tests", () => {
         }
 
         // Restore env
+      } finally {
         restoreEnvVar("PI_SUBAGENT_SESSION", savedEnv.session);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", savedEnv.autoExit);
         restoreEnvVar("PI_SUBAGENT_NAME", savedEnv.name);
-      } finally {
         rmSync(dir, { recursive: true, force: true });
       }
 

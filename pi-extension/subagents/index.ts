@@ -536,6 +536,10 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
  * (for example direnv/devenv), so the delay is configurable for users who hit
  * dropped commands. Keep the historical default at 500ms.
  */
+export function wrapLaunchCommand(baseCommand: string): string {
+  return `${baseCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
+}
+
 function getShellReadyDelayMs(): number {
   if (!needsShellReadyDelay()) return 0;
   const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
@@ -696,6 +700,47 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
+
+/** Set of surfaces pending cleanup after close failure, with retry state. */
+interface PendingCleanupEntry {
+  surface: string;
+  retriesLeft: number;
+}
+const pendingCleanups = new Map<string, PendingCleanupEntry>();
+let cleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function processPendingCleanups(): void {
+  cleanupRetryTimer = null;
+  for (const [surface, entry] of pendingCleanups) {
+    try {
+      closeSurface(surface);
+      pendingCleanups.delete(surface);
+    } catch {
+      entry.retriesLeft--;
+      if (entry.retriesLeft <= 0) {
+        pendingCleanups.delete(surface);
+      }
+    }
+  }
+  if (pendingCleanups.size > 0 && !cleanupRetryTimer) {
+    cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+  }
+}
+
+function safeCloseSurface(surface: string): void {
+  try {
+    closeSurface(surface);
+    pendingCleanups.delete(surface);
+  } catch {
+    // Schedule bounded retry
+    if (!pendingCleanups.has(surface)) {
+      pendingCleanups.set(surface, { surface, retriesLeft: 5 });
+    }
+    if (!cleanupRetryTimer) {
+      cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+    }
+  }
+}
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -1202,6 +1247,10 @@ export const __test__ = {
   widgetIcon,
   watchSubagent,
   launchSubagent,
+  wrapLaunchCommand,
+  pendingCleanups,
+  processPendingCleanups,
+  safeCloseSurface,
 };
 
 function startWidgetRefresh() {
@@ -1320,7 +1369,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
+    const command = wrapLaunchCommand(`${cdPrefix}${cmdParts.join(" ")}`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1464,7 +1513,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
+  const command = wrapLaunchCommand(piCommand);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1621,9 +1670,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      try {
-        closeSurface(surface);
-      } catch {}
+      safeCloseSurface(surface);
       runningSubagents.delete(running.id);
 
       const outcome: "success" | "failure" | "interrupted" =
@@ -1666,9 +1713,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    try {
-      closeSurface(surface);
-    } catch {}
+    safeCloseSurface(surface);
     runningSubagents.delete(running.id);
 
     const outcome: "success" | "failure" | "interrupted" =
@@ -1691,9 +1736,7 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
+    safeCloseSurface(surface);
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -1737,6 +1780,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    if (cleanupRetryTimer) {
+      clearTimeout(cleanupRetryTimer);
+      cleanupRetryTimer = null;
+    }
+    for (const [surface] of pendingCleanups) {
+      try {
+        closeSurface(surface);
+      } catch {}
+    }
+    pendingCleanups.clear();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -2298,7 +2351,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
+        const command = wrapLaunchCommand(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
