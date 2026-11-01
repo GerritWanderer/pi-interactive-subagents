@@ -3260,6 +3260,12 @@ describe("rex.ts unit tests", () => {
     const executedCommands: string[][] = [];
 
     try {
+      __rexTest__.setRexContextOverride({
+        server: "unix:///tmp/mock.sock",
+        session: "session:mock-session",
+        block: "block:mock-anchor",
+      });
+
       // (a) Absent/missing status report rejects delivery and sends zero input events
       __rexTest__.setRexExecutor((args) => {
         executedCommands.push(args);
@@ -3339,6 +3345,69 @@ describe("rex.ts unit tests", () => {
       assert.equal(enterPayload.event.payload.key, "enter");
     } finally {
       unregisterSurfaceHandle("steer-handle-test");
+      __rexTest__.setRexContextOverride(undefined);
+      __rexTest__.setRexExecutor(null);
+    }
+  });
+
+  it("launch failure cleans up created resources if Rex returns IDs on error.stdout", async () => {
+    const { createSurface, sendLongCommand, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const executedCommands: string[][] = [];
+
+    try {
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
+
+      __rexTest__.setRexContextOverride({
+        server: "unix:///tmp/mock.sock",
+        session: "session:mock-session",
+        block: "block:mock-anchor",
+      });
+
+      // Force an error where error.stdout contains JSON with window_id and block_ids
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "block" && args[1] === "inspect") {
+          return JSON.stringify({ block: { block_id: "block:mock-anchor" } });
+        }
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({
+            layers: [{ blocks: [{ block_id: "block:stdout-blk" }] }],
+          });
+        }
+        if (args[0] === "window" && args[1] === "new") {
+          const err = new Error("rex window new failed with nonzero exit code");
+          (err as any).stdout = JSON.stringify({
+            window_id: "window:stdout-win",
+            block_ids: ["block:stdout-blk"],
+          });
+          throw err;
+        }
+        return "{}";
+      });
+
+      let surfaceId: string;
+      try {
+        surfaceId = createSurface("stdout-fail-test");
+      } finally {
+        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+      }
+      const handle = getSurfaceHandle(surfaceId);
+      assert.ok(handle);
+      assert.equal(handle.kind, "tab");
+
+      assert.throws(() => {
+        sendLongCommand(surfaceId, "echo fail");
+      });
+
+      // Assert that closeSurface cleaned up the captured window_id from error.stdout
+      assert.equal(getSurfaceHandle(surfaceId), undefined);
+      assert.ok(
+        executedCommands.some((c) => c[0] === "window" && c[1] === "close" && c.includes("window:stdout-win")),
+        "closeSurface should have closed the created window extracted from error.stdout",
+      );
+    } finally {
+      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
     }
   });
@@ -3351,11 +3420,17 @@ describe("rex.ts unit tests", () => {
       const savedName = process.env.PI_SUBAGENT_NAME;
       delete process.env.PI_SUBAGENT_NAME;
 
+      __rexTest__.setRexContextOverride({
+        server: "unix:///tmp/mock.sock",
+        session: "session:mock-session",
+        block: "block:mock-anchor",
+      });
+
       // Force an error after Rex creation (e.g. by intercepting launch)
       __rexTest__.setRexExecutor((args) => {
         executedCommands.push(args);
         if (args[0] === "block" && args[1] === "inspect") {
-          return JSON.stringify({ block: { block_id: "block:anchor" } });
+          return JSON.stringify({ block: { block_id: "block:mock-anchor" } });
         }
         if (args[0] === "window" && args[1] === "inspect") {
           return JSON.stringify({
@@ -3390,12 +3465,19 @@ describe("rex.ts unit tests", () => {
         "closeSurface should have closed the created window after launch failure",
       );
     } finally {
+      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
     }
   });
 
   it("createSurfaceSplit parent-handle resolution runs deterministically with stubbed inspection", async () => {
     const { registerSurfaceHandle, unregisterSurfaceHandle, createSurfaceSplit, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+
+    __rexTest__.setRexContextOverride({
+      server: "unix:///tmp/mock.sock",
+      session: "session:mock-session",
+      block: "block:mock-anchor",
+    });
 
     __rexTest__.setRexExecutor((args) => {
       if (args[0] === "block" && args[1] === "inspect") {
@@ -3435,6 +3517,7 @@ describe("rex.ts unit tests", () => {
     } finally {
       unregisterSurfaceHandle("parent-handle-stub");
       unregisterSurfaceHandle("unlaunched-parent-stub");
+      __rexTest__.setRexContextOverride(undefined);
       __rexTest__.setRexExecutor(null);
     }
   });

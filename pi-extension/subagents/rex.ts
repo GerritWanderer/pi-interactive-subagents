@@ -48,7 +48,16 @@ export function rexBin(): string {
   return process.env.REX_BIN_PATH || (process.env.REX_BIN_DIR ? join(process.env.REX_BIN_DIR, "rex") : "rex");
 }
 
+let customContextOverride: RexContext | null | undefined = undefined;
+
+export function setRexContextOverride(ctx: RexContext | null | undefined): void {
+  customContextOverride = ctx;
+}
+
 export function getRexContext(): RexContext {
+  if (customContextOverride !== undefined && customContextOverride !== null) {
+    return customContextOverride;
+  }
   return {
     server: process.env.REX_SERVER?.trim() || undefined,
     session: process.env.REX_SESSION?.trim() || undefined,
@@ -165,8 +174,12 @@ export function rexExec(args: string[], options?: RexExecOptions): string {
     });
   } catch (error: any) {
     const stderr = typeof error?.stderr === "string" ? error.stderr.trim() : "";
+    const stdout = typeof error?.stdout === "string" ? error.stdout.trim() : "";
     const msg = stderr || error?.message || String(error);
-    throw new Error(`rex ${args.join(" ")} failed: ${msg}`);
+    const err = new Error(`rex ${args.join(" ")} failed: ${msg}`);
+    (err as any).stdout = stdout;
+    (err as any).stderr = stderr;
+    throw err;
   }
 }
 
@@ -428,9 +441,10 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     try {
       res = rexJson(args);
     } catch (err: any) {
-      // Try to parse partial response from error message if available
+      // Try to parse partial response from error.stdout, error.message, or attached json
       try {
-        const match = err?.message?.match(/\{[\s\S]*\}/);
+        const textToSearch = `${err?.stdout ?? ""} ${err?.message ?? ""}`;
+        const match = textToSearch.match(/\{[\s\S]*\}/);
         if (match) {
           const parsed = JSON.parse(match[0]);
           if (parsed?.window_id) handle.windowId = parsed.window_id;
@@ -477,7 +491,8 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
       res = rexJson(args);
     } catch (err: any) {
       try {
-        const match = err?.message?.match(/\{[\s\S]*\}/);
+        const textToSearch = `${err?.stdout ?? ""} ${err?.message ?? ""}`;
+        const match = textToSearch.match(/\{[\s\S]*\}/);
         if (match) {
           const parsed = JSON.parse(match[0]);
           if (Array.isArray(parsed?.block_ids) && parsed.block_ids.length > 0) handle.blockId = parsed.block_ids[0];
@@ -874,4 +889,5 @@ export const __rexTest__ = {
   validateTrustworthyProgramStatus,
   validateAnchorBlock,
   setRexExecutor,
+  setRexContextOverride,
 };
