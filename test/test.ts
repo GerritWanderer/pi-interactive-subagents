@@ -3168,21 +3168,135 @@ describe("rex.ts unit tests", () => {
     }
   });
 
-  it("closeSurface closes only blockId when window inspection fails, throws, or layout is malformed/has multiple blocks", async () => {
-    const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+  it("closeSurface deterministically calls window close for lone block and block close for multi-block/error", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const executedCommands: string[][] = [];
+
+    // 1. Lone block tab -> window close
+    __rexTest__.setRexExecutor((args) => {
+      executedCommands.push(args);
+      if (args[0] === "window" && args[1] === "inspect") {
+        return JSON.stringify({
+          layers: [{ blocks: [{ block_id: "block:lone-1" }] }],
+        });
+      }
+      return "";
+    });
+
     registerSurfaceHandle({
-      id: "test-inspect-fail-handle",
+      id: "tab-lone",
       kind: "tab",
-      name: "tab-inspect-fail",
-      sessionId: process.env.REX_SESSION ?? "session:test",
-      windowId: "window:nonexistent-fail-window",
-      blockId: "block:nonexistent-fail-block",
+      name: "lone",
+      sessionId: "session:test",
+      windowId: "window:w1",
+      blockId: "block:lone-1",
       status: "launched",
     });
 
-    // Should not throw, and should attempt block close only (safe path)
-    closeSurface("test-inspect-fail-handle");
-    assert.equal(getSurfaceHandle("test-inspect-fail-handle"), undefined);
+    closeSurface("tab-lone");
+    assert.deepEqual(executedCommands[executedCommands.length - 1], [
+      "window", "close", "-s", "session:test", "window:w1",
+    ]);
+
+    // 2. Multi-block tab -> block close
+    executedCommands.length = 0;
+    __rexTest__.setRexExecutor((args) => {
+      executedCommands.push(args);
+      if (args[0] === "window" && args[1] === "inspect") {
+        return JSON.stringify({
+          layers: [{ blocks: [{ block_id: "block:parent" }, { block_id: "block:child" }] }],
+        });
+      }
+      return "";
+    });
+
+    registerSurfaceHandle({
+      id: "tab-multi",
+      kind: "tab",
+      name: "multi",
+      sessionId: "session:test",
+      windowId: "window:w1",
+      blockId: "block:parent",
+      status: "launched",
+    });
+
+    closeSurface("tab-multi");
+    assert.deepEqual(executedCommands[executedCommands.length - 1], [
+      "block", "close", "-s", "session:test", "block:parent",
+    ]);
+
+    // 3. Inspection throws error -> block close
+    executedCommands.length = 0;
+    __rexTest__.setRexExecutor((args) => {
+      executedCommands.push(args);
+      if (args[0] === "window" && args[1] === "inspect") {
+        throw new Error("transport error");
+      }
+      return "";
+    });
+
+    registerSurfaceHandle({
+      id: "tab-err",
+      kind: "tab",
+      name: "err",
+      sessionId: "session:test",
+      windowId: "window:w1",
+      blockId: "block:err-1",
+      status: "launched",
+    });
+
+    closeSurface("tab-err");
+    assert.deepEqual(executedCommands[executedCommands.length - 1], [
+      "block", "close", "-s", "session:test", "block:err-1",
+    ]);
+
+    // Reset executor
+    __rexTest__.setRexExecutor(null);
+  });
+
+  it("createSurfaceSplit parent-handle resolution runs deterministically with stubbed inspection", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, createSurfaceSplit, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+
+    __rexTest__.setRexExecutor((args) => {
+      if (args[0] === "block" && args[1] === "inspect") {
+        return JSON.stringify({ block: { block_id: args[args.length - 1] } });
+      }
+      return "{}";
+    });
+
+    registerSurfaceHandle({
+      id: "parent-handle-stub",
+      kind: "tab",
+      name: "parent-stub",
+      sessionId: "session:stub",
+      blockId: "block:stub-parent",
+      status: "launched",
+    });
+
+    registerSurfaceHandle({
+      id: "unlaunched-parent-stub",
+      kind: "tab",
+      name: "unlaunched-stub",
+      sessionId: "session:stub",
+      status: "reserved",
+    });
+
+    try {
+      const splitHandleId = createSurfaceSplit("child-stub-test", "right", "parent-handle-stub");
+      const splitHandle = getSurfaceHandle(splitHandleId);
+      assert.ok(splitHandle);
+      assert.equal(splitHandle.anchorBlockId, "block:stub-parent");
+      assert.equal(splitHandle.sessionId, "session:stub");
+
+      assert.throws(
+        () => createSurfaceSplit("child-stub-fail", "right", "unlaunched-parent-stub"),
+        /has not been launched yet; no block ID available to split/,
+      );
+    } finally {
+      unregisterSurfaceHandle("parent-handle-stub");
+      unregisterSurfaceHandle("unlaunched-parent-stub");
+      __rexTest__.setRexExecutor(null);
+    }
   });
 });
 

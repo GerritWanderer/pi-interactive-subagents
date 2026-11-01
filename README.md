@@ -50,6 +50,16 @@ pi
 
 Running pi outside Rex disables the `subagent` tools with a clear diagnostic hint.
 
+## Explicit Workspace-Source Startup
+
+To test or run the extension directly from workspace source with extension auto-discovery disabled:
+
+```bash
+pi -ne -e <path-to-workspace>/pi-extension/subagents/index.ts
+```
+
+This guarantees that local edits are evaluated without conflict or interference from any globally installed package.
+
 ## Workspace-Source Testing & Verification
 
 Integration tests exercise the code directly from workspace source rather than any installed package:

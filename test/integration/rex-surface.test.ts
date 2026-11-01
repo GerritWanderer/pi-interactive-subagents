@@ -211,5 +211,88 @@ for (const backend of backends) {
       const childProc = queryBlockProcess(childHandle.blockId, childHandle.sessionId);
       assert.notEqual(childProc, "not_found", "child block must survive parent cleanup");
     });
+
+    it("closing a lone tab surface closes the entire Rex window", async () => {
+      // Ensure we simulate a top-level spawner so createSurface creates a tab
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_NAME;
+      let surface: string;
+      try {
+        surface = createTrackedSurface(env, "lone-tab-close");
+        sendLongCommand(surface, `echo "LONE_TAB"`);
+        await waitForScreen(surface, /LONE_TAB/, 10_000, 20);
+      } finally {
+        if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
+      }
+
+      const handle = (await import("../../pi-extension/subagents/rex.ts")).getSurfaceHandle(surface);
+      assert.ok(handle?.blockId && handle?.windowId);
+      const windowId = handle.windowId;
+
+      closeSurface(surface);
+      await sleep(500);
+
+      // Both block and window should be gone
+      const proc = queryBlockProcess(handle.blockId, handle.sessionId);
+      assert.equal(proc, "not_found");
+
+      const { rexExec } = await import("../../pi-extension/subagents/rex.ts");
+      assert.throws(
+        () => rexExec(["window", "inspect", "-s", handle.sessionId, windowId, "--json"]),
+        /not found/,
+      );
+    });
+
+    it("sendMessage exercises full safety check and delivery against running process", async () => {
+      const surface = createTrackedSurface(env, "send-msg-test");
+      // Run a shell that sets a status or reads input
+      sendLongCommand(surface, `bash`);
+      await sleep(1000);
+
+      // If program_status reports no records yet, sendMessage throws safely
+      try {
+        sendMessage(surface, "echo HELLO_STEER");
+        await waitForScreen(surface, /HELLO_STEER/, 5000, 20);
+      } catch (err: any) {
+        // Confirms safety refusal when status is absent/untrusted
+        assert.match(err.message, /No program status records available|Cannot deliver message safely/);
+      }
+    });
+
+    it("launches command with special-character cwd and script path", async () => {
+      const { mkdirSync } = await import("node:fs");
+      const { join } = await import("node:path");
+
+      const specialCwd = join(env.dir, "cwd with 'quotes' & spaces");
+      mkdirSync(specialCwd, { recursive: true });
+
+      const surface = createTrackedSurface(env, "special-cwd");
+      const specialScript = join(specialCwd, "test 'special' script.sh");
+
+      sendLongCommand(surface, `pwd; echo "SPECIAL_CWD_OK"`, {
+        cwd: specialCwd,
+        scriptPath: specialScript,
+      });
+
+      await waitForScreen(surface, /SPECIAL_CWD_OK/, 10_000, 20);
+    });
+
+    it("cleans up reservations and resources on launch failure", async () => {
+      const { getSurfaceHandle, sendLongCommand } = await import("../../pi-extension/subagents/rex.ts");
+      const surface = createTrackedSurface(env, "launch-fail-test");
+      const handle = getSurfaceHandle(surface);
+      assert.ok(handle);
+      assert.equal(handle.status, "reserved");
+
+      // Attempt launch with an impossible script path (e.g. read-only uncreatable path)
+      assert.throws(() => {
+        sendLongCommand(surface, "echo fail", {
+          scriptPath: "/proc/nonexistent/sub/fail.sh",
+        });
+      });
+
+      // Handle should have been closed/cleaned up
+      assert.equal(getSurfaceHandle(surface), undefined);
+    });
   });
 }

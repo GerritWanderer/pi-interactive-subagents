@@ -136,6 +136,14 @@ export interface RexExecOptions {
   timeoutMs?: number;
 }
 
+export type RexExecutor = (args: string[], options?: RexExecOptions) => string;
+
+let customExecutor: RexExecutor | null = null;
+
+export function setRexExecutor(fn: RexExecutor | null): void {
+  customExecutor = fn;
+}
+
 export function buildRexArgs(subcommandArgs: string[], server?: string): string[] {
   const s = server ?? getRexContext().server;
   if (s) {
@@ -145,6 +153,9 @@ export function buildRexArgs(subcommandArgs: string[], server?: string): string[
 }
 
 export function rexExec(args: string[], options?: RexExecOptions): string {
+  if (customExecutor) {
+    return customExecutor(args, options);
+  }
   const fullArgs = buildRexArgs(args);
   try {
     return execFileSync(rexBin(), fullArgs, {
@@ -377,19 +388,20 @@ export function sendLongCommand(
       "pi-subagent-scripts",
       `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`,
     );
-  mkdirSync(dirname(scriptPath), { recursive: true });
-
-  const scriptParts = ["#!/bin/bash"];
-  if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
-  }
-  scriptParts.push(command);
-
-  writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
-    mode: 0o755,
-  });
 
   try {
+    mkdirSync(dirname(scriptPath), { recursive: true });
+
+    const scriptParts = ["#!/bin/bash"];
+    if (options?.scriptPreamble) {
+      scriptParts.push(options.scriptPreamble.trimEnd());
+    }
+    scriptParts.push(command);
+
+    writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
+      mode: 0o755,
+    });
+
     launchRexSurface(handle, scriptPath, options?.cwd);
   } catch (err) {
     // Release reservation on failure
@@ -831,4 +843,5 @@ export const __rexTest__ = {
   isBlockedDialog,
   validateTrustworthyProgramStatus,
   validateAnchorBlock,
+  setRexExecutor,
 };
