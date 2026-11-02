@@ -751,7 +751,7 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
 
   let reconciled = false;
   for (const [sessionPath, entry] of lostObservationEntries) {
-    if (!entry.blockId) continue;
+    if (!entry.blockId?.trim() || !entry.sessionId?.trim()) continue;
     try {
       const proc = queryBlockProcess(entry.blockId, entry.sessionId);
       if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
@@ -814,9 +814,10 @@ function processPendingCleanups(): void {
     try {
       closeSurface(surface);
       pendingCleanups.delete(surface);
-    } catch {
+    } catch (err) {
       entry.retriesLeft--;
       if (entry.retriesLeft <= 0) {
+        console.error(`Failed to clean up surface ${surface} after retries exhausted: ${err}`);
         pendingCleanups.delete(surface);
       }
     }
@@ -1952,7 +1953,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     for (const [surface] of pendingCleanups) {
       try {
         closeSurface(surface);
-      } catch {}
+      } catch (err) {
+        console.error(`Failed to close surface ${surface} on session shutdown: ${err}`);
+      }
     }
     pendingCleanups.clear();
     if (widgetInterval) {
@@ -2432,9 +2435,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // If marker is still on disk, check if it has process coordinates and query directly
         if (hasLostObservationMarker(sessionPath)) {
           const marker = readLostObservationMarker(sessionPath);
-          if (marker?.blockId) {
+          if (marker?.blockId?.trim() && marker?.sessionId?.trim()) {
             try {
-              const proc = queryBlockProcess(marker.blockId, marker.sessionId ?? "");
+              const proc = queryBlockProcess(marker.blockId, marker.sessionId);
               if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
                 confirmProcessEnded(sessionPath);
                 if (marker.surface) safeCloseSurface(marker.surface);

@@ -4166,7 +4166,7 @@ describe("rex.ts unit tests", () => {
       }
     });
 
-    it("Task 3.3: separates result collection from idempotent resource cleanup", async () => {
+    it("Task 3.3: separates result collection from idempotent resource cleanup", async (t) => {
       const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
       const testApi = (subagentsModule as any).__test__;
 
@@ -4295,6 +4295,18 @@ describe("rex.ts unit tests", () => {
         assert.equal(watchRes.outcome, "success");
         assert.equal(watchRes.exitCode, 0);
         assert.equal(watchRes.summary, "Sub-agent exited without output");
+
+        await t.test("exhausted cleanup retries log the final error without changing the collected result", (t) => {
+          const collectedResult = structuredClone(watchRes);
+          const diagnostic = t.mock.method(console, "error", () => {});
+          assert.ok(testApi.pendingCleanups.has("cleanup-res-surface"));
+          for (let retry = 0; retry < 5; retry++) testApi.processPendingCleanups();
+          assert.equal(testApi.pendingCleanups.has("cleanup-res-surface"), false);
+          assert.equal(diagnostic.mock.calls.length, 1);
+          assert.match(diagnostic.mock.calls[0].arguments[0], /Failed to clean up surface cleanup-res-surface after retries exhausted:/);
+          assert.match(diagnostic.mock.calls[0].arguments[0], /close failed cosmetic/);
+          assert.deepEqual(watchRes, collectedResult);
+        });
 
         // Infrastructure observation failure test:
         // When polling fails with RexInfrastructureError after maxConsecutiveErrors,
@@ -4534,6 +4546,62 @@ describe("rex.ts unit tests", () => {
         (subagentsModule as any).default(restartApi);
         const restartMsgTool = restartTools.find((t: any) => t.name === "subagent_message");
         assert.ok(restartMsgTool);
+
+        await t.test("missing or empty process coordinates refuse resume and preserve the lost-observation guard", async () => {
+          let rexCalls = 0;
+          __rexTest__.setRexExecutor(() => {
+            rexCalls++;
+            throw new Error('block "block:mock-reconcile" not found');
+          });
+          const invalidCoordinates = [
+            { blockId: "block:mock-reconcile" },
+            { blockId: "block:mock-reconcile", sessionId: "" },
+            { blockId: "block:mock-reconcile", sessionId: " \t " },
+            { sessionId: "session:mock" },
+            { blockId: "", sessionId: "session:mock" },
+            { blockId: " \t ", sessionId: "session:mock" },
+          ];
+          for (const coordinates of invalidCoordinates) {
+            for (const inMemory of [false, true]) {
+              testApi.lostObservationSessions.clear();
+              testApi.lostObservationEntries.clear();
+              writeFileSync(lostObservationMarkerPath(reconcileSession), JSON.stringify(coordinates));
+              if (inMemory) {
+                testApi.lostObservationSessions.add(resolve(reconcileSession));
+                testApi.lostObservationEntries.set(resolve(reconcileSession), {
+                  sessionFile: reconcileSession,
+                  surface: "reconcile-surface",
+                  ...coordinates,
+                  sessionId: coordinates.sessionId ?? "",
+                });
+              }
+              const refused = await restartMsgTool.execute(
+                "msg-incomplete-coordinates",
+                { name: "reconcile-agent", message: "try resume" },
+                undefined,
+                undefined,
+                {
+                  sessionManager: {
+                    getSessionDir: () => dir,
+                    getSessionId: () => "main-sess",
+                    getSessionFile: () => join(dir, "main.jsonl"),
+                  },
+                },
+              );
+              assert.match(refused.content[0].text, /observation of its previous run was lost/);
+              assert.equal(hasLostObservationMarker(reconcileSession), true);
+              if (inMemory) assert.ok(testApi.lostObservationSessions.has(resolve(reconcileSession)));
+              assert.equal(rexCalls, 0, "incomplete coordinates must not query or close a process");
+            }
+          }
+          testApi.lostObservationSessions.clear();
+          testApi.lostObservationEntries.clear();
+          writeLostObservationMarker(reconcileSession, {
+            blockId: "block:mock-reconcile",
+            sessionId: "session:mock",
+            surface: "reconcile-surface",
+          });
+        });
 
         __rexTest__.setRexExecutor((args) => {
           if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
