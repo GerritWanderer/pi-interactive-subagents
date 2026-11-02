@@ -30,7 +30,21 @@ The pane carries the same name in the Rex window and block list. Set `PI_SUBAGEN
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Split direction follows the anchor block's geometry: a wide parent pane (columns / rows >= 2) splits right, a narrow or tall one splits below. Force one direction with `PI_SUBAGENT_SPLIT_DIRECTION=right|down|auto` (where down maps to Rex's `below`).
+Split direction follows the anchor block's geometry: a wide parent pane (columns / rows >= 2) splits right, a narrow or tall one splits below. Force one direction with `PI_SUBAGENT_SPLIT_DIRECTION=right|down|auto` (default `auto`; down maps to Rex's `below`). If dimensions cannot be read, automatic direction falls back to right.
+
+### Automatic sizing & placement overrides
+
+After a split launches or an owned pane is cleaned up, the extension balances **only the affected tab's tiled layout**. Bursts are debounced by 100 ms. Columns and rows receive equal shares for their split structure: stacked panes count as one column, and side-by-side panes count as one row. Other tabs and floating layers are left untouched; no operation selects the active tab or changes keyboard focus.
+
+**Manual sizes within that tab can be reset** at the next creation/cleanup. With the top-level `pane` override, this includes your spawning tab's tiled panes, not just agent-owned panes. A new top-level tab needs no balancing until it gains splits. Corrections smaller than 0.005 of a split's ratio are ignored. Sizing is cosmetic: stale layouts, disappeared tabs, and resize failures never fail a launch or replace a collected result. Pending sizing work and unlaunched reservations are disposed on shutdown/reload.
+
+| Environment variable | Values | Default | Scope |
+| --- | --- | --- | --- |
+| `PI_SUBAGENT_TOP_LEVEL_SURFACE` | `tab`, `pane` | `tab` | Main-session spawns; nested agents always split their parent |
+| `PI_SUBAGENT_SPLIT_DIRECTION` | `right`, `down`, `auto` | `auto` | Splits use the spawning anchor, never the focused pane |
+| `REX_BIN_PATH` | Executable path | `rex` in PATH | Explicit CLI override; alternatively `REX_BIN_DIR` locates `rex` in a directory |
+
+Unknown placement values use the defaults. Launch runs the prepared script as the new terminal command through Rex's login environment, with explicit cwd and background focus. No interactive prompt-readiness delay is needed; the retired `PI_SUBAGENT_SHELL_READY_DELAY_MS` setting has no effect. Completion uses process state and sidecars, not scrollback. Fallback screen diagnostics use at most two bounded public `format`/`blob_read` replies (64 KiB each); very long diagnostics may therefore be truncated.
 
 Steering a running sub-agent queries program status first to verify input safety: steering is refused if the subagent is blocked on a permission, question, or authentication dialog, or if trustworthy status cannot be read. Input is submitted using a targeted Rex paste event followed by an Enter key event.
 
@@ -76,7 +90,7 @@ npm run test:surface
 
 | Tool | Description |
 | --- | --- |
-| `subagent` | Spawn a sub-agent in a dedicated Herdr tab (or pane, when nested) (async) |
+| `subagent` | Spawn a sub-agent in a dedicated Rex tab (or pane, when nested) (async) |
 | `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
@@ -242,22 +256,9 @@ Status display is configured via `config.json` in the extension directory (copy 
 }
 ```
 
-## Requirements
-
-- [pi](https://github.com/badlogic/pi-mono)
-- [Herdr](https://herdr.dev) 0.9 or later. The extension drives the `herdr` CLI and needs `HERDR_ENV=1`, which Herdr sets in every pane it manages.
-- Or the Herdr desktop app, with `hc` on your `PATH`. The extension needs `HC_TERMINAL_ID`, which herdr-core sets in every terminal.
-
-```bash
-herdr        # open or attach the Herdr session
-pi           # start pi inside a Herdr pane
-```
-
-In the desktop app, start `pi` in any of its terminals. Running pi outside Herdr disables the `subagent` tools with a setup hint.
-
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/). The direct ancestor of this Herdr port is the tmux-only fork [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents).
+Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/). The direct ancestor is the tmux-only fork [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents).
 
 ## License
 

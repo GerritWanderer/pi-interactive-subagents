@@ -8,8 +8,10 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, accessSync, constants } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
+import { planEqualShares } from "./rex-sizing.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,11 +41,8 @@ function hasCommand(command: string): boolean {
   let available = false;
   try {
     // If command contains path separators, check executable access directly without shell interpolation
-    if (command.includes("/") || (process.platform === "win32" && command.includes("\\"))) {
+    if (command.includes("/")) {
       accessSync(command, constants.X_OK);
-      available = true;
-    } else if (process.platform === "win32") {
-      execFileSync("where.exe", [command], { stdio: "ignore" });
       available = true;
     } else {
       execFileSync("sh", ["-c", 'command -v "$1"', "_", command], { stdio: "ignore" });
@@ -136,10 +135,6 @@ function requireMux(): void {
 
 // ── Shell Quoting & Script Resolution ──
 
-export function needsShellReadyDelay(): boolean {
-  return true;
-}
-
 export function shellEscape(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
 }
@@ -156,6 +151,9 @@ export function sendCommand(surface: string, command: string): void {
 
 export interface RexExecOptions {
   timeoutMs?: number;
+  signal?: AbortSignal;
+  // null explicitly selects the local server, rather than a later environment value.
+  server?: string | null;
 }
 
 export type RexExecutor = (args: string[], options?: RexExecOptions) => string;
@@ -166,8 +164,8 @@ export function setRexExecutor(fn: RexExecutor | null): void {
   customExecutor = fn;
 }
 
-export function buildRexArgs(subcommandArgs: string[], server?: string): string[] {
-  const s = server ?? getRexContext().server;
+export function buildRexArgs(subcommandArgs: string[], server?: string | null): string[] {
+  const s = server === undefined ? getRexContext().server : server;
   if (s) {
     return ["-S", s, ...subcommandArgs];
   }
@@ -178,7 +176,7 @@ export function rexExec(args: string[], options?: RexExecOptions): string {
   if (customExecutor) {
     return customExecutor(args, options);
   }
-  const fullArgs = buildRexArgs(args);
+  const fullArgs = buildRexArgs(args, options?.server);
   try {
     return execFileSync(rexBin(), fullArgs, {
       encoding: "utf8",
@@ -197,11 +195,14 @@ export function rexExec(args: string[], options?: RexExecOptions): string {
 }
 
 export async function rexExecAsync(args: string[], options?: RexExecOptions): Promise<string> {
-  const fullArgs = buildRexArgs(args);
+  if (options?.signal?.aborted) throw new Error("Rex request aborted");
+  if (customExecutor) return customExecutor(args, options);
+  const fullArgs = buildRexArgs(args, options?.server);
   try {
     const { stdout } = await execFileAsync(rexBin(), fullArgs, {
       encoding: "utf8",
       timeout: options?.timeoutMs ?? 15000,
+      signal: options?.signal,
     });
     return stdout;
   } catch (error: any) {
@@ -279,6 +280,65 @@ export function queryBlockDimensions(blockId: string, session?: string): PaneDim
   } catch {}
   return undefined;
 }
+
+// ── Tab-local Cosmetic Sizing ──
+
+export const SIZING_DEBOUNCE_MS = 100;
+interface SizingPass {
+  timer?: ReturnType<typeof setTimeout>;
+  controller: AbortController;
+}
+const sizingPasses = new Map<string, SizingPass>();
+
+/** A fresh snapshot is read after each burst; no active-window or focus fallback. */
+export function scheduleTabSizing(session: string, windowId: string): void {
+  const server = getRexContext().server ?? null;
+  const key = JSON.stringify([server, session, windowId]);
+  const prior = sizingPasses.get(key);
+  if (prior?.timer) clearTimeout(prior.timer);
+  prior?.controller.abort();
+  const pass: SizingPass = { controller: new AbortController() };
+  sizingPasses.set(key, pass);
+  pass.timer = setTimeout(async () => {
+    pass.timer = undefined;
+    const options: RexExecOptions = { server, signal: pass.controller.signal, timeoutMs: 3000 };
+    try {
+      const view = await rexJsonAsync(["session", "inspect", session, "--json"], options);
+      if (pass.controller.signal.aborted) return;
+      const window = view?.windows?.find((w: any) => w.window_id === windowId);
+      const tiled = window?.layers?.find((l: any) => l.kind === "tiled");
+      for (const step of planEqualShares(tiled?.layout)) {
+        if (pass.controller.signal.aborted) return;
+        await rexJsonAsync(["api", "call", "session.resize_pane", JSON.stringify({
+          session_id: session, ...step,
+        })], options);
+      }
+    } catch {
+      // A stale layout, vanished tab, or failed border adjustment is cosmetic.
+      // Abandon this pass; the next creation/removal reads a fresh layout.
+    } finally {
+      if (sizingPasses.get(key) === pass) sizingPasses.delete(key);
+    }
+  }, SIZING_DEBOUNCE_MS);
+  pass.timer.unref();
+}
+
+/** Does not terminate live agents, including runs whose observation was lost. */
+export function disposeRexSurfaces(): void {
+  for (const pass of sizingPasses.values()) {
+    if (pass.timer) clearTimeout(pass.timer);
+    pass.controller.abort();
+  }
+  sizingPasses.clear();
+  for (const [id, handle] of activeSurfaces) {
+    if (handle.status === "reserved") activeSurfaces.delete(id);
+  }
+}
+
+// Reload can replace this module without the previous closures disappearing.
+const DISPOSE_KEY = Symbol.for("pi-subagents/rex-dispose");
+(globalThis as any)[DISPOSE_KEY]?.();
+(globalThis as any)[DISPOSE_KEY] = disposeRexSurfaces;
 
 // ── Surface Handle & Reservation ──
 
@@ -543,6 +603,8 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     }
 
     handle.status = "launched";
+    const windowId = getSurfaceTab(handle.id);
+    if (windowId) scheduleTabSizing(sessionId, windowId);
   }
 }
 
@@ -699,50 +761,66 @@ export function sendMessage(surface: string, message: string): void {
 
 // ── Screen Capture & Observation Primitives ──
 
+// Never let fallback diagnostics download the CLI's entire (up to 64 MiB)
+// scrollback. Public format/blob_read cap each reply; at most two reads are used.
+export const DIAGNOSTIC_MAX_BYTES = 64 * 1024;
+const diagnosticOptions: RexExecOptions = { timeoutMs: 3000 };
+function diagnosticArgs(handle: RexSurfaceHandle, method: string, args: object): string[] {
+  return ["block", "call", "-b", handle.blockId!, "-s", handle.sessionId, method, JSON.stringify(args)];
+}
+function tailRequest(result: any): object | undefined {
+  if (!Number.isInteger(result?.id) || !Number.isSafeInteger(result?.total) || result.total <= 0) return;
+  // max_bytes counts JSON-encoded bytes. Even worst-case escaped text fits in
+  // this tail budget (6 encoded bytes per input byte), without paginating it all.
+  return { id: result.id, offset: Math.max(0, result.total - Math.floor(DIAGNOSTIC_MAX_BYTES / 6)), max_bytes: DIAGNOSTIC_MAX_BYTES };
+}
+function diagnosticLines(text: unknown, lines: number): string {
+  if (typeof text !== "string") return "";
+  const count = Number.isFinite(lines) ? Math.max(1, Math.floor(lines)) : 50;
+  return text.slice(-DIAGNOSTIC_MAX_BYTES).trimEnd().split("\n").slice(-count).join("\n");
+}
+
 export function readScreen(surface: string, lines = 50): string {
   requireMux();
   const handle = getSurfaceHandle(surface);
-  if (!handle || !handle.blockId) {
-    return "";
-  }
-  try {
-    const stdout = rexExec(["capture", "-b", handle.blockId, "-s", handle.sessionId, "--trim", "--unwrap"]);
-    const allLines = stdout.split("\n");
-    return allLines.slice(-Math.max(1, lines)).join("\n");
-  } catch (error: any) {
-    throw new Error(`rex capture failed: ${error?.message || String(error)}`);
-  }
+  if (!handle?.blockId) return "";
+  const result = rexJson(diagnosticArgs(handle, "format", {
+    format: "text", trim: true, unwrap: true, max_bytes: DIAGNOSTIC_MAX_BYTES,
+  }), diagnosticOptions);
+  const tail = tailRequest(result);
+  const text = tail ? rexJson(diagnosticArgs(handle, "blob_read", tail), diagnosticOptions)?.data : result?.content;
+  return diagnosticLines(text, lines);
 }
 
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireMux();
   const handle = getSurfaceHandle(surface);
-  if (!handle || !handle.blockId) {
-    return "";
-  }
-  try {
-    const stdout = await rexExecAsync(["capture", "-b", handle.blockId, "-s", handle.sessionId, "--trim", "--unwrap"]);
-    const allLines = stdout.split("\n");
-    return allLines.slice(-Math.max(1, lines)).join("\n");
-  } catch (error: any) {
-    throw new Error(`rex capture failed: ${error?.message || String(error)}`);
-  }
+  if (!handle?.blockId) return "";
+  const result = await rexJsonAsync(diagnosticArgs(handle, "format", {
+    format: "text", trim: true, unwrap: true, max_bytes: DIAGNOSTIC_MAX_BYTES,
+  }), diagnosticOptions);
+  const tail = tailRequest(result);
+  const text = tail ? (await rexJsonAsync(diagnosticArgs(handle, "blob_read", tail), diagnosticOptions))?.data : result?.content;
+  return diagnosticLines(text, lines);
 }
 
-export function getSurfaceTab(surface: string): string | null {
+export function getSurfaceTab(surface: string, refresh = false): string | null {
   const handle = getSurfaceHandle(surface);
-  if (handle?.windowId) return handle.windowId;
+  if (handle?.windowId && (!refresh || !handle.blockId)) return handle.windowId;
   if (!handle?.blockId) return null;
 
   try {
     const raw = rexExec(["block", "inspect", "-s", handle.sessionId, handle.blockId, "--json"]);
     const parsed = JSON.parse(raw);
     const windowId = parsed?.block?.window_id || parsed?.window || parsed?.window_id || null;
-    if (windowId && !handle.windowId) {
-      handle.windowId = windowId;
-    }
+    if (windowId) handle.windowId = windowId;
     return windowId;
-  } catch {
+  } catch (error: any) {
+    // An externally removed pane still needs its last known tab balanced.
+    // A transport failure is not proof of absence: skip sizing rather than guess.
+    if (/block .*not found|block not found/i.test(`${error?.message}\n${error?.stderr}`)) {
+      return handle.windowId ?? null;
+    }
     return null;
   }
 }
@@ -768,6 +846,8 @@ export function closeSurface(surface: string): void {
   const handle = getSurfaceHandle(surface);
   if (!handle) return;
 
+  // Resolve before close: a vanished block can no longer tell us its window.
+  const affectedWindow = getSurfaceTab(surface, true);
   try {
     if (handle.kind === "tab" && handle.windowId) {
       if (handle.blockId) {
@@ -834,6 +914,8 @@ export function closeSurface(surface: string): void {
       // Transient transport failure: do not drop tracking silently
       throw closeError;
     }
+  } finally {
+    if (affectedWindow) scheduleTabSizing(handle.sessionId, affectedWindow);
   }
 }
 
@@ -1061,4 +1143,5 @@ export const __rexTest__ = {
   pollForExit,
   RexInfrastructureError,
   isRexInfrastructureError,
+  sizingPassCount: () => sizingPasses.size,
 };

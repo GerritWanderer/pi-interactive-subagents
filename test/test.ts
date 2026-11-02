@@ -1,4 +1,4 @@
-import { describe, it, before, after, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -30,7 +30,11 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/herdr.ts";
+import { shellEscape, __rexTest__, disposeRexSurfaces } from "../pi-extension/subagents/rex.ts";
+import { planEqualShares, type RexLayoutNode } from "../pi-extension/subagents/rex-sizing.ts";
+
+// A cosmetic timer from one fixture must not run with the next fixture's executor.
+afterEach(() => disposeRexSurfaces());
 import {
   advanceStatusState,
   capStatusLines,
@@ -57,17 +61,6 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
-import { __pollForExitTest__, __layoutTest__ } from "../pi-extension/subagents/herdr.ts";
-import {
-  exitStateOf,
-  freshTabId,
-  isHerdrDesktopEnv,
-  lastLines,
-  launchArgv,
-  runArgs,
-  terminalName,
-  uniqueTerminalName,
-} from "../pi-extension/subagents/herdr-desktop.ts";
 
 // --- Helpers ---
 
@@ -1887,16 +1880,11 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("herdr.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+describe("rex.ts interpretExitSidecar", () => {
+  const { interpretExitSidecar } = __rexTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+  it("rejects obsolete ping payloads (ask_question uses .ask, not .exit)", () => {
+    assert.equal(interpretExitSidecar({ type: "ping" }).reason, "error");
   });
 
   it("decodes done payloads", () => {
@@ -1928,9 +1916,13 @@ describe("herdr.ts interpretExitSidecar", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("rejects unknown payload shapes instead of claiming success", () => {
+    for (const payload of [{}, null]) {
+      const result = interpretExitSidecar(payload);
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage!, /Unrecognized or corrupt/);
+    }
   });
 });
 describe("commands", () => {
@@ -2654,46 +2646,6 @@ describe("subagent status renderer", () => {
   });
 });
 
-describe("subagent startup delay", () => {
-  // The delay only applies outside the Herdr desktop app, which these tests may run in.
-  const originalTerminalId = process.env.HC_TERMINAL_ID;
-  beforeEach(() => {
-    delete process.env.HC_TERMINAL_ID;
-  });
-  after(() => {
-    if (originalTerminalId != null) process.env.HC_TERMINAL_ID = originalTerminalId;
-  });
-
-  it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2856,131 +2808,7 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("herdr.ts layout", () => {
-  const { planEvenSplits, chooseSplitDirection, chooseSurfaceKind } = __layoutTest__;
-  const rect = (x: number, y: number, width: number, height: number) => ({ x, y, width, height });
-  const pane = (pane_id: string, r: ReturnType<typeof rect>) => ({ pane_id, focused: false, rect: r });
-
-  // Real snapshot shape from `herdr pane layout` after splitting w1:p1 right
-  // three times: panes 18/18/24/60 wide, tree left-nested under the root.
-  const lopsided = {
-    zoomed: false,
-    area: rect(0, 0, 120, 40),
-    focused_pane_id: "w1:p1",
-    panes: [
-      pane("w1:p1", rect(0, 0, 18, 40)),
-      pane("w1:p4", rect(18, 0, 18, 40)),
-      pane("w1:p3", rect(36, 0, 24, 40)),
-      pane("w1:p2", rect(60, 0, 60, 40)),
-    ],
-    splits: [
-      { id: "split_0_root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) },
-      { id: "split_1_0", direction: "right" as const, ratio: 0.6, rect: rect(0, 0, 60, 40) },
-      { id: "split_2_00", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 36, 40) },
-    ],
-  };
-
-  describe("planEvenSplits", () => {
-    it("targets the pane whose right edge sits on each split boundary, with a ratio delta", () => {
-      const steps = planEvenSplits(lopsided);
-      // root: 3 of 4 columns on the left -> 0.75 (grow from 0.5, owner p3)
-      // split_1_0: 2 of 3 columns -> 0.667 (grow from 0.6, owner p4)
-      // split_2_00: 1 of 2 columns -> 0.5 (already even, skipped)
-      assert.deepEqual(
-        steps.map((s) => [s.pane, s.direction, Number(s.amount.toFixed(3))]),
-        [
-          ["w1:p3", "right", 0.25],
-          ["w1:p4", "right", 0.067],
-        ],
-      );
-    });
-
-    it("shrinks with `left` when the first side is too wide, since herdr ignores the sign of --amount", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 90, 40)), pane("w1:p2", rect(90, 0, 30, 40))],
-        splits: [{ id: "root", direction: "right", ratio: 0.75, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "left", amount: 0.25 }]);
-    });
-
-    it("balances vertical splits with up/down", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 120, 10)), pane("w1:p2", rect(0, 10, 120, 30))],
-        splits: [{ id: "root", direction: "down", ratio: 0.25, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "down", amount: 0.25 }]);
-    });
-
-    it("counts stacked panes as one column so a down split inside a column does not skew the share", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [
-          pane("w1:p1", rect(0, 0, 60, 40)),
-          pane("w1:p2", rect(60, 0, 60, 20)),
-          pane("w1:p3", rect(60, 20, 60, 20)),
-        ],
-        splits: [
-          { id: "root", direction: "right", ratio: 0.5, rect: rect(0, 0, 120, 40) },
-          { id: "col", direction: "down", ratio: 0.5, rect: rect(60, 0, 60, 40) },
-        ],
-      });
-      assert.deepEqual(steps, []);
-    });
-
-    it("leaves a tab alone when every split is already even", () => {
-      const even = {
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 60, 40)), pane("w1:p2", rect(60, 0, 60, 40))],
-        splits: [{ id: "root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) }],
-      };
-      assert.deepEqual(planEvenSplits(even), []);
-    });
-  });
-
-  describe("chooseSplitDirection", () => {
-    it("splits a wide pane right and a narrow or tall pane down (herdr geometry rule; cells are ~2:1)", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "auto"), "down"); // 60x40
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "auto"), "down"); // 18x40
-      const wide = { ...lopsided, panes: [pane("w1:p1", rect(0, 0, 175, 64))] };
-      assert.equal(chooseSplitDirection(wide, "w1:p1", "auto"), "right");
-    });
-
-    it("honours an explicit setting and falls back to right without a layout", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "right"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "down"), "down");
-      assert.equal(chooseSplitDirection(undefined, "w1:p1", "auto"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p99", "auto"), "right");
-    });
-  });
-
-  describe("chooseSurfaceKind", () => {
-    it("gives a main-session subagent its own tab and keeps a nested subagent's children in its tab", () => {
-      assert.equal(chooseSurfaceKind(false, "tab"), "tab");
-      assert.equal(chooseSurfaceKind(true, "tab"), "pane");
-    });
-
-    it("falls back to panes everywhere when PI_SUBAGENT_TOP_LEVEL_SURFACE is pane", () => {
-      assert.equal(chooseSurfaceKind(false, "pane"), "pane");
-      assert.equal(chooseSurfaceKind(true, "pane"), "pane");
-    });
-
-    it("reads nesting from PI_SUBAGENT_NAME", () => {
-      const saved = process.env.PI_SUBAGENT_NAME;
-      try {
-        delete process.env.PI_SUBAGENT_NAME;
-        assert.equal(chooseSurfaceKind(undefined, "tab"), "tab");
-        process.env.PI_SUBAGENT_NAME = "map-auth-flow";
-        assert.equal(chooseSurfaceKind(undefined, "tab"), "pane");
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_NAME", saved);
-      }
-    });
-  });
-});
-
-describe("herdr.ts", () => {
+describe("rex.ts shell quoting", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -3005,69 +2833,50 @@ describe("herdr.ts", () => {
   });
 });
 
-describe("herdr-desktop.ts", () => {
-  it("detects the desktop app by the HC_TERMINAL_ID herdr-core exports", () => {
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: "t2" }), true);
-    assert.equal(isHerdrDesktopEnv({ HERDR_ENV: "1" }), false);
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: " " }), false);
+describe("Rex equal-share sizing (public session.view layout)", () => {
+  const pane = (block_id: string): RexLayoutNode => ({ block_id, rect: [0, 0, 1, 1] });
+  const split = (direction: "horizontal" | "vertical", ratio: number, before: RexLayoutNode, after: RexLayoutNode): RexLayoutNode => ({
+    rect: [0, 0, 1, 1], split: { split_id: "split:fixture", direction, ratio, before, after },
+  });
+  const a = pane("block:a"), b = pane("block:b"), c = pane("block:c"), d = pane("block:d");
+
+  it("balances repeated halvings into four equal columns using absolute border ratios", () => {
+    const layout = split("horizontal", 0.5,
+      split("horizontal", 0.6, split("horizontal", 0.5, a, b), c), d);
+    assert.deepEqual(planEqualShares(layout), [
+      { direction: "horizontal", before_block_id: "block:b", after_block_id: "block:c", ratio: 2 / 3 },
+      { direction: "horizontal", before_block_id: "block:c", after_block_id: "block:d", ratio: 3 / 4 },
+    ]);
+    assert.equal(planEqualShares(split("horizontal", 0.75, a, b))[0].ratio, 0.5, "also shrinks the before share");
   });
 
-  it("turns a subagent name into a valid hc terminal name", () => {
-    assert.equal(terminalName("Scout: Map the API!"), "scout-map-the-api");
-    assert.equal(terminalName("worker_2"), "worker_2");
-    assert.equal(terminalName("a".repeat(40))?.length, 32, "hc caps names at 32 characters");
-    assert.equal(terminalName("x".repeat(31) + "-y"), "x".repeat(31), "no trailing dash after the cut");
-    assert.equal(terminalName("!!!"), null, "nothing usable is left");
-  });
-
-  it("skips names live terminals already hold, within hc's 32 characters", () => {
-    assert.equal(uniqueTerminalName("scout", new Set()), "scout");
-    assert.equal(uniqueTerminalName("scout", new Set(["scout", "scout-2"])), "scout-3");
-    const long = "x".repeat(32);
-    assert.equal(uniqueTerminalName(long, new Set([long])), "x".repeat(30) + "-2");
-  });
-
-  it("starts subagents without notes, focus or a tie to the parent's lifetime", () => {
-    const args = runArgs({
-      cwd: "/repo", space: "sp1", tab: "tb1", name: "scout", argv: ["bash", "/s.sh"],
-    });
-    assert.deepEqual(args, [
-      "run", "--bg", "--keep", "--no-notify", "--outlive-parent",
-      "--cwd", "/repo", "--name", "scout",
-      "--label", "herdr.space=sp1", "--label", "herdr.tab=tb1",
-      "--", "bash", "/s.sh",
+  it("balances stacked rows and counts side-by-side panes as one row", () => {
+    const layout = split("vertical", 0.5, a,
+      split("vertical", 0.5, split("horizontal", 0.5, b, c), d));
+    assert.deepEqual(planEqualShares(layout), [
+      { direction: "vertical", before_block_id: "block:a", after_block_id: "block:b", ratio: 1 / 3 },
     ]);
   });
 
-  it("runs the launch script through the login shell, so the child gets the person's PATH", () => {
-    assert.deepEqual(
-      launchArgv("/tmp/it's.sh", { shell: "/bin/zsh", platform: "darwin" }),
-      ["/bin/zsh", "-l", "-i", "-c", "exec bash '/tmp/it'\\''s.sh'"],
-    );
-    assert.equal(launchArgv("/s.sh", { platform: "linux" })[0], "/bin/sh", "no $SHELL falls back to sh");
-    assert.deepEqual(launchArgv("C:\\s.sh", { platform: "win32" }), ["bash", "C:\\s.sh"]);
+  it("counts stacked panes as one column in mixed-axis trees", () => {
+    assert.deepEqual(planEqualShares(split("horizontal", 0.5, a, split("vertical", 0.5, b, c))), []);
+    const layout = split("horizontal", 0.5,
+      split("vertical", 0.7, split("horizontal", 0.5, a, b), c), d);
+    assert.deepEqual(planEqualShares(layout), [
+      { direction: "vertical", before_block_id: "block:b", after_block_id: "block:c", ratio: 0.5 },
+      { direction: "horizontal", before_block_id: "block:c", after_block_id: "block:d", ratio: 2 / 3 },
+    ]);
   });
 
-  it("knows a subagent ended from herdr-core's record, not its screen", () => {
-    assert.deepEqual(exitStateOf({ state: "live" }), { finished: false });
-    assert.deepEqual(exitStateOf({ state: "finished", exit_code: 0 }), { finished: true, exitCode: 0 });
-    assert.deepEqual(
-      exitStateOf({ state: "finished", exit_code: null }),
-      { finished: true, exitCode: 1 },
-      "a killed terminal has no exit code and counts as a failure",
-    );
+  it("leaves a single pane, empty, already equal, and insignificant corrections alone", () => {
+    for (const layout of [a, null, undefined, split("horizontal", 0.5, a, b), split("vertical", 0.504, a, b)]) {
+      assert.deepEqual(planEqualShares(layout), []);
+    }
   });
 
-  it("makes a tab id the app has not seen, so it opens a new tab", () => {
-    const id = freshTabId();
-    assert.match(id, /^tb[0-9a-f]{32}$/);
-    assert.notEqual(id, freshTabId());
-  });
-
-  it("keeps only the last lines of what hc read prints", () => {
-    const screen = "one\ntwo\nthree\n__SUBAGENT_DONE_0__\n\n\n";
-    assert.equal(lastLines(screen, 2), "three\n__SUBAGENT_DONE_0__\n");
-    assert.equal(lastLines(screen, 0), "__SUBAGENT_DONE_0__\n", "at least one line");
+  it("abandons malformed layouts rather than applying a partial plan", () => {
+    assert.deepEqual(planEqualShares(split("horizontal", 0.3,
+      split("vertical", 0.1, a, b), {})), []);
   });
 });
 
@@ -5335,6 +5144,203 @@ describe("lost-observation reconciliation timers", () => {
       shutdown();
       testApi.lostObservationEntries.clear();
       __rexTest__.setRexExecutor(null);
+    }
+  });
+});
+
+describe("Rex sizing lifecycle and bounded diagnostics", () => {
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 140));
+  const leaf = (block_id: string) => ({ block_id, rect: [0, 0, 1, 1] });
+  const layout = { rect: [0, 0, 1, 1], split: {
+    split_id: "split:fixture", direction: "horizontal", ratio: 0.8,
+    before: leaf("block:a"), after: leaf("block:b"),
+  } };
+  const view = { active_window_id: "window:unrelated", windows: [
+    { window_id: "window:target", layers: [
+      { kind: "tiled", layout },
+      { kind: "floating", layout: { ...layout, split: { ...layout.split, before: leaf("block:float-a"), after: leaf("block:float-b") } } },
+    ] },
+    { window_id: "window:unrelated", layers: [{ kind: "tiled", layout: { ...layout,
+      split: { ...layout.split, before: leaf("block:other-a"), after: leaf("block:other-b") } } }] },
+  ] };
+
+  afterEach(() => {
+    disposeRexSurfaces();
+    __rexTest__.setRexExecutor(null);
+    __rexTest__.setRexContextOverride(undefined);
+    __rexTest__.setCommandAvailabilityOverride(undefined);
+  });
+
+  it("debounces by session/window and targets only tiled borders in the remembered tab", async () => {
+    const { scheduleTabSizing } = await import("../pi-extension/subagents/rex.ts");
+    const calls: string[][] = [];
+    const servers: unknown[] = [];
+    __rexTest__.setRexContextOverride({ server: "server:original" });
+    __rexTest__.setRexExecutor((args, options) => {
+      calls.push(args);
+      servers.push(options?.server);
+      return JSON.stringify(args[0] === "session" ? view : { revision: 1 });
+    });
+    for (let i = 0; i < 5; i++) scheduleTabSizing("session:test", "window:target");
+    assert.equal(__rexTest__.sizingPassCount(), 1);
+    __rexTest__.setRexContextOverride({ server: "server:later", session: "session:later" });
+    await pause();
+    assert.equal(calls.length, 2, "one fresh inspection and one border change");
+    assert.deepEqual(calls[0], ["session", "inspect", "session:test", "--json"]);
+    assert.deepEqual(JSON.parse(calls[1][3]), {
+      session_id: "session:test", direction: "horizontal", before_block_id: "block:a", after_block_id: "block:b", ratio: 0.5,
+    });
+    assert.deepEqual(servers, ["server:original", "server:original"]);
+    assert.equal(__rexTest__.sizingPassCount(), 0);
+  });
+
+  it("remembers a split's tab before closing and rebalances survivors", async () => {
+    const { registerSurfaceHandle, closeSurface } = await import("../pi-extension/subagents/rex.ts");
+    const calls: string[][] = [];
+    let closed = false;
+    __rexTest__.setRexExecutor((args) => {
+      calls.push(args);
+      if (args[0] === "block" && args[1] === "inspect") {
+        assert.equal(closed, false, "window lookup must precede removal");
+        return JSON.stringify({ block: { window_id: "window:target" } });
+      }
+      if (args[0] === "block" && args[1] === "close") closed = true;
+      return JSON.stringify(args[0] === "session" ? view : {});
+    });
+    registerSurfaceHandle({ id: "close-sizing", kind: "split", name: "close-sizing", sessionId: "session:test", windowId: "window:old-before-move", blockId: "block:removed", status: "launched" });
+    closeSurface("close-sizing");
+    await pause();
+    assert.equal(closed, true);
+    assert.equal(calls.filter((c) => c[0] === "api").length, 1);
+    assert.equal(JSON.parse(calls.at(-1)![3]).before_block_id, "block:a");
+  });
+
+  it("balances a confirmed externally removed pane's remembered tab, but skips unknown transport failures", async () => {
+    const { registerSurfaceHandle, closeSurface } = await import("../pi-extension/subagents/rex.ts");
+    for (const missing of [true, false]) {
+      let resizes = 0;
+      __rexTest__.setRexExecutor((args) => {
+        if (args[0] === "block" && args[1] === "inspect") {
+          throw new Error(missing ? "block target block:removed not found" : "connection lost");
+        }
+        if (args[0] === "session") return JSON.stringify(view);
+        if (args[0] === "api") resizes++;
+        return "{}";
+      });
+      registerSurfaceHandle({ id: "already-removed", kind: "split", name: "already-removed", sessionId: "session:test", windowId: "window:target", blockId: "block:removed", status: "launched" });
+      closeSurface("already-removed");
+      await pause();
+      assert.equal(resizes, missing ? 1 : 0);
+    }
+  });
+
+  it("abandons missing/stale layouts and failed resizes without unhandled work", async () => {
+    const { scheduleTabSizing } = await import("../pi-extension/subagents/rex.ts");
+    for (const mode of ["missing", "inspect-failed", "resize-failed"]) {
+      let resizes = 0;
+      __rexTest__.setRexExecutor((args) => {
+        if (args[0] === "session") {
+          if (mode === "inspect-failed") throw new Error("disconnected");
+          return JSON.stringify(mode === "missing" ? { windows: [] } : view);
+        }
+        resizes++;
+        throw new Error("bad_request: split changed since inspection");
+      });
+      scheduleTabSizing("session:test", "window:target");
+      await pause();
+      assert.equal(resizes, mode === "resize-failed" ? 1 : 0);
+      assert.equal(__rexTest__.sizingPassCount(), 0);
+    }
+  });
+
+  it("shutdown cancels sizing and unlaunched reservations, permits a new session, and is idempotent", async () => {
+    const { scheduleTabSizing, registerSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    const handlers = new Map<string, Function>();
+    const { api } = createMockExtensionApi();
+    api.on = (event: string, handler: Function) => { handlers.set(event, handler); };
+    (subagentsModule as any).default(api);
+    let requests = 0;
+    __rexTest__.setRexExecutor(() => { requests++; return JSON.stringify(view); });
+    registerSurfaceHandle({ id: "shutdown-reservation", kind: "tab", name: "unused", sessionId: "session:test", status: "reserved" });
+    scheduleTabSizing("session:test", "window:target");
+    handlers.get("session_shutdown")!({}, {});
+    handlers.get("session_shutdown")!({}, {});
+    assert.equal(getSurfaceHandle("shutdown-reservation"), undefined);
+    assert.equal(__rexTest__.sizingPassCount(), 0);
+    await pause();
+    assert.equal(requests, 0);
+    scheduleTabSizing("session:test", "window:missing");
+    await pause();
+    assert.equal(requests, 1, "a subsequent session can schedule work");
+  });
+
+  it("reload disposal aborts an in-flight inspection before any resize", async () => {
+    const { scheduleTabSizing } = await import("../pi-extension/subagents/rex.ts");
+    let signal: AbortSignal | undefined;
+    __rexTest__.setRexExecutor((args, options) => {
+      assert.equal(args[0], "session");
+      signal = options?.signal;
+      (globalThis as any)[Symbol.for("pi-subagents/rex-dispose")]();
+      return JSON.stringify(view);
+    });
+    scheduleTabSizing("session:test", "window:target");
+    await pause();
+    assert.equal(signal?.aborted, true);
+    assert.equal(__rexTest__.sizingPassCount(), 0);
+  });
+
+  it("bounds large scrollback diagnostics to two reads and never captures for normal completion", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, readScreen, readScreenAsync, pollForExit, DIAGNOSTIC_MAX_BYTES } = await import("../pi-extension/subagents/rex.ts");
+    const id = "bounded-diagnostics";
+    registerSurfaceHandle({ id, kind: "split", name: id, blockId: "block:large", sessionId: "session:test", status: "launched" });
+    __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    const text = "long output\n".repeat(1_000_000) + "last line\n";
+    let calls = 0;
+    __rexTest__.setRexExecutor((args, options) => {
+      calls++;
+      assert.equal(options?.timeoutMs, 3000);
+      const payload = JSON.parse(args[7]);
+      assert.equal(payload.max_bytes, DIAGNOSTIC_MAX_BYTES);
+      if (args[6] === "format") return JSON.stringify({ content: text.slice(0, 100), id: 17, total: text.length });
+      assert.equal(args[6], "blob_read");
+      assert.equal(payload.id, 17);
+      assert.ok(payload.offset >= text.length - DIAGNOSTIC_MAX_BYTES);
+      return JSON.stringify({ data: text.slice(payload.offset), eof: true });
+    });
+    try {
+      assert.equal(readScreen(id, 1), "last line");
+      assert.equal(await readScreenAsync(id, 1), "last line");
+      assert.equal(calls, 4);
+      __rexTest__.setRexExecutor((args) => {
+        assert.equal(args[6], "process", "normal completion must never read scrollback");
+        return JSON.stringify({ last_exit: { exit_code: 0 } });
+      });
+      assert.equal((await pollForExit(id, new AbortController().signal, { interval: 1 })).reason, "done");
+    } finally { unregisterSurfaceHandle(id); }
+  });
+
+  it("reads nesting and placement settings with safe documented defaults", async () => {
+    const { chooseSurfaceKind, topLevelSurfaceSetting, splitDirectionSetting } = await import("../pi-extension/subagents/rex.ts");
+    const savedName = process.env.PI_SUBAGENT_NAME;
+    const savedTop = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+    const savedDirection = process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+    try {
+      delete process.env.PI_SUBAGENT_NAME;
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "unknown";
+      process.env.PI_SUBAGENT_SPLIT_DIRECTION = "unknown";
+      assert.equal(topLevelSurfaceSetting(), "tab");
+      assert.equal(splitDirectionSetting(), "auto");
+      assert.equal(chooseSurfaceKind(), "tab");
+      process.env.PI_SUBAGENT_NAME = "parent";
+      assert.equal(chooseSurfaceKind(), "pane");
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
+      delete process.env.PI_SUBAGENT_NAME;
+      assert.equal(chooseSurfaceKind(), "pane");
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_NAME", savedName);
+      restoreEnvVar("PI_SUBAGENT_TOP_LEVEL_SURFACE", savedTop);
+      restoreEnvVar("PI_SUBAGENT_SPLIT_DIRECTION", savedDirection);
     }
   });
 });

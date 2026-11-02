@@ -17,7 +17,6 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  needsShellReadyDelay,
   createSurface,
   sendMessage,
   sendLongCommand,
@@ -29,6 +28,7 @@ import {
   queryBlockProcess,
   getSurfaceHandle,
   getRexContext,
+  disposeRexSurfaces,
 } from "./rex.ts";
 
 import {
@@ -538,22 +538,9 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
   }
 }
 
-/**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
+/** Preserve the real command status independently of the compatibility sentinel. */
 export function wrapLaunchCommand(baseCommand: string): string {
   return `${baseCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
-}
-
-function getShellReadyDelayMs(): number {
-  if (!needsShellReadyDelay()) return 0;
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
 function muxUnavailableResult() {
@@ -1318,7 +1305,6 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 
 export const __test__ = {
   borderLine,
-  getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1958,6 +1944,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
     }
     pendingCleanups.clear();
+    // Close retries above can schedule a final cosmetic pass: dispose afterwards.
+    disposeRexSurfaces();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;

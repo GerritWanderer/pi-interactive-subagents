@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether Herdr is available
+ * - Detect whether Rex is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in Herdr panes
+ * - Start real pi sessions in Rex panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -33,9 +33,10 @@ import {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
+  disposeRexSurfaces,
 } from "../../pi-extension/subagents/rex.ts";
 
-// Re-export Herdr primitives for tests
+// Re-export Rex primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -143,6 +144,7 @@ export function cleanupTestEnv(env: TestEnv): void {
       closeSurface(surface);
     } catch {}
   }
+  disposeRexSurfaces();
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
