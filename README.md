@@ -35,7 +35,7 @@ What the Rex backend does differently from a typed-into-a-shell multiplexer:
 - **Nothing is typed into a shell.** The block starts directly on the launch script (`rex split|window new -- bash <script>`), which Rex runs with your login shell's environment, so the pane opens straight into pi with your usual `PATH`. There is no shell-ready delay and nothing can be dropped while a prompt starts.
 - **Exit comes from Rex, not the screen.** Blocks are created with `--keep-open`; the extension reads the program's real exit code (`last_exit` from `rex block call process`) and closes the block itself once the result is collected.
 - **Failures stay distinct.** Closing a sub-agent's pane by hand ends its run as `interrupted`, not as a provider failure, and its session stays available. If Rex can't be reached for 10 checks in a row, the run ends with an error and the pane is left open, because the sub-agent may still be running: check the pane before messaging it, since a resume would start a second process on the same session. A pane that fails to close never replaces a collected result; the close is retried a few times in the background.
-- **Messages arrive as a paste.** Steering a running sub-agent sends a paste event (bracketed paste in the child) and then Enter. Pi reports its state through the [Program Status Protocol (OSC 7501)](https://www.superlogical.com/rex/docs/build/program-status), so a message is refused with `agent_blocked` while the child is `blocked` on a dialog instead of typing over it. The same status drives Rex's tab spinners and blocked indicators for every sub-agent.
+- **Messages arrive as a paste, only when it is safe.** Steering a running sub-agent sends a paste event (bracketed paste in the child) and then Enter. First it reads the child's [Program Status Protocol (OSC 7501)](https://www.superlogical.com/rex/docs/build/program-status) report, which pi emits natively. The message is refused, with nothing sent, if the child is `blocked` on a dialog or in an `error` state, or if no current report from a known agent can be read. That includes a child still starting up or running with `PI_PROGRAM_STATUS=0`; `cli: claude` agents need Rex's Claude Code hook (`rex skill setup`) to report status. Rex shows the same status as tab spinners and blocked indicators.
 
 Split direction follows the block's shape: a wide parent block splits right, a narrow or tall one splits down. Force one direction with `PI_SUBAGENT_SPLIT_DIRECTION=right|down|auto` (the default constant is `SUBAGENT_SPLIT_DIRECTION` in `pi-extension/subagents/rex.ts`).
 
@@ -77,7 +77,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Running** — the message is pasted into the live pane (newlines flattened) and picked up at the next turn boundary. It is refused if the child's status says it isn't safe (see [How it works](#how-it-works)). The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
@@ -195,7 +195,7 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) 1.1 or later for OSC 7501 program status (older versions work, but the `agent_blocked` check and Rex's tab status indicators need it). pi 1.4 adds Rex hyperlinks, truecolor and inline images.
+- [pi](https://github.com/badlogic/pi-mono) 1.1 or later, which reports OSC 7501 program status. Older versions can run sub-agents, but messages to a running sub-agent are refused without that status. pi 1.4 adds Rex hyperlinks, truecolor and inline images.
 - [Rex](https://www.superlogical.com/rex/docs/installation), with the `rex` CLI on your `PATH`. The extension needs `REX_SESSION` and `REX_BLOCK`, which Rex sets in every terminal it opens.
 
 Start `pi` in any Rex tab or pane. Running pi outside Rex disables the `subagent` tools with a setup hint.

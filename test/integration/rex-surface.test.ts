@@ -136,7 +136,7 @@ for (const backend of backends) {
       writeFileSync(
         script,
         [
-          "st() { printf '\\e]7501;state=%s:app=pi-test\\e\\\\' \"$1\"; }",
+          "st() { printf '\\e]7501;state=%s:app=pi\\e\\\\' \"$1\"; }",
           "st blocked",
           "IFS= read -r line",
           "echo \"GOT[$line]\"",
@@ -150,6 +150,7 @@ for (const backend of backends) {
       await sleep(800);
 
       assert.throws(() => sendMessage(surface, "too early"), /agent_blocked/);
+      assert.ok(!readScreen(surface, 20).includes("too early"), "a refused message must not reach the pane");
       // Unblock the child the way a person would: answer its prompt.
       sendCommand(surface, "answered");
       await waitForScreen(surface, /GOT\[answered\]/, 10_000, 20);
@@ -158,6 +159,13 @@ for (const backend of backends) {
       sendMessage(surface, message);
       await waitForScreen(surface, /GOT\[use v2;/, 10_000, 20);
       assert.ok(readScreen(surface, 20).includes(`GOT[${message}]`), "the paste must arrive intact");
+    });
+
+    it("refuses a message when the program in the block reports no status", async () => {
+      const surface = createTrackedSurface(env, "no-status");
+      sendLongCommand(surface, "sleep 30");
+      await sleep(300);
+      assert.throws(() => sendMessage(surface, "hello"), /no program status/);
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {

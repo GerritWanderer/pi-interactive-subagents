@@ -60,13 +60,17 @@ import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
 import {
   __pollForExitTest__,
   __layoutTest__,
+  checkSteeringSafety,
+  closeSurface,
   createArgs,
+  createSurface,
   exitStateOf,
   isRexAvailable,
   isRexInfrastructureError,
   lastLines,
   pollForExit,
   rexSplitDirection,
+  sendMessage,
   shellEscape,
   surfaceHandle,
 } from "../pi-extension/subagents/rex.ts";
@@ -3062,6 +3066,36 @@ esac
     });
   });
 
+  describe("sendMessage", () => {
+    const delivered = () => /block\.event|send-key/.test(calls());
+
+    it("delivers when a current pi record says it is safe", () => {
+      write("status", JSON.stringify({ records: [{ state: "idle", app: "pi", effective_app: "pi" }] }));
+      sendMessage("block:c", "hello");
+      assert.ok(calls().includes("block.event"));
+      assert.ok(calls().includes("send-key"));
+    });
+
+    for (const [label, status] of [
+      ["no records", '{"records":[]}'],
+      ["a query failure", "ERR transport"],
+      ["a blocked record", JSON.stringify({ records: [{ state: "blocked", app: "pi", kind: "permission" }] })],
+    ] as const) {
+      it(`sends nothing with ${label}`, () => {
+        write("status", status);
+        assert.throws(() => sendMessage("block:c", "hello"), /Cannot deliver message/);
+        assert.equal(delivered(), false);
+      });
+    }
+
+    it("won't start a reserved surface just to type into it", () => {
+      const surface = createSurface("not-started");
+      assert.throws(() => sendMessage(surface, "hello"), /has not started/);
+      assert.equal(delivered(), false);
+      closeSurface(surface);
+    });
+  });
+
   describe("safeCloseSurface", () => {
     const testApi = (subagentsModule as any).__test__;
 
@@ -3087,6 +3121,41 @@ esac
       assert.equal(testApi.pendingCleanups.size, 0);
       assert.equal(calls().match(/^block close/gm)?.length, 6);
     });
+  });
+});
+
+describe("checkSteeringSafety", () => {
+  const pi = (state: string, extra: object = {}) => ({ state, app: "pi", effective_app: "pi", ...extra });
+
+  it("allows a current record from a known agent", () => {
+    for (const state of ["idle", "working", "done"]) {
+      assert.equal(checkSteeringSafety([pi(state)]).ok, true, state);
+    }
+    assert.equal(checkSteeringSafety([{ state: "working", effective_app: "claude-code" }]).ok, true);
+  });
+
+  it("refuses missing or malformed status", () => {
+    for (const records of [undefined, null, [], "nope", [null], [{ state: "idle" }]]) {
+      assert.equal(checkSteeringSafety(records).ok, false, JSON.stringify(records));
+    }
+  });
+
+  it("refuses a blocked or failed agent, even on a child record", () => {
+    const blocked = checkSteeringSafety([pi("working"), pi("blocked", { id: "tool", kind: "question", msg: "Sure?" })]);
+    assert.equal(blocked.ok, false);
+    assert.match((blocked as any).error, /agent_blocked.*question dialog: Sure\?/);
+    assert.equal(checkSteeringSafety([pi("error", { msg: "boom" })]).ok, false);
+  });
+
+  it("treats an unattributed blocked record as the agent's", () => {
+    assert.equal(checkSteeringSafety([pi("idle"), { state: "blocked" }]).ok, false);
+  });
+
+  it("isn't blocked or approved by a record another program owns", () => {
+    const other = { state: "blocked", app: "terraform", effective_app: "terraform" };
+    assert.equal(checkSteeringSafety([pi("idle"), other]).ok, true);
+    assert.equal(checkSteeringSafety([other]).ok, false);
+    assert.equal(checkSteeringSafety([{ state: "idle", app: "cargo" }]).ok, false);
   });
 });
 

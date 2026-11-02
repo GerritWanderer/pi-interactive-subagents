@@ -26,9 +26,10 @@
  * `last_exit`) until closeSurface removes the block.
  *
  * Messages to a running child are delivered as a paste event (bracketed paste
- * in the child) followed by Enter, and refused while the child reports itself
- * `blocked` through the Program Status Protocol (OSC 7501), which pi emits
- * natively. This is the Rex counterpart of Herdr's `agent prompt`.
+ * in the child) followed by Enter, but only after the child's Program Status
+ * Protocol (OSC 7501) report confirms it is safe. pi emits that report
+ * natively. Missing or unreadable status refuses the message rather than
+ * typing into something unknown.
  *
  * Completion comes from the block's process record and the `.exit` sidecar,
  * never from scrollback.
@@ -150,8 +151,8 @@ function rexApi(method: string, args: Record<string, unknown>): any {
 }
 
 /** `rex block call -b BLOCK METHOD` in the caller's session. */
-function blockCall(block: string, method: string): any {
-  return parseJson(rex(["block", "call", "-s", rexSession(), "-b", block, method]));
+function blockCall(block: string, method: string, timeoutMs?: number): any {
+  return parseJson(rex(["block", "call", "-s", rexSession(), "-b", block, method], { timeoutMs }));
 }
 
 async function blockCallAsync(block: string, method: string): Promise<any> {
@@ -639,31 +640,92 @@ export function sendCommand(surface: string, command: string): void {
   rex(["send-key", "-s", rexSession(), "-b", block, "enter"]);
 }
 
-/** The root record of a block's program status (OSC 7501), if it has one. */
-function rootProgramStatus(block: string): { state?: string; msg?: string } | null {
-  try {
-    const records = blockCall(block, "program_status")?.records;
-    if (!Array.isArray(records)) return null;
-    return records.find((r: any) => !r?.id) ?? null;
-  } catch {
-    return null;
+export interface ProgramStatusRecord {
+  id?: string;
+  state?: string;
+  kind?: string;
+  app?: string;
+  effective_app?: string;
+  msg?: string;
+  updated_at?: string;
+}
+
+/**
+ * Programs whose status report vouches for the agent in a block. `pi` reports
+ * natively; Claude Code reports `claude-code` when Rex's hook is installed.
+ */
+const STEERABLE_APPS = new Set(["pi", "claude-code"]);
+
+const STATUS_HINT =
+  "Check the child's PI_PROGRAM_STATUS (0 disables reports), let it finish starting up, " +
+  "and verify OSC 7501 reaches the terminal. Otherwise interact with the child in its pane; no input was sent.";
+
+/**
+ * Decide from a block's OSC 7501 records whether a message can be delivered.
+ * A blocked or failed agent refuses it, and so does the absence of a current
+ * record from a known agent. Records another program attributes to itself
+ * don't speak for the agent, so they neither block nor approve it.
+ */
+export function checkSteeringSafety(records: unknown): { ok: true } | { ok: false; error: string } {
+  if (!Array.isArray(records) || records.length === 0) {
+    return { ok: false, error: `no program status is available. ${STATUS_HINT}` };
   }
+  const appOf = (record: ProgramStatusRecord) => record?.effective_app ?? record?.app;
+  const speaksForAgent = (record: ProgramStatusRecord) => {
+    const app = appOf(record);
+    return !app || STEERABLE_APPS.has(app);
+  };
+
+  for (const record of records as ProgramStatusRecord[]) {
+    if (!record || !speaksForAgent(record)) continue;
+    const detail = record.msg ? `: ${record.msg}` : "";
+    if (record.state === "blocked") {
+      const kind = record.kind ? `${record.kind} ` : "";
+      return { ok: false, error: `agent_blocked: the subagent is waiting on a ${kind}dialog${detail}` };
+    }
+    if (record.state === "error") {
+      return { ok: false, error: `the subagent reports an error state${detail}` };
+    }
+  }
+
+  const healthy = (records as ProgramStatusRecord[]).some((record) => {
+    const app = record ? appOf(record) : undefined;
+    return (
+      !!app &&
+      STEERABLE_APPS.has(app) &&
+      (record.state === "working" || record.state === "idle" || record.state === "done")
+    );
+  });
+  return healthy
+    ? { ok: true }
+    : { ok: false, error: `no current status confirms an agent is running. ${STATUS_HINT}` };
 }
 
 /**
  * Deliver a message to the agent running in a block: a paste event, so the
  * child sees one bracketed paste rather than keystrokes, then Enter. Refused
- * with `agent_blocked` while the child reports `blocked` through OSC 7501
- * (an approval or question dialog), so it never types over one.
+ * unless the child's OSC 7501 status confirms it is safe (see
+ * checkSteeringSafety), so it never types over a dialog or into an unknown
+ * program. Nothing is sent when it throws.
  */
 export function sendMessage(surface: string, message: string): void {
   requireRex();
-  const block = resolveBlock(surface);
-  const status = rootProgramStatus(block);
-  if (status?.state === "blocked") {
-    const why = status.msg ? `: ${status.msg}` : "";
-    throw new Error(`agent_blocked: the subagent is waiting on a dialog${why}`);
+  if (pending.has(surface)) {
+    throw new Error(`Cannot deliver message: surface "${surface}" has not started yet.`);
   }
+  const block = launched.get(surface) ?? surface;
+
+  let records: unknown;
+  try {
+    records = blockCall(block, "program_status", REX_QUERY_TIMEOUT_MS)?.records;
+  } catch (error: any) {
+    throw new Error(
+      `Cannot deliver message: unable to read program status (${error?.message ?? String(error)}). ${STATUS_HINT}`,
+    );
+  }
+  const safety = checkSteeringSafety(records);
+  if (!safety.ok) throw new Error(`Cannot deliver message: ${safety.error}`);
+
   rexApi("block.event", { block_id: block, event: { type: "paste", payload: { text: message } } });
   rex(["send-key", "-s", rexSession(), "-b", block, "enter"]);
 }
