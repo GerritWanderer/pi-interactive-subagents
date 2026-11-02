@@ -29,6 +29,9 @@
  * in the child) followed by Enter, and refused while the child reports itself
  * `blocked` through the Program Status Protocol (OSC 7501), which pi emits
  * natively. This is the Rex counterpart of Herdr's `agent prompt`.
+ *
+ * Completion comes from the block's process record and the `.exit` sidecar,
+ * never from scrollback.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -145,8 +148,12 @@ async function blockCallAsync(block: string, method: string): Promise<any> {
   return parseJson(await rexAsync(["block", "call", "-s", rexSession(), "-b", block, method]));
 }
 
+/**
+ * True only when Rex says the block itself is gone. A missing binary or a
+ * transport failure must not look like a closed pane.
+ */
 function isNotFoundError(error: any): boolean {
-  return /not found/i.test(error?.message ?? String(error));
+  return /block target .* not found/i.test(error?.message ?? String(error));
 }
 
 // ── Shell helpers ──
@@ -736,8 +743,8 @@ export function closeSurface(surface: string): void {
 
 export interface PollResult {
   /** How the subagent exited */
-  reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  reason: "done" | "sentinel" | "error" | "interrupted";
+  /** The process's exit code. 0 for file-based exits. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
@@ -747,7 +754,8 @@ export interface PollResult {
  * Interpret an `.exit` sidecar payload (written by the error path in
  * subagent-done.ts). Centralized so both the fast and slow paths in
  * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected from the block's exit instead.
+ * sidecar and are detected from the block's exit instead. An unrecognized
+ * payload is reported as a failure rather than a success.
  *
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
  * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
@@ -760,7 +768,12 @@ function interpretExitSidecar(data: any): PollResult {
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }
-  return { reason: "done", exitCode: 0 };
+  if (data?.type === "done") return { reason: "done", exitCode: 0 };
+  return {
+    reason: "error",
+    exitCode: 1,
+    errorMessage: `Unrecognized subagent exit sidecar payload: ${JSON.stringify(data)}`,
+  };
 }
 
 /**
@@ -803,12 +816,12 @@ function readExitSidecar(sessionFile: string | undefined): PollResult | null {
 }
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), then the block's own exit record. The launch
- * script ends with `echo __SUBAGENT_DONE_<code>__`, so the screen supplies
- * pi's exit code when the script's own status is the echo's. A block that
- * disappears (closed by hand) ends the run with an error instead of polling
- * forever.
+ * Poll until the subagent exits, from the block's process record. An `.exit`
+ * sidecar (the error path) supplies the failure message, but the run ends only
+ * once the process has too, keeping a non-zero exit code. The Claude sentinel
+ * returns straight away, because Claude stays open after its Stop hook.
+ *
+ * A block that disappears ends the run as `interrupted`.
  */
 export async function pollForExit(
   surface: string,
@@ -821,14 +834,14 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let sidecar: PollResult | null = null;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    const sidecar = readExitSidecar(options.sessionFile);
-    if (sidecar) return sidecar;
+    sidecar ??= readExitSidecar(options.sessionFile);
 
     // Check Claude sentinel file (written by plugin Stop hook)
     if (options.sentinelFile) {
@@ -839,33 +852,42 @@ export async function pollForExit(
       } catch {}
     }
 
-    const block = launched.get(surface) ?? (pending.has(surface) ? null : surface);
-    if (block) {
-      try {
-        const state = exitStateOf(await blockCallAsync(block, "process"));
-        if (state.finished) {
-          const screen = await readScreenAsync(surface, 5).catch(() => "");
-          const match = screen.match(SENTINEL);
-          return { reason: "sentinel", exitCode: match ? parseInt(match[1], 10) : state.exitCode };
+    if (pending.has(surface)) {
+      return {
+        reason: "interrupted",
+        exitCode: 1,
+        errorMessage: "The subagent's Rex pane was never started.",
+      };
+    }
+
+    const block = launched.get(surface) ?? surface;
+    try {
+      const state = exitStateOf(await blockCallAsync(block, "process"));
+      if (state.finished) {
+        sidecar ??= readExitSidecar(options.sessionFile);
+        if (sidecar) {
+          return state.exitCode !== 0 ? { ...sidecar, exitCode: state.exitCode } : sidecar;
         }
-        // A script typed into an interactive shell ends without ending the
-        // shell, so only the screen sentinel tells.
-        if (!directLaunch.has(block)) {
-          const match = (await readScreenAsync(surface, 5)).match(SENTINEL);
-          if (match) return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-        }
-      } catch (error) {
-        if (isNotFoundError(error)) {
-          return (
-            readExitSidecar(options.sessionFile) ?? {
-              reason: "error",
-              exitCode: 1,
-              errorMessage: "The subagent's Rex pane was closed before the subagent finished.",
-            }
-          );
-        }
-        // Transient CLI failure: try again next tick.
+        return { reason: state.exitCode === 0 ? "done" : "error", exitCode: state.exitCode };
       }
+      // A script typed into an interactive shell ends without ending the
+      // shell, so only the screen sentinel tells.
+      if (!directLaunch.has(block)) {
+        const match = (await readScreenAsync(surface, 5)).match(SENTINEL);
+        if (match) return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
+      }
+    } catch (error: any) {
+      if (isNotFoundError(error)) {
+        return (
+          sidecar ??
+          readExitSidecar(options.sessionFile) ?? {
+            reason: "interrupted",
+            exitCode: 1,
+            errorMessage: "The subagent's Rex pane was closed before the subagent finished.",
+          }
+        );
+      }
+      // Transient CLI failure: try again next tick.
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

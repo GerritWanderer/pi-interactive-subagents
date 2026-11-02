@@ -103,32 +103,29 @@ for (const backend of backends) {
       }
     });
 
-    it("starts a reserved surface directly on its launch script and reports pi's exit code", async () => {
+    it("starts a reserved surface directly on its launch script and reports its real exit code", async () => {
       const surface = createTrackedSurface(env, "direct-launch");
       const marker = uniqueId();
-      // The extension's launch scripts end with this sentinel; the script
-      // itself exits 0 (the echo's status), so the code must come from it.
-      sendLongCommand(surface, `echo "DIRECT_${marker}"; (exit 5); echo '__SUBAGENT_DONE_'$?'__'`);
+      sendLongCommand(surface, `echo "DIRECT_${marker}"; exit 5`);
 
-      const result = await poll(surface);
-      assert.deepEqual(result, { reason: "sentinel", exitCode: 5 });
+      assert.deepEqual(await poll(surface), { reason: "error", exitCode: 5 });
       assert.match(readScreen(surface, 20), new RegExp(`DIRECT_${marker}`), "the block stays readable after exit");
     });
 
-    it("falls back to the block's exit status when there is no sentinel", async () => {
+    it("reports a clean exit as done", async () => {
       const surface = createTrackedSurface(env, "exit-status");
-      sendLongCommand(surface, "exit 7");
-      assert.deepEqual(await poll(surface), { reason: "sentinel", exitCode: 7 });
+      sendLongCommand(surface, "exit 0");
+      assert.deepEqual(await poll(surface), { reason: "done", exitCode: 0 });
     });
 
-    it("ends the run with an error when the block is closed by hand", async () => {
+    it("ends the run as interrupted when the block is closed by hand", async () => {
       const surface = createTrackedSurface(env, "closed-by-hand");
       sendLongCommand(surface, "sleep 30");
       const block = surfaceBlock(surface);
       await sleep(300);
       closeSurface(block); // what a person closing the pane does
       const result = await poll(surface);
-      assert.equal(result.reason, "error");
+      assert.equal(result.reason, "interrupted");
       assert.match(result.errorMessage ?? "", /closed/);
       untrackSurface(env, surface);
     });

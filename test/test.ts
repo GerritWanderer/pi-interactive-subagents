@@ -1,6 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -63,6 +64,7 @@ import {
   exitStateOf,
   isRexAvailable,
   lastLines,
+  pollForExit,
   rexSplitDirection,
   shellEscape,
   surfaceHandle,
@@ -1857,13 +1859,11 @@ describe("subagent-done.ts", () => {
 describe("rex.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+  it("treats a retired ping payload as a failure, since nothing writes one now", () => {
+    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar.
+    const result = interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" });
+    assert.equal(result.reason, "error");
+    assert.match(result.errorMessage ?? "", /Unrecognized/);
   });
 
   it("decodes done payloads", () => {
@@ -1895,9 +1895,12 @@ describe("rex.ts interpretExitSidecar", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("reports unknown payload shapes as failures, never as success", () => {
+    for (const payload of [{}, null, "done", { type: "nope" }]) {
+      const result = interpretExitSidecar(payload);
+      assert.equal(result.reason, "error", JSON.stringify(payload));
+      assert.equal(result.exitCode, 1);
+    }
   });
 });
 describe("commands", () => {
@@ -2927,6 +2930,135 @@ describe("rex.ts", () => {
     const screen = "one\ntwo\nthree\n__SUBAGENT_DONE_0__\n\n\n";
     assert.equal(lastLines(screen, 2), "three\n__SUBAGENT_DONE_0__\n");
     assert.equal(lastLines(screen, 0), "__SUBAGENT_DONE_0__\n", "at least one line");
+  });
+});
+
+describe("rex.ts failure handling", () => {
+  // A stand-in for the rex CLI. `process` replies come from a queue file, one
+  // per line; the last line repeats. "ERR <text>" fails with that stderr.
+  let dir: string;
+  const saved: Record<string, string | undefined> = {};
+  const keys = ["PI_SUBAGENT_REX_BIN", "REX_SESSION", "REX_BLOCK"];
+  const write = (name: string, content: string) => writeFileSync(join(dir, name), content);
+  const calls = () => (existsSync(join(dir, "calls")) ? readFileSync(join(dir, "calls"), "utf8") : "");
+  const poll = (surface: string, options: Record<string, unknown> = {}) =>
+    pollForExit(surface, AbortSignal.timeout(5000), { interval: 1, ...options });
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "fake-rex-"));
+    for (const key of keys) saved[key] = process.env[key];
+    const script = `#!/bin/bash
+D=${JSON.stringify(dir)}
+echo "$*" >> "$D/calls"
+fail() { echo "Error: $1" >&2; exit 3; }
+case "$*" in
+  *" process")
+    line=$(head -n1 "$D/process")
+    if [ "$(wc -l < "$D/process")" -gt 1 ]; then sed -i 1d "$D/process"; fi
+    case "$line" in "ERR "*) fail "\${line#ERR }";; esac
+    echo "$line" ;;
+  *" program_status") case "$(cat "$D/status")" in "ERR "*) fail transport;; esac; cat "$D/status" ;;
+  *" format "*) echo '{"content":"","eof":true,"total":0}' ;;
+  "session inspect"*) echo '{"windows":[]}' ;;
+  "block close"*)
+    n=$(cat "$D/close-failures" 2>/dev/null || echo 0)
+    if [ "$n" -gt 0 ]; then echo $((n-1)) > "$D/close-failures"; fail "transport down"; fi ;;
+  *) echo '{}' ;;
+esac
+`;
+    write("rex", script);
+    chmodSync(join(dir, "rex"), 0o755);
+    process.env.PI_SUBAGENT_REX_BIN = join(dir, "rex");
+    process.env.REX_SESSION = "session:test";
+    process.env.REX_BLOCK = "block:parent";
+  });
+  beforeEach(() => {
+    rmSync(join(dir, "calls"), { force: true });
+    rmSync(join(dir, "close-failures"), { force: true });
+  });
+  after(() => {
+    for (const key of keys) restoreEnvVar(key, saved[key]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  describe("pollForExit", () => {
+    it("reports the process's real exit code", async () => {
+      write("process", '{"last_exit":null}\n{"last_exit":{"exit_code":5}}\n');
+      assert.deepEqual(await poll("block:c"), { reason: "error", exitCode: 5 });
+      write("process", '{"last_exit":{"exit_code":0}}\n');
+      assert.deepEqual(await poll("block:c"), { reason: "done", exitCode: 0 });
+    });
+
+    it("survives transient CLI failures", async () => {
+      write("process", 'ERR transport down\nnot json\n{"last_exit":{"exit_code":2}}\n');
+      assert.deepEqual(await poll("block:c"), { reason: "error", exitCode: 2 });
+    });
+
+    it("reports a vanished block as interrupted, not as a provider error", async () => {
+      write("process", 'ERR block target "block:c" not found\n');
+      const result = await poll("block:c");
+      assert.equal(result.reason, "interrupted");
+      assert.equal(result.exitCode, 1);
+    });
+
+    it("waits for the process after an error sidecar and keeps its message", async () => {
+      const sessionFile = join(dir, "s1.jsonl");
+      write("s1.jsonl.exit", JSON.stringify({ type: "error", errorMessage: "529 Overloaded" }));
+      write("process", '{"last_exit":null}\n{"last_exit":null}\n{"last_exit":{"exit_code":0}}\n');
+      const result = await poll("block:c", { sessionFile });
+      assert.deepEqual(result, { reason: "error", exitCode: 1, errorMessage: "529 Overloaded" });
+      assert.equal(calls().match(/ process$/gm)?.length, 3, "must not return while the process is live");
+    });
+
+    it("keeps a non-zero exit code alongside the sidecar's message", async () => {
+      const sessionFile = join(dir, "s2.jsonl");
+      write("s2.jsonl.exit", JSON.stringify({ type: "error", errorMessage: "boom" }));
+      write("process", '{"last_exit":{"exit_code":9}}\n');
+      assert.deepEqual(await poll("block:c", { sessionFile }), { reason: "error", exitCode: 9, errorMessage: "boom" });
+    });
+
+    it("prefers a collected sidecar over interrupted when the block is gone", async () => {
+      const sessionFile = join(dir, "s3.jsonl");
+      write("s3.jsonl.exit", JSON.stringify({ type: "error", errorMessage: "boom" }));
+      write("process", 'ERR block target "block:c" not found\n');
+      assert.equal((await poll("block:c", { sessionFile })).errorMessage, "boom");
+    });
+
+    it("returns on the Claude sentinel while Claude is still open", async () => {
+      const sentinelFile = join(dir, "claude-done");
+      write("claude-done", "summary");
+      write("process", '{"last_exit":null}\n');
+      assert.deepEqual(await poll("block:c", { sentinelFile }), { reason: "sentinel", exitCode: 0 });
+    });
+  });
+});
+
+describe("launch results", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("makes the launch script exit with the agent's status, not the sentinel echo's", () => {
+    const run = (command: string) => spawnSync("bash", ["-c", testApi.wrapLaunchCommand(command)], { encoding: "utf8" });
+    const failed = run("(exit 5)");
+    assert.equal(failed.status, 5);
+    assert.match(failed.stdout, /__SUBAGENT_DONE_5__/);
+    assert.equal(run("true").status, 0);
+    assert.equal(run("cd /nonexistent-dir-xyz 2>/dev/null && true").status, 1);
+  });
+
+  it("presents an interrupted run as neither a provider failure nor a crash", () => {
+    const text = testApi.resolveResultPresentation(
+      { exitCode: 1, elapsed: 3, summary: "partial work", interrupted: true, errorMessage: "pane closed" },
+      "scout",
+    );
+    assert.match(text, /was interrupted/);
+    assert.match(text, /partial work/);
+    assert.match(text, /subagent_message/);
+    assert.doesNotMatch(text, /auto-retry/);
+  });
+
+  it("still presents provider errors as failures", () => {
+    const text = testApi.resolveResultPresentation({ exitCode: 1, elapsed: 3, summary: "", errorMessage: "529" }, "scout");
+    assert.match(text, /provider\/agent error/);
   });
 });
 

@@ -547,6 +547,14 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/**
+ * End a launch command so the script exits with the agent's real status. The
+ * sentinel is only for people reading the pane; completion uses the exit code.
+ */
+export function wrapLaunchCommand(baseCommand: string): string {
+  return `${baseCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -593,13 +601,21 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "interrupted"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  if (result.interrupted) {
+    return (
+      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)}: ` +
+      `its pane closed before it finished. This is not a provider failure, and the ` +
+      `session data was preserved.\n\n${result.summary}${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -636,6 +652,8 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** The pane closed before the subagent finished. */
+  interrupted?: boolean;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -1168,6 +1186,8 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
+  wrapLaunchCommand,
+  resolveResultPresentation,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1185,7 +1205,6 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
-  resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
@@ -1317,7 +1336,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = wrapLaunchCommand(`${cdPrefix}${cmdParts.join(" ")}`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1460,7 +1479,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = wrapLaunchCommand(piCommand);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1619,7 +1638,15 @@ async function watchSubagent(
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        ...(result.reason === "interrupted" ? { interrupted: true } : {}),
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1656,13 +1683,15 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(result.reason === "interrupted" ? { interrupted: true } : {}),
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
+    runningSubagents.delete(running.id);
+
     try {
       closeSurface(surface);
     } catch {}
-    runningSubagents.delete(running.id);
 
     if (signal.aborted) {
       return {
@@ -1893,6 +1922,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.interrupted ? { interrupted: true } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
                 },
@@ -2263,7 +2293,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = wrapLaunchCommand(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2338,6 +2368,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.interrupted ? { interrupted: true } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2428,7 +2459,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // like the in-process extension. Failure: surface the failure reason.
         let header: string;
         if (failed) {
-          const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
+          const reason = details.interrupted
+            ? "interrupted (pane closed)"
+            : errorMessage
+              ? "failed (provider/agent error)"
+              : `failed (exit ${exitCode})`;
           header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
         } else {
           const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
