@@ -2508,6 +2508,28 @@ describe("subagent interruption", () => {
     assert.doesNotMatch(presentation, /Session id:/);
   });
 
+  it("presents infrastructure observation failure without inviting an unsafe resume", () => {
+    for (const result of [
+      {
+        summary: "Infrastructure observation failure: process query timed out. Pane was kept open.",
+      },
+      {
+        summary: "Process observation unavailable",
+        error: "Sustained infrastructure failure observing Rex block",
+      },
+    ]) {
+      const presentation = subagentsModule.__test__.resolveResultPresentation(
+        { exitCode: 1, elapsed: 10, ...result },
+        "resumed-worker",
+      );
+      assert.match(presentation, /Sub-agent "resumed-worker" failed \(infrastructure observation failure\)/);
+      assert.ok(presentation.includes(result.summary));
+      assert.match(presentation, /pane was kept open/i);
+      assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+      assert.doesNotMatch(presentation, /Follow up with subagent_message/);
+    }
+  });
+
   it("renders a clear provider/agent error when errorMessage is set", () => {
     // Previously, an overload retry-exhaustion produced exitCode 0 with a
     // stale summary — the orchestrator thought the subagent finished
@@ -5002,7 +5024,175 @@ describe("rex.ts unit tests", () => {
   });
 });
 
+describe("resumed infrastructure failure delivery", () => {
+  for (const withNewOutput of [false, true]) {
+    it(`preserves the observation diagnostic ${withNewOutput ? "over partial output" : "without new output"}`, async (t) => {
+      const { __rexTest__, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const testApi = subagentsModule.__test__;
+      const dir = createTestDir();
+      const sessionFile = join(dir, "resumed.jsonl");
+      const mock = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      mock.api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(mock.api);
+      const ctx = {
+        hasUI: false,
+        sessionManager: {
+          getSessionDir: () => dir,
+          getSessionId: () => "main-sess",
+          getSessionFile: () => join(dir, "main.jsonl"),
+        },
+      };
+      handlers.get("session_start")!({}, ctx);
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      let surface: string | undefined;
+      let queries = 0;
+      let closes = 0;
+
+      try {
+        writeFileSync(sessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+        writeSubagentLoadout(sessionFile, {
+          agent: "worker", toolAllowlist: "read", model: null, thinking: null,
+          systemPromptMode: null, identity: null, spawnable: null,
+          autoExit: true, cwd: dir, agentDir: null,
+        });
+        registerName(join(dir, "artifacts", "main-sess"), "resumed-worker", {
+          sessionFile,
+          sessionId: "sess-resumed",
+        });
+        __rexTest__.setCommandAvailabilityOverride(true);
+        __rexTest__.setRexContextOverride({
+          server: "unix:///tmp/mock.sock", session: "session:mock", block: "block:anchor",
+        });
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "window" && args[1] === "new") {
+            return JSON.stringify({ window_id: "win:resume-infra", block_ids: ["blk:resume-infra"] });
+          }
+          if (args[0] === "split") return JSON.stringify({ block_ids: ["blk:resume-infra"] });
+          if (args[0] === "block" && args[1] === "inspect") {
+            return JSON.stringify({ block: { block_id: "blk:resume-infra" } });
+          }
+          if (args[0] === "block" && args[1] === "call" && args.at(-1) === "process") {
+            queries++;
+            if (withNewOutput && queries === 1) {
+              writeFileSync(sessionFile, JSON.stringify({
+                type: "message", message: { role: "assistant", content: [{ type: "text", text: "Partial resumed output" }] },
+              }) + "\n", { flag: "a" });
+            }
+            throw new Error("connection refused during resumed observation");
+          }
+          if (args[1] === "close") closes++;
+          return "{}";
+        });
+
+        const messageTool = mock.registeredTools.find((tool) => tool.name === "subagent_message");
+        const result = await messageTool.execute(
+          "resume-infra", { name: "resumed-worker", message: "continue" }, undefined, undefined, ctx,
+        );
+        assert.equal(result.details.status, "started");
+        surface = testApi.runningSubagents.get(result.details.id)!.surface;
+        for (let i = 0; i < 9; i++) {
+          t.mock.timers.tick(1000);
+          await Promise.resolve();
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+
+        assert.equal(queries, 10, "the resumed watcher must reach sustained infrastructure failure");
+        const delivery = mock.sentMessages.find(({ message }) => message.customType === "subagent_result");
+        assert.ok(delivery, "the resumed result must be delivered to the parent");
+        assert.match(delivery.message.content, /Infrastructure observation failure:.*connection refused during resumed observation/);
+        assert.match(delivery.message.content, /Pane was kept open/);
+        assert.match(delivery.message.content, /Resume is blocked until the previous process is confirmed finished/);
+        assert.doesNotMatch(delivery.message.content, /Resumed session exited with code|Partial resumed output/);
+        assert.equal(closes, 0, "observation failure must leave the process pane open");
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+      } finally {
+        handlers.get("session_shutdown")!({}, ctx);
+        testApi.lostObservationSessions.delete(sessionFile);
+        testApi.lostObservationEntries.delete(sessionFile);
+        if (surface) unregisterSurfaceHandle(surface);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("lost-observation reconciliation timers", () => {
+  it("wakes a parked auto-exit parent when the last unresolved child is reconciled", async () => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const testApi = subagentsModule.__test__;
+    const mock = createMockExtensionApi();
+    const handlers = new Map<string, Array<(...args: any[]) => void>>();
+    mock.api.on = (event: string, handler: (...args: any[]) => void) => {
+      if (!handlers.has(event)) handlers.set(event, []);
+      handlers.get(event)!.push(handler);
+    };
+    const emit = (event: string, ...args: any[]) => handlers.get(event)?.forEach((fn) => fn(...args));
+    const savedAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+    const savedRunning = new Map(testApi.runningSubagents);
+    const savedLost = new Set(testApi.lostObservationSessions);
+    const savedEntries = new Map(testApi.lostObservationEntries);
+    const dir = createTestDir();
+    const sessionFile = join(dir, "lost-child.jsonl");
+    let shutdowns = 0;
+    const ctx = { shutdown() { shutdowns++; } };
+    const event = { messages: [{ role: "assistant", stopReason: "stop" }] };
+
+    try {
+      testApi.runningSubagents.clear();
+      testApi.lostObservationSessions.clear();
+      testApi.lostObservationEntries.clear();
+      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      subagentsModule.default(mock.api);
+      subagentDoneExtension(mock.api);
+      testApi.lostObservationSessions.add(sessionFile);
+      testApi.lostObservationEntries.set(sessionFile, {
+        sessionFile,
+        surface: "",
+        blockId: "block:parked-child",
+        sessionId: "session:mock",
+      });
+
+      emit("agent_start");
+      emit("agent_end", event, ctx);
+      assert.equal(shutdowns, 0, "parent must park while process observation is unresolved");
+      assert.equal(runningChildrenCount(), 1);
+
+      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: null }));
+      testApi.reconcileLostObservations();
+      assert.equal(mock.sentMessages.length, 0, "a still-running child must not release the parent");
+
+      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
+      testApi.reconcileLostObservations();
+      assert.equal(runningChildrenCount(), 0);
+      assert.equal(testApi.lostObservationEntries.size, 0);
+      assert.equal(mock.sentMessages.length, 1, "reconciliation must wake the parked parent");
+      assert.deepEqual(mock.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+      assert.match(mock.sentMessages[0].message.content, /No child subagents remain pending/);
+
+      // Simulate the turn triggered by delivery of the reconciliation notification.
+      emit("agent_start");
+      emit("agent_end", event, ctx);
+      assert.equal(shutdowns, 1, "the awakened parent must be allowed to auto-exit");
+      testApi.reconcileLostObservations();
+      assert.equal(mock.sentMessages.length, 1, "already-reconciled children must not wake the parent again");
+    } finally {
+      emit("session_shutdown", {});
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", savedAutoExit);
+      testApi.runningSubagents.clear();
+      for (const [key, value] of savedRunning) testApi.runningSubagents.set(key, value);
+      testApi.lostObservationSessions.clear();
+      for (const value of savedLost) testApi.lostObservationSessions.add(value);
+      testApi.lostObservationEntries.clear();
+      for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
+      __rexTest__.setRexExecutor(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps one retry chain across direct calls and cancels it on shutdown", async (t) => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
     const testApi = subagentsModule.__test__;

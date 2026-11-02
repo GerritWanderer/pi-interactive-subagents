@@ -598,6 +598,13 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   return ` stalled${detail}${duration} `;
 }
 
+function isInfrastructureObservationFailure(
+  result: Pick<SubagentResult, "summary" | "error">,
+): boolean {
+  return result.summary.startsWith("Infrastructure observation failure:") ||
+    !!result.error?.includes("infrastructure failure");
+}
+
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
@@ -622,6 +629,14 @@ function resolveResultPresentation(
       `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
       `(pane closed externally before completion).${detail}\n\n` +
       `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
+    );
+  }
+
+  if (isInfrastructureObservationFailure(result)) {
+    return (
+      `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
+      `${result.summary}\n\n` +
+      `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
     );
   }
 
@@ -739,19 +754,32 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
     }
   }
 
+  let reconciled = false;
   for (const [sessionPath, entry] of lostObservationEntries) {
     if (!entry.blockId) continue;
     try {
       const proc = queryBlockProcess(entry.blockId, entry.sessionId);
       if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
         confirmProcessEnded(sessionPath);
-        lostObservationEntries.delete(sessionPath);
+        reconciled = true;
         if (entry.surface) safeCloseSurface(entry.surface);
       }
     } catch {}
   }
   if (lostObservationEntries.size > 0 && !reconcileRetryTimer) {
     reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
+  }
+  if (reconciled && runningSubagents.size + lostObservationSessions.size === 0) {
+    const content = "All child processes with lost observations are now confirmed ended. No child subagents remain pending.";
+    latestPi?.sendMessage(
+      {
+        customType: "subagent_status",
+        content,
+        display: true,
+        details: { lines: [content], overflow: 0 },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
   }
 }
 
@@ -2575,12 +2603,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
+            const summary = isInfrastructureObservationFailure(result)
+              ? result.summary
+              : findLastAssistantMessage(allEntries) ??
+                (result.errorMessage
+                  ? `Subagent error: ${result.errorMessage}`
+                  : result.exitCode !== 0
+                    ? `Resumed session exited with code ${result.exitCode}`
+                    : "Resumed session exited without new output");
             const presentation = resolveResultPresentation(
               { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
               name,
