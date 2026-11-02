@@ -5712,6 +5712,42 @@ describe("Rex sizing lifecycle and bounded diagnostics", () => {
     assert.equal(__rexTest__.sizingPassCount(), 0);
   });
 
+  for (const lookupFails of [false, true]) {
+    it(`bounds split-launch tab lookup and ${lookupFails ? "preserves the launch on timeout" : "schedules sizing on success"}`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle, sendLongCommand } = await import("../pi-extension/subagents/rex.ts");
+      const id = `launch-lookup-${lookupFails}`;
+      const dir = mkdtempSync(join(tmpdir(), "rex-launch-lookup-"));
+      const scriptPath = join(dir, "launch.sh");
+      const calls: string[][] = [];
+      const lookupTimeouts: (number | undefined)[] = [];
+      __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexExecutor((args, options) => {
+        calls.push(args);
+        if (args[0] === "split") return JSON.stringify({ block_ids: ["block:launched"] });
+        if (args[0] === "block" && args[1] === "inspect") {
+          lookupTimeouts.push(options?.timeoutMs);
+          if (lookupFails) throw new Error("lookup timed out");
+          return JSON.stringify({ block: { window_id: "window:target" } });
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "split", name: id, sessionId: "session:test", anchorBlockId: "block:anchor", status: "reserved" });
+      try {
+        assert.equal(sendLongCommand(id, "echo launched", { scriptPath }), scriptPath);
+        assert.deepEqual(lookupTimeouts, [3000], "split-launch tab lookup must not use the 15-second default");
+        assert.deepEqual(calls.map((args) => args.slice(0, 2)), [["split", "-s"], ["block", "inspect"]]);
+        assert.equal(getSurfaceHandle(id)?.status, "launched");
+        assert.equal(getSurfaceHandle(id)?.blockId, "block:launched");
+        assert.equal(getSurfaceHandle(id)?.windowId, lookupFails ? undefined : "window:target");
+        assert.equal(__rexTest__.sizingPassCount(), lookupFails ? 0 : 1);
+      } finally {
+        unregisterSurfaceHandle(id);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("remembers a split's tab before closing and rebalances survivors", async () => {
     const { registerSurfaceHandle, closeSurface } = await import("../pi-extension/subagents/rex.ts");
     const calls: string[][] = [];

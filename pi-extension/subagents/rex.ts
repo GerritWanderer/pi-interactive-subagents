@@ -605,7 +605,8 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     }
 
     handle.status = "launched";
-    const windowId = getSurfaceTab(handle.id);
+    // Bound this cosmetic lookup so sizing cannot stall an otherwise successful launch.
+    const windowId = getSurfaceTab(handle.id, false, 3000);
     if (windowId) scheduleTabSizing(sessionId, windowId);
   }
 }
