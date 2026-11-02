@@ -157,7 +157,14 @@ npm test
 
 # Run no-model Rex surface integration tests (fast & free, exercises Rex CLI/API directly)
 npm run test:surface
+
+# Only with explicit model/test-budget approval and authenticated model access:
+PI_TEST_MODEL=github-copilot/gemini-3.8-flash PI_TEST_TIMEOUT=240000 npm run test:integration
 ```
+
+`test:integration` includes the no-model surface suite plus real-Pi lifecycle cases. `PI_TEST_MODEL` selects both the parent and every copied test-agent profile (default: `anthropic/claude-haiku-4-5`); fixtures disable unnecessary thinking. `PI_TEST_TIMEOUT` bounds each wait, in milliseconds. Model latency varies, so allow several minutes for the full run. Each lifecycle case creates and removes its own Rex session, including descendants on failure, and checks that cleanup preserves the invoking pane. Launch acknowledgements and delivered results are verified in explicit parent transcripts, not by matching text echoed from prompts. Normal saved child-session history remains available in Pi's session storage.
+
+See [end-to-end acceptance evidence](docs/rex-end-to-end-acceptance.md) for the tested versions, commands, capability observations, and native macOS-host coverage gap.
 
 ## Tools
 

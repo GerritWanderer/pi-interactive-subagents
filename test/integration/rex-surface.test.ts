@@ -237,6 +237,8 @@ for (const backend of backends) {
 
       const topTab = getSurfaceTab(top);
       assert.ok(topTab, "expected to read top surface window id");
+      const labeled = rexJson(["block", "inspect", "-s", ctx.session!, topHandle!.blockId!, "--json"]);
+      assert.equal(labeled.block.label, "tab-top-level", "the command pane must share the named tab's agent label");
 
       // Verify top-level window is different from the spawner's window
       const rexModule = await import("../../pi-extension/subagents/rex.ts");
@@ -274,6 +276,40 @@ for (const backend of backends) {
         else process.env.REX_BLOCK = savedBlock;
       }
     });
+
+    for (const label of ["-agent-name", "--dash-name"]) {
+      it(`preserves the leading-dash label ${JSON.stringify(label)} on tabs and nested panes`, async () => {
+        const initialFocus = getFocusedSurface();
+        const top = mainSurface(env, label);
+        let nested: string | undefined;
+        try {
+          sendLongCommand(top, 'echo "DASH_TOP_READY"');
+          await waitForScreen(top, /DASH_TOP_READY/, 10_000, 20);
+          const topHandle = getSurfaceHandle(top)!;
+          assert.equal(topHandle.kind, "tab");
+          assert.equal(topHandle.name, label);
+          const view = rexJson(["session", "inspect", topHandle.sessionId, "--json"]);
+          const tab = view.windows.find((w: any) => w.window_id === topHandle.windowId);
+          assert.equal(tab?.label, label, "the temporary tab label must be replaced with the exact requested name");
+          const pane = rexJson(["block", "inspect", "-s", topHandle.sessionId, topHandle.blockId!, "--json"]);
+          assert.equal(pane.block.label, label, "the command pane must retain the leading dashes");
+
+          nested = createTrackedSurfaceSplit(env, label, "right", top);
+          sendLongCommand(nested, 'echo "DASH_NESTED_READY"');
+          await waitForScreen(nested, /DASH_NESTED_READY/, 10_000, 20);
+          const nestedHandle = getSurfaceHandle(nested)!;
+          assert.equal(nestedHandle.kind, "split");
+          assert.equal(nestedHandle.name, label);
+          const nestedPane = rexJson(["block", "inspect", "-s", nestedHandle.sessionId, nestedHandle.blockId!, "--json"]);
+          assert.equal(nestedPane.block.label, label, "split labels must also retain the leading dashes");
+          assert.equal(nestedPane.block.window_id, topHandle.windowId);
+          assert.equal(getFocusedSurface(), initialFocus, "labeling must not change focus");
+        } finally {
+          if (nested) closeSurface(nested);
+          closeSurface(top);
+        }
+      });
+    }
 
     it("launches command directly, reads output, queries process, and closes cleanly", async () => {
       const surface = createTrackedSurface(env, "exec-test");

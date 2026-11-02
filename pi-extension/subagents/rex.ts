@@ -545,8 +545,10 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
   const label = handle.name;
 
   if (handle.kind === "tab") {
-    // rex window new [-s SESSION] [LABEL] [-- COMMAND...] --focus=false --keep-open --json
-    const args = ["window", "new", "-s", sessionId, label, "--focus=false", "--keep-open", "--json"];
+    // `window new` reserves `--` for COMMAND, so a leading-dash LABEL
+    // needs a safe temporary name until we can rename the returned window.
+    const initialLabel = label.startsWith("-") ? `subagent${label}` : label;
+    const args = ["window", "new", "-s", sessionId, initialLabel, "--focus=false", "--keep-open", "--json"];
     if (cwd) {
       args.push("-c", cwd);
     }
@@ -572,6 +574,21 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
     }
 
     handle.status = "launched";
+    if (initialLabel !== label) {
+      try {
+        rexExec(["window", "rename", "-s", sessionId, "--", windowId, label]);
+      } catch (renameErr) {
+        console.warn(`Failed to set tab label for subagent "${label}":`, renameErr);
+      }
+    }
+    // `window new LABEL` names only the tab; its command pane otherwise keeps
+    // the generic shell label. Use the returned ID, never the focused block.
+    // Labeling failure must not tear down the already-running command.
+    try {
+      rexExec(["block", "rename", "-s", sessionId, "--", handle.blockId!, label]);
+    } catch (renameErr) {
+      console.warn(`Failed to set pane label for subagent "${label}":`, renameErr);
+    }
   } else {
     // rex split -s SESSION -b ANCHOR --split=DIRECTION --label=LABEL --focus=false --keep-open --json -- COMMAND...
     const anchor = handle.anchorBlockId;
