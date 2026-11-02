@@ -717,6 +717,36 @@ export function confirmProcessEnded(sessionFile: string): void {
   lostObservationEntries.delete(resolve(sessionFile));
 }
 
+const guardedSubagentRuns = new WeakSet<RunningSubagent>();
+
+/** Preserve resume safety without starting new work in a disposed runtime. */
+function recordLostObservation(running: RunningSubagent): Error | null {
+  const { sessionFile, surface } = running;
+  if (!sessionFile || guardedSubagentRuns.has(running)) return null;
+
+  // Shutdown records synchronously; its later watcher rejection must not
+  // recreate a guard that reconciliation has already cleared.
+  guardedSubagentRuns.add(running);
+
+  const resolvedPath = resolve(sessionFile);
+  const surfaceHandle = getSurfaceHandle(surface);
+  const entry = {
+    sessionFile,
+    surface,
+    blockId: surfaceHandle?.blockId,
+    sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
+  };
+  lostObservationSessions.add(resolvedPath);
+  lostObservationEntries.set(resolvedPath, entry);
+  try {
+    writeLostObservationMarker(sessionFile, entry);
+    return null;
+  } catch (err) {
+    console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, err);
+    return err instanceof Error ? err : new Error(String(err));
+  }
+}
+
 let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function reconcileLostObservations(sessionPathCheck?: string): void {
@@ -1742,6 +1772,10 @@ async function watchSubagent(
       },
     });
 
+    // Shutdown may have recorded a guard after polling confirmed exit but
+    // before this continuation ran. The process is now known to have ended.
+    if (lostObservationSessions.has(resolve(sessionFile))) confirmProcessEnded(sessionFile);
+
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (running.cli === "claude") {
@@ -1843,7 +1877,8 @@ async function watchSubagent(
     if (signal.aborted || moduleSignal.aborted) {
       // Shutdown/reload only disposes observation; the child may still be live.
       // Only an explicit watcher cancellation may close its pane here.
-      if (!moduleSignal.aborted) safeCloseSurface(surface);
+      if (moduleSignal.aborted) recordLostObservation(running);
+      else safeCloseSurface(surface);
       runningSubagents.delete(running.id);
       return {
         name,
@@ -1860,30 +1895,9 @@ async function watchSubagent(
     if (isRexInfrastructureError(err)) {
       // Sustained infrastructure failure observing the process.
       // Do NOT kill or close a potentially live agent!
-      let markerError: any = null;
-      if (sessionFile) {
-        const resolvedPath = resolve(sessionFile);
-        lostObservationSessions.add(resolvedPath);
-        const surfaceHandle = getSurfaceHandle(surface);
-        lostObservationEntries.set(resolvedPath, {
-          sessionFile,
-          surface,
-          blockId: surfaceHandle?.blockId,
-          sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
-        });
-        try {
-          writeLostObservationMarker(sessionFile, {
-            blockId: surfaceHandle?.blockId,
-            sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
-            surface,
-          });
-        } catch (mErr: any) {
-          markerError = mErr;
-          console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, mErr);
-        }
-        if (!reconcileRetryTimer) {
-          reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
-        }
+      const markerError = recordLostObservation(running);
+      if (sessionFile && !reconcileRetryTimer) {
+        reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
       }
       runningSubagents.delete(running.id);
       const errorMsg = markerError
@@ -1961,6 +1975,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+    // Persist guards synchronously before clearing live tracking: shutdown can
+    // complete before the aborted watchers' promise continuations run.
+    for (const agent of runningSubagents.values()) recordLostObservation(agent);
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {

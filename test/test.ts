@@ -5021,12 +5021,20 @@ describe("subagent watcher disposal", () => {
     it(`${reason} ${reason === "cancellation" ? "closes" : "preserves"} a live watched child's pane`, async (t) => {
       const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
       const testApi = subagentsModule.__test__;
-      const { api } = createMockExtensionApi();
+      const { hasLostObservationMarker, readLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const { api, registeredTools } = createMockExtensionApi();
       const handlers = new Map<string, (...args: any[]) => void>();
       api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
       subagentsModule.default(api);
-      handlers.get("session_start")!({}, { hasUI: false });
       const dir = createTestDir();
+      const ctx = {
+        hasUI: false,
+        sessionManager: {
+          getSessionDir: () => dir,
+          getSessionId: () => "main-sess",
+        },
+      };
+      handlers.get("session_start")!({}, ctx);
       const controller = new AbortController();
       const id = `live-watcher-${reason}`;
       const running = {
@@ -5036,11 +5044,23 @@ describe("subagent watcher disposal", () => {
         statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
         abortController: controller,
       };
+      writeFileSync(running.sessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+      registerName(join(dir, "artifacts", "main-sess"), id, {
+        sessionFile: running.sessionFile, sessionId: "sess-child",
+      });
       const calls: string[][] = [];
+      let processExited = false;
       t.mock.timers.enable({ apis: ["setTimeout"] });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      // The child's coordinates must come from its handle, not the current parent.
+      __rexTest__.setRexContextOverride({ session: "session:parent", block: "block:parent" });
       __rexTest__.setRexExecutor((args) => {
         calls.push(args);
-        if (args.at(-1) === "process") return JSON.stringify({ last_exit: null });
+        if (args.at(-1) === "process") {
+          assert.ok(args.includes("block:live-child"));
+          assert.ok(args.includes("session:test"));
+          return JSON.stringify({ last_exit: processExited ? { exit_code: 0 } : null });
+        }
         return "{}";
       });
       registerSurfaceHandle({
@@ -5056,6 +5076,8 @@ describe("subagent watcher disposal", () => {
         if (reason === "session_shutdown") {
           handlers.get("session_shutdown")!({}, {});
           assert.equal(controller.signal.aborted, true, "shutdown also aborts the per-agent controller");
+          assert.equal(hasLostObservationMarker(running.sessionFile), true,
+            "shutdown must persist the guard before watcher continuations run");
         } else if (reason === "reload") {
           // Match module reload: abort the previous runtime, then replace the
           // global controller before the old watcher's catch branch executes.
@@ -5077,10 +5099,108 @@ describe("subagent watcher disposal", () => {
         t.mock.timers.tick(5000);
         await Promise.resolve();
         assert.equal(calls.length, callsAfterDisposal, "disposal must stop background polling");
+
+        if (reason === "cancellation") {
+          assert.equal(hasLostObservationMarker(running.sessionFile), false);
+          assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), false);
+        } else {
+          const marker = readLostObservationMarker(running.sessionFile);
+          assert.equal(marker?.blockId, "block:live-child");
+          assert.equal(marker?.sessionId, "session:test");
+          assert.equal(marker?.surface, id);
+          assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), true);
+
+          handlers.get("session_start")!({}, ctx);
+          const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+          for (const guard of ["in-memory", "disk-only"]) {
+            if (guard === "disk-only") {
+              // A replacement runtime has no running map or lost-observation memory.
+              testApi.lostObservationSessions.clear();
+              testApi.lostObservationEntries.clear();
+            }
+            const result = await messageTool.execute(
+              `resume-${guard}`, { name: id, message: "continue" }, undefined, undefined, ctx,
+            );
+            assert.match(result.details.error, /Cannot resume.*process may still be active/,
+              `${guard} guard must refuse unsafe name-based resume`);
+            assert.equal(hasLostObservationMarker(running.sessionFile), true);
+            assert.ok(getSurfaceHandle(id), "a refused resume must preserve the live child");
+            assert.equal(calls.some((args) => args[0] === "split" || args[1] === "new"), false,
+              "refused resume must not create another process surface");
+            assert.equal(testApi.runningSubagents.size, 0);
+          }
+
+          processExited = true;
+          testApi.reconcileLostObservations(running.sessionFile);
+          assert.equal(hasLostObservationMarker(running.sessionFile), false,
+            "confirmed process exit must clear the persisted guard");
+          assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), false);
+          assert.equal(testApi.lostObservationEntries.has(resolve(running.sessionFile)), false);
+          assert.equal(getSurfaceHandle(id), undefined, "only confirmed exit may close the retained pane");
+        }
       } finally {
         handlers.get("session_shutdown")!({}, {});
         controller.abort();
         await watcher;
+        testApi.lostObservationSessions.delete(resolve(running.sessionFile));
+        testApi.lostObservationEntries.delete(resolve(running.sessionFile));
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("subagent watcher exit during shutdown", () => {
+  for (const exitObserved of [true, false]) {
+    it(`clears a shutdown guard when exit is confirmed by ${exitObserved ? "polling" : "reconciliation"}`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const { hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(api);
+      handlers.get("session_start")!({}, { hasUI: false });
+      const dir = createTestDir();
+      const id = "exited-during-shutdown";
+      const running = {
+        id, name: id, task: "finished", surface: id,
+        startTime: Date.now(), sessionFile: join(dir, "child.jsonl"),
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      registerSurfaceHandle({
+        id, name: id, kind: "split", status: "launched",
+        sessionId: "session:test", blockId: "block:exited-child",
+      });
+      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: exitObserved ? { exit_code: 0 } : null }));
+      testApi.runningSubagents.set(id, running);
+      const watcher = testApi.watchSubagent(running, new AbortController().signal);
+
+      try {
+        // The watcher has not resumed from its await, whether polling resolved
+        // or is about to reject because of shutdown.
+        handlers.get("session_shutdown")!({}, {});
+        assert.equal(hasLostObservationMarker(running.sessionFile), true);
+        if (!exitObserved) {
+          __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
+          testApi.reconcileLostObservations(running.sessionFile);
+        }
+        const result = await watcher;
+        assert.equal(result.outcome, exitObserved ? "success" : "interrupted");
+        assert.equal(hasLostObservationMarker(running.sessionFile), false);
+        assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), false);
+        assert.equal(testApi.lostObservationEntries.has(resolve(running.sessionFile)), false);
+      } finally {
+        handlers.get("session_shutdown")!({}, {});
+        await watcher;
+        testApi.runningSubagents.delete(id);
+        testApi.lostObservationSessions.delete(resolve(running.sessionFile));
+        testApi.lostObservationEntries.delete(resolve(running.sessionFile));
         unregisterSurfaceHandle(id);
         __rexTest__.setRexExecutor(null);
         rmSync(dir, { recursive: true, force: true });
