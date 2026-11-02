@@ -125,21 +125,36 @@ export interface TestEnv {
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
  */
-export function createTestEnv(opts?: { isolateRex?: boolean }): TestEnv {
+export function createTestEnv(opts?: { isolateRex?: boolean; agentsSrc?: string }): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const env: TestEnv = { dir, surfaces: [], tempFiles: [] };
   try {
     const agentsDir = join(dir, ".pi", "agents");
     mkdirSync(agentsDir, { recursive: true });
 
+    // Allow isolated profile fixtures without modifying the shared test agents.
+    const agentsSrc = opts?.agentsSrc ?? TEST_AGENTS_SRC;
     // Copy test agent definitions into the project-local agents dir
-    if (existsSync(TEST_AGENTS_SRC)) {
-      for (const file of readdirSync(TEST_AGENTS_SRC)) {
+    if (existsSync(agentsSrc)) {
+      for (const file of readdirSync(agentsSrc)) {
         if (file.endsWith(".md")) {
           const target = join(agentsDir, file);
-          cpSync(join(TEST_AGENTS_SRC, file), target);
+          cpSync(join(agentsSrc, file), target);
+          // Rewrite only frontmatter: body examples must not override this guard.
           // The approved model applies to parents AND profile-selected children.
-          writeFileSync(target, readFileSync(target, "utf8").replace(/^model:.*$/m, `model: ${TEST_MODEL}\nthinking: off`));
+          const content = readFileSync(target, "utf8").replace(
+            /^---\n((?:[^\n]*\n)*?)---(?=\n|$)/,
+            (_match, frontmatter: string) => {
+              frontmatter = /^model:/m.test(frontmatter)
+                ? frontmatter.replace(/^model:.*$/gm, () => `model: ${TEST_MODEL}`)
+                : `${frontmatter}model: ${TEST_MODEL}\n`;
+              frontmatter = /^thinking:/m.test(frontmatter)
+                ? frontmatter.replace(/^thinking:.*$/gm, () => "thinking: off")
+                : `${frontmatter}thinking: off\n`;
+              return `---\n${frontmatter}---`;
+            },
+          );
+          writeFileSync(target, content);
         }
       }
     }

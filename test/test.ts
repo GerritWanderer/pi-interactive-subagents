@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -38,7 +38,7 @@ import {
   shellEscape, __rexTest__, disposeRexSurfaces, registerSurfaceHandle, unregisterSurfaceHandle,
 } from "../pi-extension/subagents/rex.ts";
 import { planEqualShares, type RexLayoutNode } from "../pi-extension/subagents/rex-sizing.ts";
-import { createTestEnv, cleanupTestEnv } from "./integration/harness.ts";
+import { createTestEnv, cleanupTestEnv, TEST_MODEL } from "./integration/harness.ts";
 
 // A cosmetic timer from one fixture must not run with the next fixture's executor.
 afterEach(() => disposeRexSurfaces());
@@ -2960,6 +2960,74 @@ describe("Rex equal-share sizing (public session.view layout)", () => {
   it("abandons malformed layouts rather than applying a partial plan", () => {
     assert.deepEqual(planEqualShares(split("horizontal", 0.3,
       split("vertical", 0.1, a, b), {})), []);
+  });
+});
+
+describe("integration harness profile guards", () => {
+  function assertProfiles(dir: string, model: string): string[] {
+    const agentsDir = join(dir, ".pi/agents");
+    const files = readdirSync(agentsDir).filter((file) => file.endsWith(".md"));
+    assert.ok(files.length > 0);
+    for (const file of files) {
+      const content = readFileSync(join(agentsDir, file), "utf8");
+      const frontmatter = content.match(/^---\n([\s\S]*?)\n---(?=\n|$)/)?.[1];
+      assert.ok(frontmatter, `${file} must have frontmatter`);
+      assert.deepEqual(frontmatter.match(/^model:.*$/gm), [`model: ${model}`], file);
+      assert.deepEqual(frontmatter.match(/^thinking:.*$/gm), ["thinking: off"], file);
+    }
+    return files;
+  }
+
+  it("rewrites every copied test profile with TEST_MODEL and thinking off", () => {
+    const env = createTestEnv();
+    try {
+      const source = fileURLToPath(new URL("./integration/agents", import.meta.url));
+      assert.deepEqual(assertProfiles(env.dir, TEST_MODEL), readdirSync(source).filter((file) => file.endsWith(".md")));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("replaces or adds frontmatter settings with a literal special-character TEST_MODEL", async () => {
+    const model = "test/model-$&-$$-$`-$'";
+    const previousModel = process.env.PI_TEST_MODEL;
+    try {
+      process.env.PI_TEST_MODEL = model;
+      // TEST_MODEL is read at module initialization; use a fresh module instance.
+      const harness: typeof import("./integration/harness.ts") = await import(
+        new URL("./integration/harness.ts?profile-guard-test", import.meta.url).href
+      );
+      assert.equal(harness.TEST_MODEL, model);
+      withTempDir((agentsSrc) => {
+        const profiles = {
+          "existing-thinking": "model: unapproved/model\nthinking: high",
+          "missing-thinking": "model: unapproved/model",
+          "missing-model": "thinking: high",
+          "missing-both": "description: no model or thinking",
+          "empty-frontmatter": "",
+        };
+        const body = "Preserve these body examples:\nmodel: body/model\nthinking: high";
+        for (const [name, frontmatter] of Object.entries(profiles)) {
+          writeAgentFile(agentsSrc, name, frontmatter, body);
+        }
+        writeFileSync(join(agentsSrc, "ignored.txt"), "not an agent");
+        const env = harness.createTestEnv({ agentsSrc });
+        try {
+          assert.deepEqual(assertProfiles(env.dir, harness.TEST_MODEL).sort(), Object.keys(profiles).map((name) => `${name}.md`).sort());
+          for (const name of Object.keys(profiles)) {
+            const file = `${name}.md`;
+            const copied = readFileSync(join(env.dir, ".pi/agents", file), "utf8");
+            assert.ok(copied.endsWith(`\n\n${body}\n`), `${file} body must be unchanged`);
+            assert.ok(!readFileSync(join(agentsSrc, file), "utf8").includes(model), `${file} source must be unchanged`);
+          }
+          assert.equal(existsSync(join(env.dir, ".pi/agents/ignored.txt")), false);
+        } finally {
+          harness.cleanupTestEnv(env);
+        }
+      });
+    } finally {
+      restoreEnvVar("PI_TEST_MODEL", previousModel);
+    }
   });
 });
 

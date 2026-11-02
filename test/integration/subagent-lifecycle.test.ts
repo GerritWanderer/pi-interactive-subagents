@@ -6,7 +6,7 @@
  */
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import {
   getAvailableBackends, createTestEnv, cleanupTestEnv, createTrackedSurface,
@@ -96,7 +96,16 @@ for (const backend of backends) {
       env = createTestEnv({ isolateRex: true });
       assert.notEqual(env.rexSession, outside.session);
       // Every copied profile, not just the parent, must use the approved model.
-      assert.match(readFileSync(join(env.dir, ".pi/agents/test-echo.md"), "utf8"), new RegExp(`model: ${TEST_MODEL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+      const agentsDir = join(env.dir, ".pi/agents");
+      const profiles = readdirSync(agentsDir).filter((file) => file.endsWith(".md"));
+      assert.ok(profiles.length > 0, "test agent profiles must be copied");
+      for (const file of profiles) {
+        const content = readFileSync(join(agentsDir, file), "utf8");
+        const frontmatter = content.match(/^---\n([\s\S]*?)\n---(?=\n|$)/)?.[1];
+        assert.ok(frontmatter, `${file} must have frontmatter`);
+        assert.deepEqual(frontmatter.match(/^model:.*$/gm), [`model: ${TEST_MODEL}`], `${file} must use the approved model`);
+        assert.deepEqual(frontmatter.match(/^thinking:.*$/gm), ["thinking: off"], `${file} must disable thinking`);
+      }
     });
     afterEach(() => {
       const ownedSession = env.rexSession;
