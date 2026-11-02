@@ -723,7 +723,10 @@ export function confirmProcessEnded(sessionFile: string): void {
 let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function reconcileLostObservations(sessionPathCheck?: string): void {
-  reconcileRetryTimer = null;
+  if (reconcileRetryTimer) {
+    clearTimeout(reconcileRetryTimer);
+    reconcileRetryTimer = null;
+  }
   if (sessionPathCheck && !lostObservationEntries.has(resolve(sessionPathCheck))) {
     const marker = readLostObservationMarker(sessionPathCheck);
     if (marker?.blockId) {

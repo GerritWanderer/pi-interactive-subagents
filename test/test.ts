@@ -4542,8 +4542,10 @@ describe("rex.ts unit tests", () => {
         assert.equal(hasLostObservationMarker(reconcileSession), false);
       } finally {
         testApi.lostObservationSessions?.clear();
+        testApi.lostObservationEntries?.clear();
         testApi.pendingCleanups?.clear();
         unregisterSurfaceHandle("cleanup-res-surface");
+        unregisterSurfaceHandle("reconcile-surface");
         __rexTest__.setRexExecutor(null);
         __rexTest__.setCommandAvailabilityOverride(undefined);
         __rexTest__.setRexContextOverride(undefined);
@@ -4997,6 +4999,54 @@ describe("rex.ts unit tests", () => {
       assert.match(textMentionPres, /Sub-agent "mention-worker" was interrupted/);
       assert.doesNotMatch(textMentionPres, /was cancelled after/);
     });
+  });
+});
+
+describe("lost-observation reconciliation timers", () => {
+  it("keeps one retry chain across direct calls and cancels it on shutdown", async (t) => {
+    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+    const testApi = subagentsModule.__test__;
+    const { api } = createMockExtensionApi();
+    let shutdown: () => void = () => {};
+    api.on = (event: string, handler: () => void) => {
+      if (event === "session_shutdown") shutdown = handler;
+    };
+    subagentsModule.default(api);
+    shutdown();
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+
+    let processQueries = 0;
+    __rexTest__.setRexExecutor(() => {
+      processQueries++;
+      return JSON.stringify({ last_exit: null });
+    });
+    const sessionFile = join(tmpdir(), "reconcile-timer-session.jsonl");
+    testApi.lostObservationEntries.set(sessionFile, {
+      sessionFile,
+      surface: "",
+      blockId: "block:reconcile-timer",
+      sessionId: "session:mock",
+    });
+
+    try {
+      for (let i = 0; i < 3; i++) testApi.reconcileLostObservations();
+      assert.equal(processQueries, 3);
+      t.mock.timers.tick(1000);
+      assert.equal(processQueries, 4, "direct calls must leave only one retry timeout");
+      t.mock.timers.tick(1000);
+      assert.equal(processQueries, 5, "retries must continue as a single timer chain");
+
+      for (let i = 0; i < 3; i++) testApi.reconcileLostObservations();
+      assert.equal(processQueries, 8);
+      shutdown();
+      t.mock.timers.tick(5000);
+      assert.equal(processQueries, 8, "shutdown must cancel every pending reconciliation timeout");
+      assert.equal(testApi.lostObservationEntries.size, 1, "unresolved observations must remain tracked");
+    } finally {
+      shutdown();
+      testApi.lostObservationEntries.clear();
+      __rexTest__.setRexExecutor(null);
+    }
   });
 });
 
