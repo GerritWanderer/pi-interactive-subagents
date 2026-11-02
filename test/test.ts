@@ -3870,8 +3870,17 @@ describe("rex.ts unit tests", () => {
     }
   });
 
-  for (const failRename of [false, true]) {
-    it(`labels the returned top-level command pane${failRename ? " and preserves it with a warning if labeling fails" : " without relying on focus"}`, async (t) => {
+  for (const { label, failedRename } of [
+    { label: "literal 'agent' $name", failedRename: undefined },
+    { label: "literal 'agent' $name", failedRename: "block" },
+    { label: "-agent-name", failedRename: undefined },
+    { label: "-agent-name", failedRename: "window" },
+    { label: "-agent-name", failedRename: "block" },
+    { label: "--dash-name", failedRename: undefined },
+    { label: "--dash-name", failedRename: "window" },
+    { label: "--dash-name", failedRename: "block" },
+  ] as const) {
+    it(`labels the returned top-level command pane ${JSON.stringify(label)}${failedRename ? ` and preserves it if ${failedRename} labeling fails` : " without relying on focus"}`, async (t) => {
       const { createSurface, sendLongCommand, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
       const dir = mkdtempSync(join(tmpdir(), "rex-label-"));
       const renameError = new Error("rename unavailable");
@@ -3886,30 +3895,38 @@ describe("rex.ts unit tests", () => {
       __rexTest__.setRexExecutor((args) => {
         calls.push(args);
         if (args[0] === "window" && args[1] === "new") return JSON.stringify({ window_id: "window:label", block_ids: ["block:created"] });
-        if (args[0] === "block" && args[1] === "rename") {
+        if ((args[0] === "block" || args[0] === "window") && args[1] === "rename") {
           assert.equal(getSurfaceHandle(surface)?.status, "launched", "command must be marked launched before labeling");
-          if (failRename) throw renameError;
+          if (args[0] === failedRename) throw renameError;
         }
         if (args[0] === "block" && args[1] === "inspect") return JSON.stringify({ block: { window_id: "window:label" } });
         if (args[0] === "window" && args[1] === "inspect") return JSON.stringify({ layers: [{ blocks: [{ block_id: "block:created" }] }] });
         return "{}";
       });
-      const surface = createSurface("literal 'agent' $name");
+      const surface = createSurface(label);
       try {
         const scriptPath = join(dir, "launch.sh");
         assert.equal(sendLongCommand(surface, "true", { scriptPath }), scriptPath);
         assert.equal(getSurfaceHandle(surface)?.status, "launched");
         assert.equal(getSurfaceHandle(surface)?.windowId, "window:label");
         assert.equal(getSurfaceHandle(surface)?.blockId, "block:created");
+        assert.equal(getSurfaceHandle(surface)?.name, label, "the original name must be preserved in the handle");
         assert.equal(calls.some((c) => c[1] === "close" || c[1] === "kill"), false,
           "labeling must not close or kill the launched surface");
-        assert.equal(warning.mock.callCount(), failRename ? 1 : 0);
-        if (failRename) {
+        assert.equal(warning.mock.callCount(), failedRename ? 1 : 0);
+        if (failedRename) {
           assert.deepEqual(warning.mock.calls[0].arguments,
-            ["Failed to set pane label for subagent \"literal 'agent' $name\":", renameError]);
+            [`Failed to set ${failedRename === "window" ? "tab" : "pane"} label for subagent "${label}":`, renameError]);
         }
+        assert.deepEqual(calls.find((c) => c[0] === "window" && c[1] === "new"),
+          ["window", "new", "-s", "session:label", label.startsWith("-") ? `subagent${label}` : label,
+            "--focus=false", "--keep-open", "--json", "--", "bash", "-l", scriptPath]);
+        const tabRenames = calls.filter((c) => c[0] === "window" && c[1] === "rename");
+        assert.deepEqual(tabRenames, label.startsWith("-")
+          ? [["window", "rename", "-s", "session:label", "--", "window:label", label]]
+          : [], "only leading-dash labels should need a tab rename, targeting the returned window ID");
         assert.deepEqual(calls.find((c) => c[0] === "block" && c[1] === "rename"),
-          ["block", "rename", "-s", "session:label", "block:created", "literal 'agent' $name"]);
+          ["block", "rename", "-s", "session:label", "--", "block:created", label]);
       } finally {
         closeSurface(surface);
         __rexTest__.setRexExecutor(null);
