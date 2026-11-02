@@ -186,7 +186,10 @@ for (const backend of backends) {
       assert.equal(readFileSync(`${first.details.sessionFile}.loadout.json`, "utf8"), snapshot);
       const loadout = JSON.parse(snapshot);
       assert.equal(loadout.cwd, cwd); assert.equal(loadout.model, TEST_MODEL);
-      assert.ok(loadout.toolAllowlist.includes("bash")); assert.ok(!loadout.toolAllowlist.includes("subagent,"));
+      const allowedTools = loadout.toolAllowlist.split(",").map((tool: string) => tool.trim());
+      assert.equal(allowedTools.includes("subagent"), false);
+      assert.equal(allowedTools.includes("bash"), true);
+      assert.equal(allowedTools.includes("ask_question"), true);
       assert.match(readFileSync(resume.details.launchScriptFile, "utf8"), /--no-extensions/);
       assert.equal(readFileSync(join(cwd, "first.txt"), "utf8").trim(), "FIRST_OK");
       assert.equal(readFileSync(join(cwd, "second.txt"), "utf8").trim(), "SECOND_OK");

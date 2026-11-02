@@ -36,6 +36,7 @@ import {
 
 import { shellEscape, __rexTest__, disposeRexSurfaces } from "../pi-extension/subagents/rex.ts";
 import { planEqualShares, type RexLayoutNode } from "../pi-extension/subagents/rex-sizing.ts";
+import { cleanupTestEnv } from "./integration/harness.ts";
 
 // A cosmetic timer from one fixture must not run with the next fixture's executor.
 afterEach(() => disposeRexSurfaces());
@@ -2958,6 +2959,66 @@ describe("Rex equal-share sizing (public session.view layout)", () => {
     assert.deepEqual(planEqualShares(split("horizontal", 0.3,
       split("vertical", 0.1, a, b), {})), []);
   });
+});
+
+describe("integration harness cleanup", () => {
+  for (const reason of ["session already closed", "RPC error"]) {
+    it(`cleans local resources and restores context after ${reason}`, (t) => {
+      const root = mkdtempSync(join(tmpdir(), "pi-cleanup-test-"));
+      const dir = join(root, "project");
+      const tempFile = join(root, "tracked.tmp");
+      mkdirSync(dir);
+      writeFileSync(join(dir, "project.tmp"), "test");
+      writeFileSync(tempFile, "test");
+      const savedContext = {
+        REX_SESSION: "session:caller",
+        REX_BLOCK: "block:caller",
+        PI_SUBAGENT_CLEANUP_TEST: undefined,
+      };
+      const originalContext = Object.fromEntries(
+        Object.keys(savedContext).map((key) => [key, process.env[key]]),
+      );
+      const error = new Error(reason);
+      const warning = t.mock.method(console, "warn", () => {});
+      let killCalls = 0;
+      __rexTest__.setRexExecutor((args) => {
+        assert.deepEqual(args, ["kill", "session:owned"]);
+        killCalls++;
+        throw error;
+      });
+
+      try {
+        process.env.REX_SESSION = "session:owned";
+        process.env.REX_BLOCK = "block:owned";
+        process.env.PI_SUBAGENT_CLEANUP_TEST = "child";
+        assert.doesNotThrow(() => cleanupTestEnv({
+          dir,
+          surfaces: [],
+          // A missing file must not prevent removal of later tracked files.
+          tempFiles: [join(root, "already-removed.tmp"), tempFile],
+          rexSession: "session:owned",
+          savedContext,
+        }));
+
+        assert.equal(killCalls, 1);
+        assert.equal(existsSync(dir), false, "project directory must be removed");
+        assert.equal(existsSync(tempFile), false, "external temp file must be removed");
+        for (const [key, value] of Object.entries(savedContext)) {
+          assert.equal(process.env[key], value, `${key} must be restored`);
+        }
+        assert.equal(warning.mock.callCount(), 1);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to clean up Rex test resources/);
+        assert.equal(warning.mock.calls[0].arguments[1], error);
+      } finally {
+        __rexTest__.setRexExecutor(null);
+        for (const [key, value] of Object.entries(originalContext)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("rex.ts unit tests", () => {

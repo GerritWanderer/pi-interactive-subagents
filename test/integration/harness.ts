@@ -166,27 +166,31 @@ export function cleanupTestEnv(env: TestEnv): void {
       closeSurface(surface);
     } catch {}
   }
-  disposeRexSurfaces();
-  if (env.rexSession) {
-    try {
+  try {
+    disposeRexSurfaces();
+    if (env.rexSession) {
       // Only the exact session returned by this fixture's `rex new` is owned.
       // This also cleans descendant panes that outlived a failed assertion.
       rexExec(["kill", env.rexSession]);
-    } finally {
-      for (const [key, value] of Object.entries(env.savedContext ?? {})) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
     }
-  }
-  for (const file of env.tempFiles) {
+  } catch (error) {
+    // An already-closed session or RPC failure must not skip local cleanup or
+    // prevent the caller's post-cleanup assertions from running.
+    console.warn("Failed to clean up Rex test resources:", error);
+  } finally {
+    for (const [key, value] of Object.entries(env.savedContext ?? {})) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const file of env.tempFiles) {
+      try {
+        unlinkSync(file);
+      } catch {}
+    }
     try {
-      unlinkSync(file);
+      rmSync(env.dir, { recursive: true, force: true });
     } catch {}
   }
-  try {
-    rmSync(env.dir, { recursive: true, force: true });
-  } catch {}
 }
 
 /**
