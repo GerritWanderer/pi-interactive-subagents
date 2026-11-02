@@ -571,6 +571,9 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
       throw new Error(`Failed to create Rex window for subagent: unexpected output ${JSON.stringify(res)}`);
     }
 
+    // `window new LABEL` names only the tab; its command pane otherwise keeps
+    // the generic shell label. Use the returned ID, never the focused block.
+    rexExec(["block", "rename", "-s", sessionId, handle.blockId!, label]);
     handle.status = "launched";
   } else {
     // rex split -s SESSION -b ANCHOR --split=DIRECTION --label=LABEL --focus=false --keep-open --json -- COMMAND...

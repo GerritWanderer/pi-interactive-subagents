@@ -237,6 +237,8 @@ for (const backend of backends) {
 
       const topTab = getSurfaceTab(top);
       assert.ok(topTab, "expected to read top surface window id");
+      const labeled = rexJson(["block", "inspect", "-s", ctx.session!, topHandle!.blockId!, "--json"]);
+      assert.equal(labeled.block.label, "tab-top-level", "the command pane must share the named tab's agent label");
 
       // Verify top-level window is different from the spawner's window
       const rexModule = await import("../../pi-extension/subagents/rex.ts");
