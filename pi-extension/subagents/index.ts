@@ -548,6 +548,51 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/** Pane closes that failed and will be retried a limited number of times. */
+const pendingCleanups = new Map<string, { retriesLeft: number }>();
+let cleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+const CLEANUP_RETRIES = 5;
+const CLEANUP_RETRY_MS = 1000;
+
+function scheduleCleanupRetry(): void {
+  if (cleanupRetryTimer || pendingCleanups.size === 0) return;
+  cleanupRetryTimer = setTimeout(processPendingCleanups, CLEANUP_RETRY_MS);
+  cleanupRetryTimer.unref?.();
+}
+
+function processPendingCleanups(): void {
+  cleanupRetryTimer = null;
+  for (const [surface, entry] of pendingCleanups) {
+    try {
+      closeSurface(surface);
+      pendingCleanups.delete(surface);
+    } catch (err) {
+      entry.retriesLeft--;
+      if (entry.retriesLeft <= 0) {
+        console.error(`Failed to close subagent surface ${surface}: ${err}`);
+        pendingCleanups.delete(surface);
+      }
+    }
+  }
+  scheduleCleanupRetry();
+}
+
+/**
+ * Close a finished subagent's pane without letting a failure replace the
+ * result already collected. A failed close is retried in the background.
+ */
+function safeCloseSurface(surface: string): void {
+  try {
+    closeSurface(surface);
+    pendingCleanups.delete(surface);
+  } catch {
+    if (!pendingCleanups.has(surface)) {
+      pendingCleanups.set(surface, { retriesLeft: CLEANUP_RETRIES });
+    }
+    scheduleCleanupRetry();
+  }
+}
+
 /**
  * End a launch command so the script exits with the agent's real status. The
  * sentinel is only for people reading the pane; completion uses the exit code.
@@ -1189,6 +1234,9 @@ export const __test__ = {
   getShellReadyDelayMs,
   wrapLaunchCommand,
   resolveResultPresentation,
+  safeCloseSurface,
+  processPendingCleanups,
+  pendingCleanups,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1636,7 +1684,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      safeCloseSurface(surface);
       runningSubagents.delete(running.id);
 
       return {
@@ -1672,7 +1720,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    safeCloseSurface(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1707,9 +1755,7 @@ async function watchSubagent(
       };
     }
 
-    try {
-      closeSurface(surface);
-    } catch {}
+    safeCloseSurface(surface);
 
     if (signal.aborted) {
       return {
@@ -1766,6 +1812,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    if (cleanupRetryTimer) {
+      clearTimeout(cleanupRetryTimer);
+      cleanupRetryTimer = null;
+    }
+    for (const surface of pendingCleanups.keys()) {
+      try {
+        closeSurface(surface);
+      } catch (err) {
+        console.error(`Failed to close subagent surface ${surface} on shutdown: ${err}`);
+      }
+    }
+    pendingCleanups.clear();
   });
 
   // The spawning tools are always registered here. Whether a child process can

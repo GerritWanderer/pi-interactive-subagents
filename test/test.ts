@@ -3061,6 +3061,33 @@ esac
       assert.deepEqual(await poll("block:c", { sentinelFile }), { reason: "sentinel", exitCode: 0 });
     });
   });
+
+  describe("safeCloseSurface", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    it("doesn't throw when a close fails, and retries until it works", () => {
+      write("close-failures", "1");
+      testApi.safeCloseSurface("block:c");
+      assert.equal(testApi.pendingCleanups.has("block:c"), true);
+      testApi.processPendingCleanups();
+      assert.equal(testApi.pendingCleanups.has("block:c"), false);
+      assert.equal(calls().match(/^block close/gm)?.length, 2);
+    });
+
+    it("stops retrying after a limited number of attempts", () => {
+      write("close-failures", "99");
+      const error = console.error;
+      console.error = () => {};
+      try {
+        testApi.safeCloseSurface("block:c");
+        for (let i = 0; i < 5; i++) testApi.processPendingCleanups();
+      } finally {
+        console.error = error;
+      }
+      assert.equal(testApi.pendingCleanups.size, 0);
+      assert.equal(calls().match(/^block close/gm)?.length, 6);
+    });
+  });
 });
 
 describe("launch results", () => {
