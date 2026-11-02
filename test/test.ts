@@ -4081,6 +4081,40 @@ describe("rex.ts unit tests", () => {
           });
           assert.equal(sidecarInterruptRes.reason, "interrupted", "pane closed externally after reading sidecar must report interrupted");
           unregisterSurfaceHandle("poll-sidecar-surface");
+
+          // Late sidecar race: sidecar written concurrently with process exit query
+          // Initial check before Rex query sees no sidecar; process returns exit 0; late check discovers sidecar!
+          const lateSidecarSession = join(dir, "late-sidecar.jsonl");
+          writeFileSync(lateSidecarSession, JSON.stringify(SESSION_HEADER) + "\n");
+          registerSurfaceHandle({
+            id: "poll-late-sidecar-surface",
+            kind: "split",
+            name: "late-sidecar",
+            sessionId: "session:mock",
+            blockId: "block:late-sidecar-block",
+            status: "launched",
+          });
+
+          __rexTest__.setRexExecutor((args) => {
+            if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+              // Simulate Pi writing the .exit sidecar concurrently while queryBlockProcess is running
+              writeFileSync(
+                `${lateSidecarSession}.exit`,
+                JSON.stringify({ type: "error", errorMessage: "Late discovery error" }),
+              );
+              return JSON.stringify({ last_exit: { exit_code: 0 } });
+            }
+            return "{}";
+          });
+
+          const lateSidecarRes = await __rexTest__.pollForExit("poll-late-sidecar-surface", abortCtrl.signal, {
+            interval: 5,
+            sessionFile: lateSidecarSession,
+          });
+          assert.equal(lateSidecarRes.reason, "error", "late sidecar must be discovered and applied");
+          assert.equal(lateSidecarRes.errorMessage, "Late discovery error");
+          assert.equal(existsSync(`${lateSidecarSession}.exit`), false, "late sidecar file should be cleaned up");
+          unregisterSurfaceHandle("poll-late-sidecar-surface");
         } finally {
           rmSync(dir, { recursive: true, force: true });
         }
@@ -4386,6 +4420,59 @@ describe("rex.ts unit tests", () => {
 
         // writeLostObservationMarker throws when target directory does not exist
         assert.throws(() => writeLostObservationMarker("/nonexistent-dir/session.jsonl"));
+
+        // Finding 1: reconcileLostObservations clears guard and enables resume when process exits or pane missing
+        const reconcileDir = join(dir, "reconcile-test");
+        mkdirSync(reconcileDir, { recursive: true });
+        const reconcileSession = join(reconcileDir, "reconcile-sess.jsonl");
+        writeFileSync(reconcileSession, JSON.stringify(SESSION_HEADER) + "\n");
+        registerName(parentArtDir, "reconcile-agent", {
+          sessionFile: reconcileSession,
+          sessionId: "sess-reconcile",
+        });
+        registerSurfaceHandle({
+          id: "reconcile-surface",
+          kind: "split",
+          name: "reconcile-agent",
+          sessionId: "session:mock",
+          blockId: "block:reconcile-block",
+          status: "launched",
+        });
+        const reconcileRunning = {
+          id: "reconcile-run-id",
+          name: "reconcile-agent",
+          task: "reconcile task",
+          surface: "reconcile-surface",
+          startTime: Date.now(),
+          sessionFile: reconcileSession,
+          interactive: false,
+          statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        };
+
+        // Trigger infrastructure failure to put into lost-observation state
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            throw new Error("persistent connection refused");
+          }
+          return "{}";
+        });
+        await testApi.watchSubagent(reconcileRunning, new AbortController().signal);
+        assert.ok(testApi.lostObservationSessions.has(resolve(reconcileSession)));
+        assert.ok(hasLostObservationMarker(reconcileSession));
+
+        // When queryBlockProcess reports process exit, reconcileLostObservations clears the guard
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            return JSON.stringify({ last_exit: { exit_code: 0 } });
+          }
+          if (args[0] === "block" && args[1] === "close") {
+            return "{}";
+          }
+          return "{}";
+        });
+        testApi.reconcileLostObservations();
+        assert.equal(testApi.lostObservationSessions.has(resolve(reconcileSession)), false);
+        assert.equal(hasLostObservationMarker(reconcileSession), false);
       } finally {
         testApi.lostObservationSessions?.clear();
         testApi.pendingCleanups?.clear();
@@ -4672,6 +4759,7 @@ describe("rex.ts unit tests", () => {
             clearInterval(prevStatusInterval);
             (globalThis as any)[Symbol.for("pi-subagents/status-interval")] = null;
           }
+          __rexTest__.setRexExecutor(null);
           __rexTest__.setCommandAvailabilityOverride(undefined);
           __rexTest__.setRexContextOverride(undefined);
         }
@@ -4827,6 +4915,20 @@ describe("rex.ts unit tests", () => {
       assert.match(cancelledPres, /Sub-agent "cancelled-worker" was cancelled/);
       assert.doesNotMatch(cancelledPres, /pane closed externally/);
       assert.match(cancelledPres, /The session data was preserved/);
+
+      // (c) Interrupted run mentioning "cancelled" in summary/error is NOT mislabeled as user cancellation
+      const textMentionPres = testApi.resolveResultPresentation(
+        {
+          exitCode: 1,
+          elapsed: 12,
+          summary: "Agent checked if task was cancelled before pane was closed",
+          outcome: "interrupted",
+          errorMessage: "Subagent pane closed while checking if order was cancelled",
+        },
+        "mention-worker",
+      );
+      assert.match(textMentionPres, /Sub-agent "mention-worker" was interrupted/);
+      assert.doesNotMatch(textMentionPres, /was cancelled after/);
     });
   });
 });

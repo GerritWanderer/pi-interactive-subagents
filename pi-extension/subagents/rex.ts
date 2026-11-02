@@ -971,6 +971,18 @@ export async function pollForExit(
         }
         consecutiveErrors = 0; // reset only on valid process response
         if (proc.last_exit !== null && proc.last_exit !== undefined) {
+          // Late-sidecar discovery path: check if .exit sidecar was written while Rex query was running
+          if (options.sessionFile && !cachedSidecarResult) {
+            try {
+              const exitFile = `${options.sessionFile}.exit`;
+              if (existsSync(exitFile)) {
+                const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+                rmSync(exitFile, { force: true });
+                cachedSidecarResult = interpretExitSidecar(data);
+              }
+            } catch {}
+          }
+
           if (cachedSidecarResult) {
             // If process exited with a non-zero code, preserve the real exit code
             // while retaining the sidecar's error message/reason

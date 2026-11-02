@@ -26,6 +26,9 @@ import {
   shellEscape,
   readScreen,
   isRexInfrastructureError,
+  queryBlockProcess,
+  getSurfaceHandle,
+  getRexContext,
 } from "./rex.ts";
 
 import {
@@ -605,11 +608,8 @@ function resolveResultPresentation(
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
 
-  if (result.outcome === "interrupted") {
-    const isCancelled =
-      result.error === "cancelled" ||
-      result.errorMessage?.toLowerCase().includes("cancelled") ||
-      result.summary?.toLowerCase().includes("cancelled");
+  if (result.outcome === "interrupted" || (result.outcome as string) === "cancelled") {
+    const isCancelled = result.error === "cancelled" || (result.outcome as string) === "cancelled";
     if (isCancelled) {
       return (
         `Sub-agent "${name}" was cancelled after ${formatElapsed(result.elapsed)}.\n\n` +
@@ -657,7 +657,7 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
-  outcome?: "success" | "failure" | "interrupted";
+  outcome?: "success" | "failure" | "interrupted" | "cancelled";
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
@@ -702,12 +702,35 @@ const runningSubagents = new Map<string, RunningSubagent>();
 /** Set of resolved session file paths whose process observation was lost and not confirmed exited. */
 const lostObservationSessions = new Set<string>();
 
+interface LostObservationEntry {
+  sessionFile: string;
+  surface: string;
+  blockId?: string;
+  sessionId: string;
+}
+const lostObservationEntries = new Map<string, LostObservationEntry>();
+
 /** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended.
  * Throws if clearing the disk marker fails, preserving the in-memory guard.
  */
 export function confirmProcessEnded(sessionFile: string): void {
   clearLostObservationMarker(sessionFile);
   lostObservationSessions.delete(resolve(sessionFile));
+  lostObservationEntries.delete(resolve(sessionFile));
+}
+
+export function reconcileLostObservations(): void {
+  for (const [sessionPath, entry] of lostObservationEntries) {
+    if (!entry.blockId) continue;
+    try {
+      const proc = queryBlockProcess(entry.blockId, entry.sessionId);
+      if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
+        confirmProcessEnded(sessionPath);
+        lostObservationEntries.delete(sessionPath);
+        safeCloseSurface(entry.surface);
+      }
+    } catch {}
+  }
 }
 
 // When this extension is loaded inside a subagent that itself spawns children
@@ -736,6 +759,7 @@ let cleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 function processPendingCleanups(): void {
   cleanupRetryTimer = null;
+  reconcileLostObservations();
   for (const [surface, entry] of pendingCleanups) {
     try {
       closeSurface(surface);
@@ -1265,7 +1289,9 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   lostObservationSessions,
+  lostObservationEntries,
   confirmProcessEnded,
+  reconcileLostObservations,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1794,7 +1820,15 @@ async function watchSubagent(
       // Do NOT kill or close a potentially live agent!
       let markerError: any = null;
       if (sessionFile) {
-        lostObservationSessions.add(resolve(sessionFile));
+        const resolvedPath = resolve(sessionFile);
+        lostObservationSessions.add(resolvedPath);
+        const surfaceHandle = getSurfaceHandle(surface);
+        lostObservationEntries.set(resolvedPath, {
+          sessionFile,
+          surface,
+          blockId: surfaceHandle?.blockId,
+          sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
+        });
         try {
           writeLostObservationMarker(sessionFile);
         } catch (mErr: any) {
@@ -2330,6 +2364,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Guard: refuse resume if observation of the previous process was lost and not confirmed exited.
+        // First try to reconcile any pending lost observations before enforcing the guard.
+        reconcileLostObservations();
+
         // Check both in-memory set and persistent marker sidecar across restarts.
         if (lostObservationSessions.has(resolve(sessionPath)) || hasLostObservationMarker(sessionPath)) {
           const err =
