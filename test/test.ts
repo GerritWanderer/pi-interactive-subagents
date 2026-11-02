@@ -2510,6 +2510,12 @@ describe("subagent interruption", () => {
         summary: "Process observation unavailable",
         observationFailure: true,
       },
+      {
+        summary: "Observation disposed during session shutdown or reload.",
+        observationFailure: true,
+        outcome: "interrupted" as const,
+        error: "cancelled",
+      },
     ]) {
       const presentation = subagentsModule.__test__.resolveResultPresentation(
         { exitCode: 1, elapsed: 10, ...result },
@@ -2521,6 +2527,35 @@ describe("subagent interruption", () => {
       assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
       assert.doesNotMatch(presentation, /Follow up with subagent_message/);
     }
+  });
+
+  it("does not invite resume while an in-memory or persistent observation guard is active", async () => {
+    const { writeLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "guarded.jsonl");
+      for (const guard of ["in-memory", "disk-only"]) {
+        try {
+          if (guard === "in-memory") testApi.lostObservationSessions.add(resolve(sessionFile));
+          else writeLostObservationMarker(sessionFile);
+          const presentation = testApi.resolveResultPresentation(
+            {
+              exitCode: 1,
+              elapsed: 10,
+              summary: "Subagent cancelled.",
+              outcome: "interrupted",
+              error: "cancelled",
+              sessionFile,
+            },
+            "guarded-worker",
+          );
+          assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+          assert.doesNotMatch(presentation, /You can resume|Follow up with subagent_message/);
+        } finally {
+          testApi.confirmProcessEnded(sessionFile);
+        }
+      }
+    });
   });
 
   it("does not infer observation failure from summary or error text", () => {
@@ -3318,8 +3353,12 @@ describe("rex.ts unit tests", () => {
       assert.throws(() => closeSurface("tab-partial-fail"), /RPC connection failure/);
       const { getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
       assert.ok(getSurfaceHandle("tab-partial-fail"), "handle must remain registered when close fails");
-      unregisterSurfaceHandle("tab-partial-fail");
     } finally {
+      for (const id of ["tab-lone", "tab-multi", "tab-err", "tab-partial-zero", "tab-partial-one", "tab-partial-multi", "tab-partial-fail"]) {
+        unregisterSurfaceHandle(id);
+      }
+      __rexTest__.setRexContextOverride(null);
+      __rexTest__.setCommandAvailabilityOverride(null);
       __rexTest__.setRexExecutor(null);
     }
   });
@@ -5087,7 +5126,22 @@ describe("subagent watcher disposal", () => {
         } else {
           controller.abort();
         }
-        await watcher;
+        const watcherResult = await watcher;
+        const presentation = testApi.resolveResultPresentation(watcherResult, id);
+        assert.equal(watcherResult.outcome, "interrupted");
+        if (reason === "cancellation") {
+          assert.equal(watcherResult.error, "cancelled");
+          assert.notEqual(watcherResult.observationFailure, true);
+          assert.match(presentation, /You can resume the session with subagent_message/);
+        } else {
+          assert.equal(watcherResult.error, "observation_lost");
+          assert.equal(watcherResult.observationFailure, true);
+          assert.equal(watcherResult.summary,
+            "Observation disposed during session shutdown or reload. The pane was kept open and resume is blocked until process exit is confirmed.");
+          assert.ok(presentation.includes(watcherResult.summary));
+          assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+          assert.doesNotMatch(presentation, /was cancelled|You can resume|Follow up with subagent_message/);
+        }
         assert.equal(testApi.runningSubagents.has(id), false, "disposed watchers must stop tracking");
         const closes = calls.filter((args) => args[1] === "close");
         assert.equal(closes.length, reason === "cancellation" ? 1 : 0,
@@ -5293,6 +5347,83 @@ describe("lost-observation reconciliation timers", () => {
       }
     });
   }
+
+  it("retains unqueryable guards without retrying and unrefs queryable retries", async (t) => {
+    const { writeLostObservationMarker, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    const { api } = createMockExtensionApi();
+    let shutdown: () => void = () => {};
+    api.on = (event: string, handler: () => void) => {
+      if (event === "session_shutdown") shutdown = handler;
+    };
+    subagentsModule.default(api);
+    shutdown();
+    const savedLost = new Set(testApi.lostObservationSessions);
+    const savedEntries = new Map(testApi.lostObservationEntries);
+    const dir = createTestDir();
+    const scheduled = t.mock.method(globalThis, "setTimeout");
+    let processQueries = 0;
+    let processExited = false;
+
+    try {
+      testApi.lostObservationSessions.clear();
+      testApi.lostObservationEntries.clear();
+      __rexTest__.setRexExecutor(() => {
+        processQueries++;
+        return JSON.stringify({ last_exit: processExited ? { exit_code: 0 } : null });
+      });
+      const unqueryable = [
+        { blockId: undefined, sessionId: "session:mock" },
+        { blockId: "", sessionId: "session:mock" },
+        { blockId: " \t ", sessionId: "session:mock" },
+        { blockId: "block:mock", sessionId: "" },
+        { blockId: "block:mock", sessionId: " \t " },
+      ];
+      const guardedSessions = unqueryable.map((coordinates, i) => {
+        const sessionFile = join(dir, `unqueryable-${i}.jsonl`);
+        writeLostObservationMarker(sessionFile, coordinates);
+        testApi.lostObservationSessions.add(sessionFile);
+        testApi.lostObservationEntries.set(sessionFile, { sessionFile, surface: "", ...coordinates });
+        return sessionFile;
+      });
+
+      for (let i = 0; i < 3; i++) testApi.reconcileLostObservations();
+      assert.equal(processQueries, 0, "missing coordinates must not be queried");
+      assert.equal(scheduled.mock.callCount(), 0, "unqueryable entries must not schedule retry timers");
+
+      const queryableSession = join(dir, "queryable.jsonl");
+      testApi.lostObservationSessions.add(queryableSession);
+      testApi.lostObservationEntries.set(queryableSession, {
+        sessionFile: queryableSession, surface: "", blockId: "block:mock", sessionId: "session:mock",
+      });
+      testApi.reconcileLostObservations();
+      assert.equal(processQueries, 1);
+      assert.equal(scheduled.mock.callCount(), 1, "queryable entries still need background reconciliation");
+      const retryTimer = scheduled.mock.calls[0].result;
+      assert.ok(retryTimer);
+      assert.equal(retryTimer.hasRef(), false, "retries must not keep Node alive");
+
+      processExited = true;
+      testApi.reconcileLostObservations();
+      assert.equal(processQueries, 2);
+      assert.equal(scheduled.mock.callCount(), 1, "no new timer is needed after the last queryable entry ends");
+      assert.equal(testApi.lostObservationEntries.size, guardedSessions.length);
+      for (const sessionFile of guardedSessions) {
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true, "unqueryable guards must stay on disk");
+      }
+    } finally {
+      shutdown();
+      testApi.lostObservationSessions.clear();
+      for (const value of savedLost) testApi.lostObservationSessions.add(value);
+      testApi.lostObservationEntries.clear();
+      for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
+      __rexTest__.setRexContextOverride(null);
+      __rexTest__.setCommandAvailabilityOverride(null);
+      __rexTest__.setRexExecutor(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("keeps one retry chain across direct calls and cancels it on shutdown", async (t) => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");

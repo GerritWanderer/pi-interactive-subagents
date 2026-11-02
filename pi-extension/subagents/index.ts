@@ -597,6 +597,18 @@ function resolveResultPresentation(
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
 
+  if (
+    result.observationFailure === true ||
+    (result.sessionFile &&
+      (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile)))
+  ) {
+    return (
+      `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
+      `${result.summary}\n\n` +
+      `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
+    );
+  }
+
   if (result.outcome === "interrupted" || (result.outcome as string) === "cancelled") {
     const isCancelled = result.error === "cancelled" || (result.outcome as string) === "cancelled";
     if (isCancelled) {
@@ -610,14 +622,6 @@ function resolveResultPresentation(
       `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
       `(pane closed externally before completion).${detail}\n\n` +
       `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
-    );
-  }
-
-  if (result.observationFailure === true) {
-    return (
-      `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
-      `${result.summary}\n\n` +
-      `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
     );
   }
 
@@ -749,6 +753,17 @@ function recordLostObservation(running: RunningSubagent): Error | null {
 
 let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
+function scheduleLostObservationReconciliation(): void {
+  // Missing process coordinates must keep their safety guard, but cannot be polled.
+  const hasQueryableEntry = Array.from(lostObservationEntries.values()).some(
+    (entry) => entry.blockId?.trim() && entry.sessionId?.trim(),
+  );
+  if (hasQueryableEntry && !reconcileRetryTimer) {
+    reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
+    reconcileRetryTimer.unref?.();
+  }
+}
+
 export function reconcileLostObservations(sessionPathCheck?: string): void {
   if (reconcileRetryTimer) {
     clearTimeout(reconcileRetryTimer);
@@ -778,9 +793,7 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
       }
     } catch {}
   }
-  if (lostObservationEntries.size > 0 && !reconcileRetryTimer) {
-    reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
-  }
+  scheduleLostObservationReconciliation();
   if (
     reconciled &&
     sessionPathCheck === undefined &&
@@ -1883,10 +1896,13 @@ async function watchSubagent(
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: moduleSignal.aborted
+          ? "Observation disposed during session shutdown or reload. The pane was kept open and resume is blocked until process exit is confirmed."
+          : "Subagent cancelled.",
+        ...(moduleSignal.aborted ? { observationFailure: true } : {}),
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: moduleSignal.aborted ? "observation_lost" : "cancelled",
         outcome: "interrupted",
         sessionFile,
       };
@@ -1896,9 +1912,7 @@ async function watchSubagent(
       // Sustained infrastructure failure observing the process.
       // Do NOT kill or close a potentially live agent!
       const markerError = recordLostObservation(running);
-      if (sessionFile && !reconcileRetryTimer) {
-        reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
-      }
+      scheduleLostObservationReconciliation();
       runningSubagents.delete(running.id);
       const errorMsg = markerError
         ? `${err?.message ?? String(err)} (and failed to persist safety marker: ${markerError?.message ?? String(markerError)})`
