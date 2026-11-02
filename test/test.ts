@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -3335,6 +3335,111 @@ describe("rex.ts unit tests", () => {
       assert.deepEqual(executedCommands[executedCommands.length - 1], [
         "block", "close", "-s", "session:test", "block:err-1",
       ]);
+
+      // 4. Partial tab creation (windowId exists, blockId absent):
+      // 4a. Zero blocks in window -> window close
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({ layers: [{ blocks: [] }] });
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-partial-zero",
+        kind: "tab",
+        name: "partial-zero",
+        sessionId: "session:test",
+        windowId: "window:w-partial-zero",
+        status: "launched",
+      });
+
+      closeSurface("tab-partial-zero");
+      assert.deepEqual(executedCommands[executedCommands.length - 1], [
+        "window", "close", "-s", "session:test", "window:w-partial-zero",
+      ]);
+      assert.equal(unregisterSurfaceHandle("tab-partial-zero"), undefined);
+
+      // 4b. One block in window -> window close
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({ layers: [{ blocks: [{ block_id: "block:b1" }] }] });
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-partial-one",
+        kind: "tab",
+        name: "partial-one",
+        sessionId: "session:test",
+        windowId: "window:w-partial-one",
+        status: "launched",
+      });
+
+      closeSurface("tab-partial-one");
+      assert.deepEqual(executedCommands[executedCommands.length - 1], [
+        "window", "close", "-s", "session:test", "window:w-partial-one",
+      ]);
+
+      // 4c. Multiple blocks in window -> do NOT close window, do not unregister if close fails
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({
+            layers: [{ blocks: [{ block_id: "block:b1" }, { block_id: "block:b2" }] }],
+          });
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-partial-multi",
+        kind: "tab",
+        name: "partial-multi",
+        sessionId: "session:test",
+        windowId: "window:w-partial-multi",
+        status: "launched",
+      });
+
+      closeSurface("tab-partial-multi");
+      assert.equal(
+        executedCommands.some((c) => c[0] === "window" && c[1] === "close"),
+        false,
+        "must not close window when partial creation window has more than 1 block",
+      );
+
+      // 4d. Do not unregister handle if close throws unexpected error
+      executedCommands.length = 0;
+      __rexTest__.setRexExecutor((args) => {
+        executedCommands.push(args);
+        if (args[0] === "window" && args[1] === "inspect") {
+          return JSON.stringify({ layers: [{ blocks: [] }] });
+        }
+        if (args[0] === "window" && args[1] === "close") {
+          throw new Error("RPC connection failure");
+        }
+        return "";
+      });
+
+      registerSurfaceHandle({
+        id: "tab-partial-fail",
+        kind: "tab",
+        name: "partial-fail",
+        sessionId: "session:test",
+        windowId: "window:w-partial-fail",
+        status: "launched",
+      });
+
+      assert.throws(() => closeSurface("tab-partial-fail"), /RPC connection failure/);
+      const { getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      assert.ok(getSurfaceHandle("tab-partial-fail"), "handle must remain registered when close fails");
+      unregisterSurfaceHandle("tab-partial-fail");
     } finally {
       __rexTest__.setRexExecutor(null);
     }
@@ -4186,15 +4291,61 @@ describe("rex.ts unit tests", () => {
         assert.equal(hasLostObservationMarker(infraRunning.sessionFile), false);
 
         // Verify hasLostObservationMarker fails closed when read/stat throws
-        const { lostObservationMarkerPath } = await import("../pi-extension/subagents/session.ts");
+        const { lostObservationMarkerPath, __setStatSyncOverride } = await import("../pi-extension/subagents/session.ts");
         const markerPath = lostObservationMarkerPath(infraRunning.sessionFile);
-        // Create marker as an unreadable/faulty file or simulate error by mocking
-        // Test fails closed behavior directly
-        const origExistsSync = (await import("node:fs")).existsSync;
+        // Test fails closed behavior directly by mocking statSync with non-ENOENT error
+        try {
+          __setStatSyncOverride((p: string) => {
+            if (p === markerPath) {
+              const err = new Error("Permission denied") as any;
+              err.code = "EACCES";
+              throw err;
+            }
+            return statSync(p);
+          });
+          assert.equal(hasLostObservationMarker(infraRunning.sessionFile), true, "hasLostObservationMarker must fail closed on EACCES");
+        } finally {
+          __setStatSyncOverride(null);
+        }
+
         // Verify write failure handling in watchSubagent
-        const readOnlySession = join(dir, "readonly-dir", "sess.jsonl");
+        const readOnlyDir = join(dir, "readonly-dir");
+        mkdirSync(readOnlyDir, { recursive: true });
+        const readOnlySession = join(readOnlyDir, "sess-unwritable.jsonl");
+        writeFileSync(readOnlySession, JSON.stringify(SESSION_HEADER) + "\n");
+        const failingRunning = {
+          id: "child-failing-writer",
+          name: "failing-agent",
+          task: "failing task",
+          surface: "cleanup-res-surface",
+          startTime: Date.now(),
+          sessionFile: readOnlySession,
+          interactive: false,
+          statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        };
+
+        const { writeLostObservationMarker, __setWriteFileSyncOverride } = await import("../pi-extension/subagents/session.ts");
+        try {
+          __setWriteFileSyncOverride(((p: string, ...rest: any[]) => {
+            if (typeof p === "string" && p.endsWith(".lost-observation")) {
+              const err = new Error("Disk full or permission denied") as any;
+              err.code = "EIO";
+              throw err;
+            }
+            return (writeFileSync as any)(p, ...rest);
+          }) as any);
+
+          const writeFailRes = await testApi.watchSubagent(failingRunning, new AbortController().signal);
+          assert.equal(writeFailRes.outcome, "failure");
+          assert.match(writeFailRes.summary, /Infrastructure observation failure/);
+          assert.match(writeFailRes.summary, /failed to persist safety marker/);
+          // Infrastructure failure must still be recorded in in-memory guard
+          assert.ok(testApi.lostObservationSessions.has(resolve(readOnlySession)));
+        } finally {
+          __setWriteFileSyncOverride(null);
+        }
+
         // writeLostObservationMarker throws when target directory does not exist
-        const { writeLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
         assert.throws(() => writeLostObservationMarker("/nonexistent-dir/session.jsonl"));
       } finally {
         testApi.lostObservationSessions?.clear();

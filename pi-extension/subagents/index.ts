@@ -702,7 +702,9 @@ const runningSubagents = new Map<string, RunningSubagent>();
 /** Set of resolved session file paths whose process observation was lost and not confirmed exited. */
 const lostObservationSessions = new Set<string>();
 
-/** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended. */
+/** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended.
+ * Throws if clearing the disk marker fails, preserving the in-memory guard.
+ */
 export function confirmProcessEnded(sessionFile: string): void {
   clearLostObservationMarker(sessionFile);
   lostObservationSessions.delete(resolve(sessionFile));

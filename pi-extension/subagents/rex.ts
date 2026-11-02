@@ -770,30 +770,53 @@ export function closeSurface(surface: string): void {
 
   try {
     if (handle.kind === "tab" && handle.windowId) {
-      // Default to safe behavior: close window ONLY if inspection explicitly succeeds,
-      // layers is a non-empty array, and extracting all blocks across all layers results
-      // in an array containing EXACTLY ONE block whose block_id matches handle.blockId.
-      // In ALL OTHER CASES (missing layers, empty layers, 0 blocks found, > 1 blocks found,
-      // any other block_id present, or inspection thrown/failed), close ONLY handle.blockId!
-      let canCloseWindowSafely = false;
-      try {
-        const raw = rexExec(["window", "inspect", "-s", handle.sessionId, handle.windowId, "--json"]);
-        const win = JSON.parse(raw);
-        if (Array.isArray(win?.layers) && win.layers.length > 0) {
-          const blocks = win.layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
-          if (blocks.length === 1 && blocks[0]?.block_id === handle.blockId) {
-            canCloseWindowSafely = true;
+      if (handle.blockId) {
+        // Normal tab with known block:
+        // Default to safe behavior: close window ONLY if inspection explicitly succeeds,
+        // layers is a non-empty array, and extracting all blocks across all layers results
+        // in an array containing EXACTLY ONE block whose block_id matches handle.blockId.
+        // In ALL OTHER CASES (missing layers, empty layers, 0 blocks found, > 1 blocks found,
+        // any other block_id present, or inspection thrown/failed), close ONLY handle.blockId!
+        let canCloseWindowSafely = false;
+        try {
+          const raw = rexExec(["window", "inspect", "-s", handle.sessionId, handle.windowId, "--json"]);
+          const win = JSON.parse(raw);
+          if (Array.isArray(win?.layers) && win.layers.length > 0) {
+            const blocks = win.layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
+            if (blocks.length === 1 && blocks[0]?.block_id === handle.blockId) {
+              canCloseWindowSafely = true;
+            }
           }
+        } catch {
+          // Inspection failed or window target not found; do NOT close the entire window
+          canCloseWindowSafely = false;
         }
-      } catch {
-        // Inspection failed or window target not found; do NOT close the entire window
-        canCloseWindowSafely = false;
-      }
 
-      if (canCloseWindowSafely) {
-        rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
-      } else if (handle.blockId) {
-        rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
+        if (canCloseWindowSafely) {
+          rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
+        } else {
+          rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
+        }
+      } else {
+        // Partial tab creation failure (windowId exists, blockId absent):
+        // Inspect the window. If the window has zero or one block, close the window.
+        let canClosePartialWindow = false;
+        try {
+          const raw = rexExec(["window", "inspect", "-s", handle.sessionId, handle.windowId, "--json"]);
+          const win = JSON.parse(raw);
+          if (Array.isArray(win?.layers)) {
+            const blocks = win.layers.flatMap((l: any) => (Array.isArray(l?.blocks) ? l.blocks : []));
+            if (blocks.length <= 1) {
+              canClosePartialWindow = true;
+            }
+          }
+        } catch {
+          canClosePartialWindow = false;
+        }
+
+        if (canClosePartialWindow) {
+          rexExec(["window", "close", "-s", handle.sessionId, handle.windowId]);
+        }
       }
     } else if (handle.blockId) {
       rexExec(["block", "close", "-s", handle.sessionId, handle.blockId]);
@@ -848,7 +871,10 @@ export function queryBlockProcess(blockId: string, session: string): RexProcessO
   } catch (error: any) {
     const msg = error?.message || String(error);
     const stderr = error?.stderr || "";
-    if (/not found/i.test(msg) || /not found/i.test(stderr)) {
+    const combined = `${msg}\n${stderr}`;
+    const escapedBlockId = blockId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const blockNotFoundPattern = new RegExp(`block\\s+.*${escapedBlockId}.*\\s+not found|block target .* not found|block not found`, "i");
+    if (blockNotFoundPattern.test(combined)) {
       return "not_found";
     }
     throw error;
