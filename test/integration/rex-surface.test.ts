@@ -44,6 +44,9 @@ import {
 } from "../../pi-extension/subagents/rex.ts";
 import { planEqualShares } from "../../pi-extension/subagents/rex-sizing.ts";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Deliberate top-level identities, independent of the test runner's ancestry.
 function mainSurface(env: TestEnv, name: string): string {
@@ -95,6 +98,98 @@ for (const backend of backends) {
       cleanupTestEnv(env);
     });
 
+    for (const mode of ["automatic", "disabled", "settings-override"] as const) {
+      it(`source-loaded Pi uses native capabilities/status (${mode}), without model requests or config changes`, async () => {
+        const initialFocus = getFocusedSurface();
+        const dir = mkdtempSync(join(env.dir, "native-pi-"));
+        const agentDir = join(dir, "agent");
+        mkdirSync(agentDir);
+        const disabled = mode === "settings-override";
+        const settings = JSON.stringify({
+          theme: "dark", tuiMode: "regular", quietStartup: true,
+          lastChangelogVersion: execFileSync("pi", ["--version"], { encoding: "utf8" }).trim(),
+          terminal: { hyperlinks: disabled ? false : "auto", images: disabled ? false : "auto", trueColor: disabled ? false : "auto" },
+        });
+        const settingsFile = join(agentDir, "settings.json");
+        writeFileSync(settingsFile, settings);
+        const source = fileURLToPath(new URL("../../pi-extension/subagents/index.ts", import.meta.url));
+        const fixture = fileURLToPath(new URL("./fixtures/native-pi.ts", import.meta.url));
+        const { shellEscape } = await import("../../pi-extension/subagents/rex.ts");
+        const log = join(dir, "native-output.log");
+        const surface = mainSurface(env, `native-pi-${mode}`);
+        // Scrub inherited identities/overrides in this isolated fixture only. In
+        // production, explicit user overrides are preserved by sendLongCommand.
+        const unset = "unset PI_SUBAGENT_NAME PI_SUBAGENT_AUTO_EXIT PI_SUBAGENT_ALLOWED PI_SUBAGENT_AGENT PI_SUBAGENT_SESSION PI_SUBAGENT_ID PI_SUBAGENT_ACTIVITY_FILE PI_SUBAGENT_SURFACE PI_PROGRAM_STATUS PI_HYPERLINKS PI_IMAGE_PROTOCOL PI_TRUE_COLOR TMUX STY;";
+        const overrides = mode === "disabled" ? "PI_PROGRAM_STATUS=0" : disabled ? "PI_HYPERLINKS=1 PI_IMAGE_PROTOCOL=kitty PI_TRUE_COLOR=1" : "";
+        sendLongCommand(surface, `${unset}\nexec env PI_CODING_AGENT_DIR=${shellEscape(agentDir)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 PI_TUI_WRITE_LOG=${shellEscape(log)} ${overrides} pi -ne -e ${shellEscape(source)} -e ${shellEscape(fixture)} --no-skills --no-prompt-templates --no-themes --no-session`, {
+          cwd: dir, scriptPath: join(dir, "launch.sh"),
+        });
+        const handle = getSurfaceHandle(surface)!;
+        try {
+          const stateFile = join(dir, "native-state.json");
+          const deadline = Date.now() + 15_000;
+          while (!existsSync(stateFile) && Date.now() < deadline) await sleep(100);
+          assert.ok(existsSync(stateFile), `Pi startup failed: ${await readScreenAsync(surface, 60)}`);
+          const state = JSON.parse(readFileSync(stateFile, "utf8"));
+          assert.equal(state.termProgram, "rex", "must exercise real Rex environment detection");
+          assert.ok(state.tools.includes("subagent"), "workspace source must be loaded");
+          assert.deepEqual(state.capabilities, disabled
+            ? { images: null, trueColor: false, hyperlinks: false }
+            : { images: "kitty", trueColor: true, hyperlinks: true });
+          assert.equal(state.programStatus, mode === "disabled" ? "0" : null);
+          await waitForScreen(surface, /NATIVE_REX_COLOR/, 10_000);
+          const stream = readFileSync(log, "utf8");
+          if (disabled) {
+            assert.doesNotMatch(stream, /\x1b\]8;;https:\/\/www\.superlogical\.com\/rex/);
+            assert.doesNotMatch(stream, /\x1b_G/);
+            assert.doesNotMatch(stream, /\x1b\[38;2;18;52;86m/);
+          } else {
+            assert.match(stream, /\x1b\]8;;https:\/\/www\.superlogical\.com\/rex/);
+            assert.match(stream, /\x1b\[38;2;18;52;86m/);
+            assert.match(stream, /\x1b_G[^\x1b]*a=T/, "Pi's Image component must transmit Kitty graphics");
+            // Rex's own capture confirms the link/color reached its terminal model.
+            const html = rexExec(["capture", "-s", handle.sessionId, "-b", handle.blockId!, "--format=html", "--trim"]);
+            assert.match(html, /NATIVE_REX_LINK/);
+            assert.match(html, /href="https:\/\/www\.superlogical\.com\/rex"/);
+            assert.match(html, /(?:#123456|rgb\(18,\s*52,\s*86\))/i);
+          }
+          if (mode === "disabled") {
+            assert.deepEqual(queryProgramStatus(handle.blockId!, handle.sessionId), []);
+            assert.throws(() => sendMessage(surface, "/hotkeys"), /PI_PROGRAM_STATUS.*OSC 7501/);
+            const processState = queryBlockProcess(handle.blockId!, handle.sessionId);
+            assert.notEqual(processState, "not_found");
+            assert.equal(processState !== "not_found" && processState.last_exit, null);
+          } else {
+            let records = queryProgramStatus(handle.blockId!, handle.sessionId);
+            const statusDeadline = Date.now() + 5000;
+            while (!records.some((record) => record.app === "pi" && record.state === "idle") && Date.now() < statusDeadline) {
+              await sleep(100);
+              records = queryProgramStatus(handle.blockId!, handle.sessionId);
+            }
+            assert.ok(records.some((record) => record.app === "pi" && record.state === "idle"), JSON.stringify(records));
+            sendMessage(surface, "/hotkeys");
+            await waitForScreen(surface, /Slash commands/, 10_000);
+            if (mode === "automatic") {
+              sendMessage(surface, "/native-smoke-dialog");
+              let blockedRecords = queryProgramStatus(handle.blockId!, handle.sessionId);
+              const blockedDeadline = Date.now() + 5000;
+              while (!blockedRecords.some((record) => record.state === "blocked") && Date.now() < blockedDeadline) {
+                await sleep(100);
+                blockedRecords = queryProgramStatus(handle.blockId!, handle.sessionId);
+              }
+              assert.ok(blockedRecords.some((record) => record.state === "blocked"), JSON.stringify(blockedRecords));
+              assert.throws(() => sendMessage(surface, "must not reach dialog"), /blocked on a .*dialog/);
+            }
+          }
+          assert.equal(existsSync(join(dir, "unexpected-provider-request")), false);
+          assert.equal(readFileSync(settingsFile, "utf8"), settings, "Pi choices must not be rewritten");
+          assert.equal(getFocusedSurface(), initialFocus);
+        } finally {
+          closeSurface(surface);
+        }
+      });
+    }
+
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
       const initialFocus = getFocusedSurface();
       assert.ok(initialFocus, "expected to read currently focused block");
@@ -142,6 +237,8 @@ for (const backend of backends) {
 
       const topTab = getSurfaceTab(top);
       assert.ok(topTab, "expected to read top surface window id");
+      const labeled = rexJson(["block", "inspect", "-s", ctx.session!, topHandle!.blockId!, "--json"]);
+      assert.equal(labeled.block.label, "tab-top-level", "the command pane must share the named tab's agent label");
 
       // Verify top-level window is different from the spawner's window
       const rexModule = await import("../../pi-extension/subagents/rex.ts");
@@ -179,6 +276,40 @@ for (const backend of backends) {
         else process.env.REX_BLOCK = savedBlock;
       }
     });
+
+    for (const label of ["-agent-name", "--dash-name"]) {
+      it(`preserves the leading-dash label ${JSON.stringify(label)} on tabs and nested panes`, async () => {
+        const initialFocus = getFocusedSurface();
+        const top = mainSurface(env, label);
+        let nested: string | undefined;
+        try {
+          sendLongCommand(top, 'echo "DASH_TOP_READY"');
+          await waitForScreen(top, /DASH_TOP_READY/, 10_000, 20);
+          const topHandle = getSurfaceHandle(top)!;
+          assert.equal(topHandle.kind, "tab");
+          assert.equal(topHandle.name, label);
+          const view = rexJson(["session", "inspect", topHandle.sessionId, "--json"]);
+          const tab = view.windows.find((w: any) => w.window_id === topHandle.windowId);
+          assert.equal(tab?.label, label, "the temporary tab label must be replaced with the exact requested name");
+          const pane = rexJson(["block", "inspect", "-s", topHandle.sessionId, topHandle.blockId!, "--json"]);
+          assert.equal(pane.block.label, label, "the command pane must retain the leading dashes");
+
+          nested = createTrackedSurfaceSplit(env, label, "right", top);
+          sendLongCommand(nested, 'echo "DASH_NESTED_READY"');
+          await waitForScreen(nested, /DASH_NESTED_READY/, 10_000, 20);
+          const nestedHandle = getSurfaceHandle(nested)!;
+          assert.equal(nestedHandle.kind, "split");
+          assert.equal(nestedHandle.name, label);
+          const nestedPane = rexJson(["block", "inspect", "-s", nestedHandle.sessionId, nestedHandle.blockId!, "--json"]);
+          assert.equal(nestedPane.block.label, label, "split labels must also retain the leading dashes");
+          assert.equal(nestedPane.block.window_id, topHandle.windowId);
+          assert.equal(getFocusedSurface(), initialFocus, "labeling must not change focus");
+        } finally {
+          if (nested) closeSurface(nested);
+          closeSurface(top);
+        }
+      });
+    }
 
     it("launches command directly, reads output, queries process, and closes cleanly", async () => {
       const surface = createTrackedSurface(env, "exec-test");

@@ -1,10 +1,14 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import {
+  visibleWidth, detectCapabilities, getCapabilities, setCapabilityOverrides,
+  resetCapabilitiesCache, getTerminalColorMode, hyperlink,
+} from "@earendil-works/pi-tui";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -30,8 +34,11 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape, __rexTest__, disposeRexSurfaces } from "../pi-extension/subagents/rex.ts";
+import {
+  shellEscape, __rexTest__, disposeRexSurfaces, registerSurfaceHandle, unregisterSurfaceHandle,
+} from "../pi-extension/subagents/rex.ts";
 import { planEqualShares, type RexLayoutNode } from "../pi-extension/subagents/rex-sizing.ts";
+import { createTestEnv, cleanupTestEnv, TEST_MODEL } from "./integration/harness.ts";
 
 // A cosmetic timer from one fixture must not run with the next fixture's executor.
 afterEach(() => disposeRexSurfaces());
@@ -2956,6 +2963,327 @@ describe("Rex equal-share sizing (public session.view layout)", () => {
   });
 });
 
+describe("integration harness profile guards", () => {
+  function assertProfiles(dir: string, model: string): string[] {
+    const agentsDir = join(dir, ".pi/agents");
+    const files = readdirSync(agentsDir).filter((file) => file.endsWith(".md"));
+    assert.ok(files.length > 0);
+    for (const file of files) {
+      const content = readFileSync(join(agentsDir, file), "utf8");
+      const frontmatter = content.match(/^---\n([\s\S]*?)\n---(?=\n|$)/)?.[1];
+      assert.ok(frontmatter, `${file} must have frontmatter`);
+      assert.deepEqual(frontmatter.match(/^model:.*$/gm), [`model: ${model}`], file);
+      assert.deepEqual(frontmatter.match(/^thinking:.*$/gm), ["thinking: off"], file);
+    }
+    return files;
+  }
+
+  it("rewrites every copied test profile with TEST_MODEL and thinking off", () => {
+    const env = createTestEnv();
+    try {
+      const source = fileURLToPath(new URL("./integration/agents", import.meta.url));
+      assert.deepEqual(assertProfiles(env.dir, TEST_MODEL), readdirSync(source).filter((file) => file.endsWith(".md")));
+    } finally {
+      cleanupTestEnv(env);
+    }
+  });
+
+  it("replaces or adds LF and CRLF frontmatter settings with a literal special-character TEST_MODEL", async () => {
+    const model = "test/model-$&-$$-$`-$'";
+    const previousModel = process.env.PI_TEST_MODEL;
+    try {
+      process.env.PI_TEST_MODEL = model;
+      // TEST_MODEL is read at module initialization; use a fresh module instance.
+      const harness: typeof import("./integration/harness.ts") = await import(
+        new URL("./integration/harness.ts?profile-guard-test", import.meta.url).href
+      );
+      assert.equal(harness.TEST_MODEL, model);
+      withTempDir((agentsSrc) => {
+        const profiles = {
+          "existing-thinking": "model: unapproved/model\nthinking: high",
+          "missing-thinking": "model: unapproved/model",
+          "missing-model": "thinking: high",
+          "missing-both": "description: no model or thinking",
+          "empty-frontmatter": "",
+        };
+        const body = "Preserve these body examples:\nmodel: body/model\nthinking: high";
+        for (const [name, frontmatter] of Object.entries(profiles)) {
+          writeAgentFile(agentsSrc, name, frontmatter, body);
+          const content = readFileSync(join(agentsSrc, `${name}.md`), "utf8");
+          writeFileSync(join(agentsSrc, `${name}-crlf.md`), content.replace(/\n/g, "\r\n"));
+        }
+        const names = Object.keys(profiles).flatMap((name) => [name, `${name}-crlf`]);
+        writeFileSync(join(agentsSrc, "ignored.txt"), "not an agent");
+        const env = harness.createTestEnv({ agentsSrc });
+        try {
+          assert.deepEqual(assertProfiles(env.dir, harness.TEST_MODEL).sort(), names.map((name) => `${name}.md`).sort());
+          for (const name of names) {
+            const file = `${name}.md`;
+            const copied = readFileSync(join(env.dir, ".pi/agents", file), "utf8");
+            assert.ok(copied.endsWith(`\n\n${body}\n`), `${file} body must be unchanged`);
+            assert.ok(!readFileSync(join(agentsSrc, file), "utf8").includes(model), `${file} source must be unchanged`);
+          }
+          assert.equal(existsSync(join(env.dir, ".pi/agents/ignored.txt")), false);
+        } finally {
+          harness.cleanupTestEnv(env);
+        }
+      });
+    } finally {
+      restoreEnvVar("PI_TEST_MODEL", previousModel);
+    }
+  });
+});
+
+describe("integration harness setup rollback", () => {
+  let originalEnv: NodeJS.ProcessEnv;
+  let savedContext: NodeJS.ProcessEnv;
+  let dir: string | undefined;
+  let calls: string[][];
+  let response: unknown;
+  let newError: Error | undefined;
+  let killError: Error | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env;
+    process.env = {
+      ...originalEnv,
+      REX_SESSION: "session:caller",
+      REX_BLOCK: "block:caller",
+      PI_SUBAGENT_SETUP_TEST: "caller",
+    };
+    savedContext = { ...process.env };
+    dir = undefined;
+    calls = [];
+    response = { session_id: "session:owned", initial_windows: [{ block_ids: ["block:owned"] }] };
+    newError = undefined;
+    killError = undefined;
+    __rexTest__.setRexExecutor((args) => {
+      calls.push(args);
+      if (args[0] === "new") {
+        dir = args[args.indexOf("-c") + 1];
+        assert.equal(existsSync(join(dir, ".pi", "agents")), true);
+        assert.deepEqual(process.env, savedContext, "context must not change before Rex setup");
+        if (newError) throw newError;
+        return JSON.stringify(response) ?? "";
+      }
+      assert.deepEqual(args, ["kill", "session:owned"]);
+      if (killError) throw killError;
+      return "";
+    });
+  });
+
+  afterEach(() => {
+    __rexTest__.setRexExecutor(null);
+    process.env = originalEnv;
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const malformedResponses = [
+    ["null response", null, false],
+    ["missing session ID", { initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["numeric session ID", { session_id: 42, initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["blank session ID", { session_id: "  ", initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["missing windows", { session_id: "session:owned" }, true],
+    ["empty windows", { session_id: "session:owned", initial_windows: [] }, true],
+    ["non-array windows", { session_id: "session:owned", initial_windows: { 0: { block_ids: ["block:owned"] } } }, true],
+    ...[
+      ["missing block IDs", {}],
+      ["null block IDs", { block_ids: null }],
+      ["empty block IDs", { block_ids: [] }],
+      ["non-array block IDs", { block_ids: "block:owned" }],
+      ["null block ID", { block_ids: [null] }],
+      ["numeric block ID", { block_ids: [42] }],
+      ["object block ID", { block_ids: [{}] }],
+      ["empty block ID", { block_ids: [""] }],
+      ["blank block ID", { block_ids: ["  "] }],
+    ].map(([name, window]) => [name, { session_id: "session:owned", initial_windows: [window] }, true]),
+  ] as const;
+
+  for (const [name, malformed, ownsSession] of malformedResponses) {
+    it(`rolls back ${name} without mutating caller context`, () => {
+      response = malformed;
+      const writes: PropertyKey[] = [];
+      process.env = new Proxy(process.env, {
+        set(target, key, value) {
+          writes.push(key);
+          return Reflect.set(target, key, value);
+        },
+        deleteProperty(target, key) {
+          writes.push(key);
+          return Reflect.deleteProperty(target, key);
+        },
+      });
+
+      assert.throws(() => createTestEnv({ isolateRex: true }), /Invalid Rex test session response/);
+      assert.equal(calls.length, ownsSession ? 2 : 1);
+      assert.equal(existsSync(dir!), false, "failed fixture directory must be removed");
+      assert.deepEqual(process.env, savedContext);
+      assert.deepEqual(writes, [], "invalid responses must be rejected before environment mutations");
+    });
+  }
+
+  it("removes the fixture directory when rex new throws", () => {
+    newError = new Error("rex new failed");
+    assert.throws(() => createTestEnv({ isolateRex: true }), (error) => error === newError);
+    assert.equal(calls.length, 1, "no session ID is available to kill");
+    assert.equal(existsSync(dir!), false);
+    assert.deepEqual(process.env, savedContext);
+  });
+
+  for (const killFails of [false, true]) {
+    it(`restores partially modified context when setup fails${killFails ? " even if session kill fails" : ""}`, (t) => {
+      const setupError = new Error("environment setup failed");
+      const warning = t.mock.method(console, "warn", () => {});
+      if (killFails) killError = new Error("kill failed");
+      process.env = new Proxy(process.env, {
+        set(target, key, value) {
+          if (key === "REX_BLOCK" && value === "block:owned") {
+            assert.equal(target.REX_SESSION, "session:owned");
+            assert.equal(target.PI_SUBAGENT_SETUP_TEST, undefined);
+            throw setupError;
+          }
+          return Reflect.set(target, key, value);
+        },
+      });
+
+      assert.throws(() => createTestEnv({ isolateRex: true }), (error) => error === setupError);
+      assert.equal(calls.length, 2);
+      assert.equal(existsSync(dir!), false);
+      assert.deepEqual(process.env, savedContext);
+      assert.equal(warning.mock.callCount(), killFails ? 1 : 0);
+      if (killFails) {
+        assert.deepEqual(warning.mock.calls[0].arguments, ["Failed to kill Rex test session:", killError]);
+      }
+    });
+  }
+
+  it("returns a valid isolated fixture and restores context during normal cleanup", () => {
+    const env = createTestEnv({ isolateRex: true });
+    assert.equal(env.rexSession, "session:owned");
+    assert.equal(process.env.REX_SESSION, "session:owned");
+    assert.equal(process.env.REX_BLOCK, "block:owned");
+    assert.equal(process.env.PI_SUBAGENT_SETUP_TEST, undefined);
+    cleanupTestEnv(env);
+    assert.equal(calls.length, 2);
+    assert.equal(existsSync(env.dir), false);
+    assert.deepEqual(process.env, savedContext);
+  });
+});
+
+describe("integration harness cleanup", () => {
+  for (const killFails of [false, true]) {
+    it(`kills the owned session even if surface disposal throws${killFails ? " and kill fails" : ""}`, (t) => {
+      const root = createTestDir();
+      const dir = join(root, "project");
+      const tempFile = join(root, "tracked.tmp");
+      mkdirSync(dir);
+      writeFileSync(tempFile, "test");
+      const originalEnv = process.env;
+      process.env = { ...originalEnv, REX_SESSION: "session:owned", REX_BLOCK: "block:owned" };
+      const disposeError = new Error("surface disposal failed");
+      const killError = new Error("session kill failed");
+      const warning = t.mock.method(console, "warn", () => {});
+      let killCalls = 0;
+      registerSurfaceHandle({
+        id: "harness-disposal-failure",
+        name: "harness-disposal-failure",
+        kind: "tab",
+        sessionId: "session:owned",
+        // Force the real disposer to fail while inspecting a tracked handle.
+        get status(): "reserved" { throw disposeError; },
+      });
+      __rexTest__.setRexExecutor((args) => {
+        assert.deepEqual(args, ["kill", "session:owned"]);
+        killCalls++;
+        if (killFails) throw killError;
+        return "";
+      });
+
+      try {
+        assert.doesNotThrow(() => cleanupTestEnv({
+          dir,
+          surfaces: [],
+          tempFiles: [tempFile],
+          rexSession: "session:owned",
+          savedContext: { REX_SESSION: originalEnv.REX_SESSION, REX_BLOCK: originalEnv.REX_BLOCK },
+        }));
+        assert.equal(killCalls, 1);
+        assert.equal(existsSync(dir), false);
+        assert.equal(existsSync(tempFile), false);
+        assert.deepEqual({ ...process.env }, { ...originalEnv });
+        assert.equal(warning.mock.callCount(), killFails ? 2 : 1);
+        assert.deepEqual(warning.mock.calls[0].arguments, ["Failed to dispose Rex surfaces:", disposeError]);
+        if (killFails) {
+          assert.deepEqual(warning.mock.calls[1].arguments, ["Failed to kill Rex test session:", killError]);
+        }
+      } finally {
+        unregisterSurfaceHandle("harness-disposal-failure");
+        __rexTest__.setRexExecutor(null);
+        process.env = originalEnv;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const reason of ["session already closed", "RPC error"]) {
+    it(`cleans local resources and restores context after ${reason}`, (t) => {
+      const root = mkdtempSync(join(tmpdir(), "pi-cleanup-test-"));
+      const dir = join(root, "project");
+      const tempFile = join(root, "tracked.tmp");
+      mkdirSync(dir);
+      writeFileSync(join(dir, "project.tmp"), "test");
+      writeFileSync(tempFile, "test");
+      const savedContext = {
+        REX_SESSION: "session:caller",
+        REX_BLOCK: "block:caller",
+        PI_SUBAGENT_CLEANUP_TEST: undefined,
+      };
+      const originalContext = Object.fromEntries(
+        Object.keys(savedContext).map((key) => [key, process.env[key]]),
+      );
+      const error = new Error(reason);
+      const warning = t.mock.method(console, "warn", () => {});
+      let killCalls = 0;
+      __rexTest__.setRexExecutor((args) => {
+        assert.deepEqual(args, ["kill", "session:owned"]);
+        killCalls++;
+        throw error;
+      });
+
+      try {
+        process.env.REX_SESSION = "session:owned";
+        process.env.REX_BLOCK = "block:owned";
+        process.env.PI_SUBAGENT_CLEANUP_TEST = "child";
+        assert.doesNotThrow(() => cleanupTestEnv({
+          dir,
+          surfaces: [],
+          // A missing file must not prevent removal of later tracked files.
+          tempFiles: [join(root, "already-removed.tmp"), tempFile],
+          rexSession: "session:owned",
+          savedContext,
+        }));
+
+        assert.equal(killCalls, 1);
+        assert.equal(existsSync(dir), false, "project directory must be removed");
+        assert.equal(existsSync(tempFile), false, "external temp file must be removed");
+        for (const [key, value] of Object.entries(savedContext)) {
+          assert.equal(process.env[key], value, `${key} must be restored`);
+        }
+        assert.equal(warning.mock.callCount(), 1);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to kill Rex test session/);
+        assert.equal(warning.mock.calls[0].arguments[1], error);
+      } finally {
+        __rexTest__.setRexExecutor(null);
+        for (const [key, value] of Object.entries(originalContext)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("rex.ts unit tests", () => {
   it("buildRexArgs includes server flag when server is specified or in env", async () => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
@@ -3541,6 +3869,75 @@ describe("rex.ts unit tests", () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  for (const { label, failedRename } of [
+    { label: "literal 'agent' $name", failedRename: undefined },
+    { label: "literal 'agent' $name", failedRename: "block" },
+    { label: "-agent-name", failedRename: undefined },
+    { label: "-agent-name", failedRename: "window" },
+    { label: "-agent-name", failedRename: "block" },
+    { label: "--dash-name", failedRename: undefined },
+    { label: "--dash-name", failedRename: "window" },
+    { label: "--dash-name", failedRename: "block" },
+  ] as const) {
+    it(`labels the returned top-level command pane ${JSON.stringify(label)}${failedRename ? ` and preserves it if ${failedRename} labeling fails` : " without relying on focus"}`, async (t) => {
+      const { createSurface, sendLongCommand, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+      const dir = mkdtempSync(join(tmpdir(), "rex-label-"));
+      const renameError = new Error("rename unavailable");
+      const warning = t.mock.method(console, "warn", () => {});
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedTop = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      delete process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const calls: string[][] = [];
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexContextOverride({ session: "session:label", block: "block:anchor" });
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args[0] === "window" && args[1] === "new") return JSON.stringify({ window_id: "window:label", block_ids: ["block:created"] });
+        if ((args[0] === "block" || args[0] === "window") && args[1] === "rename") {
+          assert.equal(getSurfaceHandle(surface)?.status, "launched", "command must be marked launched before labeling");
+          if (args[0] === failedRename) throw renameError;
+        }
+        if (args[0] === "block" && args[1] === "inspect") return JSON.stringify({ block: { window_id: "window:label" } });
+        if (args[0] === "window" && args[1] === "inspect") return JSON.stringify({ layers: [{ blocks: [{ block_id: "block:created" }] }] });
+        return "{}";
+      });
+      const surface = createSurface(label);
+      try {
+        const scriptPath = join(dir, "launch.sh");
+        assert.equal(sendLongCommand(surface, "true", { scriptPath }), scriptPath);
+        assert.equal(getSurfaceHandle(surface)?.status, "launched");
+        assert.equal(getSurfaceHandle(surface)?.windowId, "window:label");
+        assert.equal(getSurfaceHandle(surface)?.blockId, "block:created");
+        assert.equal(getSurfaceHandle(surface)?.name, label, "the original name must be preserved in the handle");
+        assert.equal(calls.some((c) => c[1] === "close" || c[1] === "kill"), false,
+          "labeling must not close or kill the launched surface");
+        assert.equal(warning.mock.callCount(), failedRename ? 1 : 0);
+        if (failedRename) {
+          assert.deepEqual(warning.mock.calls[0].arguments,
+            [`Failed to set ${failedRename === "window" ? "tab" : "pane"} label for subagent "${label}":`, renameError]);
+        }
+        assert.deepEqual(calls.find((c) => c[0] === "window" && c[1] === "new"),
+          ["window", "new", "-s", "session:label", label.startsWith("-") ? `subagent${label}` : label,
+            "--focus=false", "--keep-open", "--json", "--", "bash", "-l", scriptPath]);
+        const tabRenames = calls.filter((c) => c[0] === "window" && c[1] === "rename");
+        assert.deepEqual(tabRenames, label.startsWith("-")
+          ? [["window", "rename", "-s", "session:label", "--", "window:label", label]]
+          : [], "only leading-dash labels should need a tab rename, targeting the returned window ID");
+        assert.deepEqual(calls.find((c) => c[0] === "block" && c[1] === "rename"),
+          ["block", "rename", "-s", "session:label", "--", "block:created", label]);
+      } finally {
+        closeSurface(surface);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME; else process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedTop === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE; else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTop;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("launch failure cleans up created resources if Rex returns IDs on error.stdout", async () => {
     const { createSurface, sendLongCommand, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
@@ -5972,6 +6369,162 @@ describe("Rex sizing lifecycle and bounded diagnostics", () => {
       restoreEnvVar("PI_SUBAGENT_SPLIT_DIRECTION", savedDirection);
     }
   });
+});
+
+describe("Pi 1.4 native Rex capability and status compatibility", () => {
+  const nativeKeys = ["PI_PROGRAM_STATUS", "PI_HYPERLINKS", "PI_IMAGE_PROTOCOL", "PI_TRUE_COLOR"] as const;
+  const terminalKeys = [...nativeKeys, "TERM_PROGRAM", "TERM", "COLORTERM", "TMUX"];
+  let saved: Array<[string, string | undefined]>;
+  beforeEach(() => {
+    saved = terminalKeys.map((key) => [key, process.env[key]]);
+    for (const key of terminalKeys) delete process.env[key];
+    process.env.TERM_PROGRAM = "rex";
+    process.env.TERM = "xterm-256color";
+    setCapabilityOverrides({});
+    resetCapabilitiesCache();
+  });
+  afterEach(() => {
+    for (const [key, value] of saved) restoreEnvVar(key, value);
+    setCapabilityOverrides({});
+    resetCapabilitiesCache();
+  });
+
+  it("uses native automatic Rex detection and auto overrides, not a second renderer", () => {
+    const expected = { images: "kitty", trueColor: true, hyperlinks: true };
+    assert.deepEqual(detectCapabilities(), expected);
+    process.env.PI_HYPERLINKS = "auto";
+    process.env.PI_IMAGE_PROTOCOL = "auto";
+    process.env.PI_TRUE_COLOR = "auto";
+    assert.deepEqual(detectCapabilities(), expected);
+    assert.equal(getTerminalColorMode(), "truecolor");
+    assert.match(hyperlink("Rex", "https://www.superlogical.com/rex"), /\x1b\]8;/);
+  });
+
+  it("honors native environment disablement and explicit image protocol selection", () => {
+    process.env.PI_HYPERLINKS = "0";
+    process.env.PI_IMAGE_PROTOCOL = "none";
+    process.env.PI_TRUE_COLOR = "0";
+    assert.deepEqual(detectCapabilities(), { images: null, trueColor: false, hyperlinks: false });
+    assert.equal(getTerminalColorMode(), "256color");
+    assert.equal(getCapabilities().hyperlinks, false);
+    process.env.PI_IMAGE_PROTOCOL = "iterm2";
+    assert.equal(detectCapabilities().images, "iterm2");
+  });
+
+  it("lets Pi settings override conflicting environment choices without writing settings", () => {
+    process.env.PI_HYPERLINKS = "1";
+    process.env.PI_IMAGE_PROTOCOL = "kitty";
+    process.env.PI_TRUE_COLOR = "1";
+    const settings = SettingsManager.inMemory({ terminal: { hyperlinks: false, images: false, trueColor: false } });
+    setCapabilityOverrides(settings.getTerminalCapabilityOverrides());
+    assert.deepEqual(getCapabilities(), { images: null, trueColor: false, hyperlinks: false });
+    // Auto settings defer to native environment/detection; they are not forced values.
+    const automatic = SettingsManager.inMemory({ terminal: { hyperlinks: "auto", images: "auto", trueColor: "auto" } });
+    setCapabilityOverrides(automatic.getTerminalCapabilityOverrides());
+    assert.deepEqual(getCapabilities(), { images: "kitty", trueColor: true, hyperlinks: true });
+  });
+
+  it("preserves explicit native overrides verbatim in server-launched wrappers and leaves auto unset", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { registerSurfaceHandle, unregisterSurfaceHandle, sendLongCommand } = await import("../pi-extension/subagents/rex.ts");
+    const dir = createTestDir();
+    const id = "native-overrides";
+    __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    __rexTest__.setRexExecutor(() => JSON.stringify({ window_id: "window:child", block_ids: ["block:child"] }));
+    try {
+      for (const explicit of [false, true]) {
+        registerSurfaceHandle({ id, kind: "tab", name: id, sessionId: "session:test", status: "reserved" });
+        if (explicit) {
+          process.env.PI_PROGRAM_STATUS = "0";
+          process.env.PI_HYPERLINKS = "0";
+          process.env.PI_IMAGE_PROTOCOL = "none";
+          // Do not interpret/execute unexpected values; let Pi handle them.
+          process.env.PI_TRUE_COLOR = "auto'; $(touch should-not-exist)";
+        }
+        const script = sendLongCommand(id, explicit ? 'echo "$PI_TRUE_COLOR"' : "exit 0", { scriptPath: join(dir, "launch.sh") });
+        const text = readFileSync(script, "utf8");
+        for (const key of nativeKeys) {
+          if (explicit) assert.ok(text.includes(`export ${key}=${shellEscape(process.env[key]!)}`));
+          else assert.equal(text.includes(key), false, "automatic detection must remain unset");
+        }
+        assert.equal(text.includes("PI_PROGRAM_STATUS=1"), false, "must not force status on");
+        if (explicit) {
+          const output = execFileSync("bash", [script], {
+            cwd: dir,
+            encoding: "utf8",
+            // Require the wrapper to restore the value, rather than inherit it.
+            env: { ...process.env, PI_TRUE_COLOR: undefined },
+          });
+          assert.equal(existsSync(join(dir, "should-not-exist")), false, "must not execute the injected command");
+          assert.equal(output, "auto'; $(touch should-not-exist)\n");
+        }
+      }
+    } finally {
+      unregisterSurfaceHandle(id);
+      __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of ["automatic-unavailable", "disabled", "forced-but-unavailable", "query-failed", "native-report"] as const) {
+    it(`uses the target's actual status for ${mode}, without changing Pi environment/settings`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, sendMessage } = await import("../pi-extension/subagents/rex.ts");
+      const dir = createTestDir();
+      const settingsFile = join(dir, "settings.json");
+      const settings = '{"terminal":{"hyperlinks":false,"images":false,"trueColor":false}}\n';
+      writeFileSync(settingsFile, settings);
+      const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = dir;
+      if (mode === "disabled" || mode === "native-report") process.env.PI_PROGRAM_STATUS = "0";
+      if (mode === "forced-but-unavailable") process.env.PI_PROGRAM_STATUS = "1";
+      const envBefore = { ...process.env };
+      const calls: string[][] = [];
+      const id = `native-status-${mode}`;
+      __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args.at(-1) === "program_status") {
+          if (mode === "query-failed") throw new Error("server disconnected");
+          return JSON.stringify({ records: mode === "native-report" ? [
+            { state: "idle", app: "pi", updated_at: "2026-11-02T00:00:00Z" },
+          ] : [] });
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "tab", name: id, sessionId: "session:test", blockId: "block:child", status: "launched" });
+      try {
+        if (mode === "native-report") {
+          // The parent's disabled status is not evidence that the child's report is absent.
+          sendMessage(id, "/hotkeys");
+          assert.equal(calls.filter((args) => args.includes("block.event")).length, 2);
+        } else {
+          assert.throws(() => sendMessage(id, "do not submit"), (error: Error) => {
+            assert.match(error.message, /Cannot deliver message safely/);
+            assert.match(error.message, /PI_PROGRAM_STATUS \(0 disables reports\)/);
+            assert.match(error.message, /OSC 7501/);
+            assert.match(error.message, /interact with the child manually; no input was sent/);
+            return true;
+          });
+          assert.equal(calls.some((args) => args.includes("block.event")), false);
+        }
+        // An assertion failure must not dump unrelated provider credentials.
+        assert.ok(JSON.stringify({ ...process.env }) === JSON.stringify(envBefore), "adapter must not change process environment");
+        assert.equal(readFileSync(settingsFile, "utf8"), settings);
+        assert.equal(statSync(settingsFile).isFile(), true);
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", savedAgentDir);
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("safe_bash tool", () => {
