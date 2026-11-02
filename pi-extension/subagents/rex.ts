@@ -111,18 +111,28 @@ function rexErrorMessage(error: any): string {
   return error?.message ?? String(error);
 }
 
+/** Upper bound for one process/status query, so a stuck CLI counts as a failure. */
+const REX_QUERY_TIMEOUT_MS = 15_000;
+
 /** Run a rex command scoped to the caller's session; returns stdout. */
-function rex(args: string[]): string {
+function rex(args: string[], options?: { timeoutMs?: number }): string {
   try {
-    return execFileSync(rexBin(), args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    return execFileSync(rexBin(), args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      ...(options?.timeoutMs ? { timeout: options.timeoutMs } : {}),
+    });
   } catch (error: any) {
     throw new Error(`rex ${args[0]} ${args[1] ?? ""} failed: ${rexErrorMessage(error)}`);
   }
 }
 
-async function rexAsync(args: string[]): Promise<string> {
+async function rexAsync(args: string[], options?: { timeoutMs?: number }): Promise<string> {
   try {
-    const { stdout } = await execFileAsync(rexBin(), args, { encoding: "utf8" });
+    const { stdout } = await execFileAsync(rexBin(), args, {
+      encoding: "utf8",
+      ...(options?.timeoutMs ? { timeout: options.timeoutMs } : {}),
+    });
     return stdout;
   } catch (error: any) {
     throw new Error(`rex ${args[0]} ${args[1] ?? ""} failed: ${rexErrorMessage(error)}`);
@@ -145,7 +155,11 @@ function blockCall(block: string, method: string): any {
 }
 
 async function blockCallAsync(block: string, method: string): Promise<any> {
-  return parseJson(await rexAsync(["block", "call", "-s", rexSession(), "-b", block, method]));
+  return parseJson(
+    await rexAsync(["block", "call", "-s", rexSession(), "-b", block, method], {
+      timeoutMs: REX_QUERY_TIMEOUT_MS,
+    }),
+  );
 }
 
 /**
@@ -776,6 +790,21 @@ function interpretExitSidecar(data: any): PollResult {
   };
 }
 
+/** Repeated failures to observe a block, as opposed to the subagent failing. */
+export class RexInfrastructureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RexInfrastructureError";
+  }
+}
+
+export function isRexInfrastructureError(error: unknown): boolean {
+  return error instanceof RexInfrastructureError;
+}
+
+/** Consecutive failed observations before pollForExit gives up. */
+const DEFAULT_MAX_CONSECUTIVE_ERRORS = 10;
+
 /**
  * Whether a block's program has ended, from `block call process`. Rex reports
  * `last_exit: null` while the program runs and `{exit_code}` once it ended;
@@ -785,11 +814,11 @@ export function exitStateOf(
   record: any,
 ): { finished: false } | { finished: true; exitCode: number } {
   const last = record?.last_exit;
-  if (!last || typeof last !== "object") return { finished: false };
-  return {
-    finished: true,
-    exitCode: typeof last.exit_code === "number" && last.exit_code >= 0 ? last.exit_code : 1,
-  };
+  if (last === null) return { finished: false };
+  if (!last || typeof last !== "object" || typeof last.exit_code !== "number") {
+    throw new Error(`Malformed Rex process record: ${JSON.stringify(record)}`);
+  }
+  return { finished: true, exitCode: last.exit_code >= 0 ? last.exit_code : 1 };
 }
 
 const SENTINEL = /__SUBAGENT_DONE_(\d+)__/;
@@ -821,7 +850,9 @@ function readExitSidecar(sessionFile: string | undefined): PollResult | null {
  * once the process has too, keeping a non-zero exit code. The Claude sentinel
  * returns straight away, because Claude stays open after its Stop hook.
  *
- * A block that disappears ends the run as `interrupted`.
+ * A block that disappears ends the run as `interrupted`. Repeated failures to
+ * observe it throw RexInfrastructureError instead of polling forever; the
+ * process may still be running then.
  */
 export async function pollForExit(
   surface: string,
@@ -831,9 +862,12 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    maxConsecutiveErrors?: number;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const maxErrors = options.maxConsecutiveErrors ?? DEFAULT_MAX_CONSECUTIVE_ERRORS;
+  let consecutiveErrors = 0;
   let sidecar: PollResult | null = null;
 
   for (;;) {
@@ -863,6 +897,7 @@ export async function pollForExit(
     const block = launched.get(surface) ?? surface;
     try {
       const state = exitStateOf(await blockCallAsync(block, "process"));
+      consecutiveErrors = 0;
       if (state.finished) {
         sidecar ??= readExitSidecar(options.sessionFile);
         if (sidecar) {
@@ -887,7 +922,13 @@ export async function pollForExit(
           }
         );
       }
-      // Transient CLI failure: try again next tick.
+      consecutiveErrors++;
+      if (consecutiveErrors >= maxErrors) {
+        throw new RexInfrastructureError(
+          `Lost contact with Rex while watching block ${block} ` +
+            `(${consecutiveErrors} failed checks): ${error?.message ?? String(error)}`,
+        );
+      }
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);

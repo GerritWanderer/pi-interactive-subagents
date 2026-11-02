@@ -63,6 +63,7 @@ import {
   createArgs,
   exitStateOf,
   isRexAvailable,
+  isRexInfrastructureError,
   lastLines,
   pollForExit,
   rexSplitDirection,
@@ -2915,6 +2916,12 @@ describe("rex.ts", () => {
     assert.match(surfaceHandle("!!!"), /^rex-surface:subagent-/);
   });
 
+  it("rejects a process record it can't interpret", () => {
+    for (const record of [{}, null, { last_exit: "nope" }, { last_exit: {} }]) {
+      assert.throws(() => exitStateOf(record), /Malformed/, JSON.stringify(record));
+    }
+  });
+
   it("knows a subagent ended from the block's exit record, not its screen", () => {
     assert.deepEqual(exitStateOf({ last_exit: null, child: { pid: 1 } }), { finished: false });
     assert.deepEqual(exitStateOf({ last_exit: { exit_code: 0 } }), { finished: true, exitCode: 0 });
@@ -2994,11 +3001,34 @@ esac
       assert.deepEqual(await poll("block:c"), { reason: "error", exitCode: 2 });
     });
 
+    it("gives up after sustained failures instead of polling forever", async () => {
+      write("process", "ERR transport down\n");
+      await assert.rejects(
+        poll("block:c", { maxConsecutiveErrors: 3 }),
+        (error: any) => isRexInfrastructureError(error) && /3 failed checks.*transport down/.test(error.message),
+      );
+    });
+
+    it("counts malformed process records as failures, not as a running child", async () => {
+      write("process", '{"last_exit":"nope"}\n');
+      await assert.rejects(poll("block:c", { maxConsecutiveErrors: 2 }), isRexInfrastructureError);
+    });
+
+    it("resets the failure count after a good reply", async () => {
+      write("process", 'ERR a\nERR b\n{"last_exit":null}\nERR c\nERR d\n{"last_exit":{"exit_code":0}}\n');
+      assert.equal((await poll("block:c", { maxConsecutiveErrors: 3 })).reason, "done");
+    });
+
     it("reports a vanished block as interrupted, not as a provider error", async () => {
       write("process", 'ERR block target "block:c" not found\n');
       const result = await poll("block:c");
       assert.equal(result.reason, "interrupted");
       assert.equal(result.exitCode, 1);
+    });
+
+    it("doesn't mistake other not-found errors for a closed pane", async () => {
+      write("process", "ERR bash: rex: command not found\n");
+      await assert.rejects(poll("block:c", { maxConsecutiveErrors: 2 }), isRexInfrastructureError);
     });
 
     it("waits for the process after an error sidecar and keeps its message", async () => {

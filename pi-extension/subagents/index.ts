@@ -25,6 +25,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  isRexInfrastructureError,
 } from "./rex.ts";
 
 import {
@@ -1688,6 +1689,23 @@ async function watchSubagent(
     };
   } catch (err: any) {
     runningSubagents.delete(running.id);
+
+    if (isRexInfrastructureError(err)) {
+      // Rex can't be observed, so the child may still be running: leave its
+      // pane alone, and warn that resuming could start a second process.
+      return {
+        name,
+        task,
+        summary:
+          `${err?.message ?? String(err)}\n\nThe pane was left open because the subagent may ` +
+          `still be running. Check it before using subagent_message: a resume started while ` +
+          `the old process is alive would run two processes on one session.`,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: err?.message ?? String(err),
+        sessionFile,
+      };
+    }
 
     try {
       closeSurface(surface);
