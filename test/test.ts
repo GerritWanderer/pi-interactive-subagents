@@ -34,9 +34,11 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape, __rexTest__, disposeRexSurfaces } from "../pi-extension/subagents/rex.ts";
+import {
+  shellEscape, __rexTest__, disposeRexSurfaces, registerSurfaceHandle, unregisterSurfaceHandle,
+} from "../pi-extension/subagents/rex.ts";
 import { planEqualShares, type RexLayoutNode } from "../pi-extension/subagents/rex-sizing.ts";
-import { cleanupTestEnv } from "./integration/harness.ts";
+import { createTestEnv, cleanupTestEnv } from "./integration/harness.ts";
 
 // A cosmetic timer from one fixture must not run with the next fixture's executor.
 afterEach(() => disposeRexSurfaces());
@@ -2961,7 +2963,197 @@ describe("Rex equal-share sizing (public session.view layout)", () => {
   });
 });
 
+describe("integration harness setup rollback", () => {
+  let originalEnv: NodeJS.ProcessEnv;
+  let savedContext: NodeJS.ProcessEnv;
+  let dir: string | undefined;
+  let calls: string[][];
+  let response: unknown;
+  let newError: Error | undefined;
+  let killError: Error | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env;
+    process.env = {
+      ...originalEnv,
+      REX_SESSION: "session:caller",
+      REX_BLOCK: "block:caller",
+      PI_SUBAGENT_SETUP_TEST: "caller",
+    };
+    savedContext = { ...process.env };
+    dir = undefined;
+    calls = [];
+    response = { session_id: "session:owned", initial_windows: [{ block_ids: ["block:owned"] }] };
+    newError = undefined;
+    killError = undefined;
+    __rexTest__.setRexExecutor((args) => {
+      calls.push(args);
+      if (args[0] === "new") {
+        dir = args[args.indexOf("-c") + 1];
+        assert.equal(existsSync(join(dir, ".pi", "agents")), true);
+        assert.deepEqual(process.env, savedContext, "context must not change before Rex setup");
+        if (newError) throw newError;
+        return JSON.stringify(response) ?? "";
+      }
+      assert.deepEqual(args, ["kill", "session:owned"]);
+      if (killError) throw killError;
+      return "";
+    });
+  });
+
+  afterEach(() => {
+    __rexTest__.setRexExecutor(null);
+    process.env = originalEnv;
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const malformedResponses = [
+    ["null response", null, false],
+    ["missing session ID", { initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["numeric session ID", { session_id: 42, initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["blank session ID", { session_id: "  ", initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["missing windows", { session_id: "session:owned" }, true],
+    ["empty windows", { session_id: "session:owned", initial_windows: [] }, true],
+    ["non-array windows", { session_id: "session:owned", initial_windows: { 0: { block_ids: ["block:owned"] } } }, true],
+    ...[
+      ["missing block IDs", {}],
+      ["null block IDs", { block_ids: null }],
+      ["empty block IDs", { block_ids: [] }],
+      ["non-array block IDs", { block_ids: "block:owned" }],
+      ["null block ID", { block_ids: [null] }],
+      ["numeric block ID", { block_ids: [42] }],
+      ["object block ID", { block_ids: [{}] }],
+      ["empty block ID", { block_ids: [""] }],
+      ["blank block ID", { block_ids: ["  "] }],
+    ].map(([name, window]) => [name, { session_id: "session:owned", initial_windows: [window] }, true]),
+  ] as const;
+
+  for (const [name, malformed, ownsSession] of malformedResponses) {
+    it(`rolls back ${name} without mutating caller context`, () => {
+      response = malformed;
+      const writes: PropertyKey[] = [];
+      process.env = new Proxy(process.env, {
+        set(target, key, value) {
+          writes.push(key);
+          return Reflect.set(target, key, value);
+        },
+        deleteProperty(target, key) {
+          writes.push(key);
+          return Reflect.deleteProperty(target, key);
+        },
+      });
+
+      assert.throws(() => createTestEnv({ isolateRex: true }), /Invalid Rex test session response/);
+      assert.equal(calls.length, ownsSession ? 2 : 1);
+      assert.equal(existsSync(dir!), false, "failed fixture directory must be removed");
+      assert.deepEqual(process.env, savedContext);
+      assert.deepEqual(writes, [], "invalid responses must be rejected before environment mutations");
+    });
+  }
+
+  it("removes the fixture directory when rex new throws", () => {
+    newError = new Error("rex new failed");
+    assert.throws(() => createTestEnv({ isolateRex: true }), (error) => error === newError);
+    assert.equal(calls.length, 1, "no session ID is available to kill");
+    assert.equal(existsSync(dir!), false);
+    assert.deepEqual(process.env, savedContext);
+  });
+
+  for (const killFails of [false, true]) {
+    it(`restores partially modified context when setup fails${killFails ? " even if session kill fails" : ""}`, (t) => {
+      const setupError = new Error("environment setup failed");
+      const warning = t.mock.method(console, "warn", () => {});
+      if (killFails) killError = new Error("kill failed");
+      process.env = new Proxy(process.env, {
+        set(target, key, value) {
+          if (key === "REX_BLOCK" && value === "block:owned") {
+            assert.equal(target.REX_SESSION, "session:owned");
+            assert.equal(target.PI_SUBAGENT_SETUP_TEST, undefined);
+            throw setupError;
+          }
+          return Reflect.set(target, key, value);
+        },
+      });
+
+      assert.throws(() => createTestEnv({ isolateRex: true }), (error) => error === setupError);
+      assert.equal(calls.length, 2);
+      assert.equal(existsSync(dir!), false);
+      assert.deepEqual(process.env, savedContext);
+      assert.equal(warning.mock.callCount(), killFails ? 1 : 0);
+      if (killFails) {
+        assert.deepEqual(warning.mock.calls[0].arguments, ["Failed to kill Rex test session:", killError]);
+      }
+    });
+  }
+
+  it("returns a valid isolated fixture and restores context during normal cleanup", () => {
+    const env = createTestEnv({ isolateRex: true });
+    assert.equal(env.rexSession, "session:owned");
+    assert.equal(process.env.REX_SESSION, "session:owned");
+    assert.equal(process.env.REX_BLOCK, "block:owned");
+    assert.equal(process.env.PI_SUBAGENT_SETUP_TEST, undefined);
+    cleanupTestEnv(env);
+    assert.equal(calls.length, 2);
+    assert.equal(existsSync(env.dir), false);
+    assert.deepEqual(process.env, savedContext);
+  });
+});
+
 describe("integration harness cleanup", () => {
+  for (const killFails of [false, true]) {
+    it(`kills the owned session even if surface disposal throws${killFails ? " and kill fails" : ""}`, (t) => {
+      const root = createTestDir();
+      const dir = join(root, "project");
+      const tempFile = join(root, "tracked.tmp");
+      mkdirSync(dir);
+      writeFileSync(tempFile, "test");
+      const originalEnv = process.env;
+      process.env = { ...originalEnv, REX_SESSION: "session:owned", REX_BLOCK: "block:owned" };
+      const disposeError = new Error("surface disposal failed");
+      const killError = new Error("session kill failed");
+      const warning = t.mock.method(console, "warn", () => {});
+      let killCalls = 0;
+      registerSurfaceHandle({
+        id: "harness-disposal-failure",
+        name: "harness-disposal-failure",
+        kind: "tab",
+        sessionId: "session:owned",
+        // Force the real disposer to fail while inspecting a tracked handle.
+        get status(): "reserved" { throw disposeError; },
+      });
+      __rexTest__.setRexExecutor((args) => {
+        assert.deepEqual(args, ["kill", "session:owned"]);
+        killCalls++;
+        if (killFails) throw killError;
+        return "";
+      });
+
+      try {
+        assert.doesNotThrow(() => cleanupTestEnv({
+          dir,
+          surfaces: [],
+          tempFiles: [tempFile],
+          rexSession: "session:owned",
+          savedContext: { REX_SESSION: originalEnv.REX_SESSION, REX_BLOCK: originalEnv.REX_BLOCK },
+        }));
+        assert.equal(killCalls, 1);
+        assert.equal(existsSync(dir), false);
+        assert.equal(existsSync(tempFile), false);
+        assert.deepEqual({ ...process.env }, { ...originalEnv });
+        assert.equal(warning.mock.callCount(), killFails ? 2 : 1);
+        assert.deepEqual(warning.mock.calls[0].arguments, ["Failed to dispose Rex surfaces:", disposeError]);
+        if (killFails) {
+          assert.deepEqual(warning.mock.calls[1].arguments, ["Failed to kill Rex test session:", killError]);
+        }
+      } finally {
+        unregisterSurfaceHandle("harness-disposal-failure");
+        __rexTest__.setRexExecutor(null);
+        process.env = originalEnv;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
   for (const reason of ["session already closed", "RPC error"]) {
     it(`cleans local resources and restores context after ${reason}`, (t) => {
       const root = mkdtempSync(join(tmpdir(), "pi-cleanup-test-"));
@@ -3007,7 +3199,7 @@ describe("integration harness cleanup", () => {
           assert.equal(process.env[key], value, `${key} must be restored`);
         }
         assert.equal(warning.mock.callCount(), 1);
-        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to clean up Rex test resources/);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to kill Rex test session/);
         assert.equal(warning.mock.calls[0].arguments[1], error);
       } finally {
         __rexTest__.setRexExecutor(null);

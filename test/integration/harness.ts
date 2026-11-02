@@ -127,34 +127,55 @@ export interface TestEnv {
  */
 export function createTestEnv(opts?: { isolateRex?: boolean }): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
-  const agentsDir = join(dir, ".pi", "agents");
-  mkdirSync(agentsDir, { recursive: true });
+  const env: TestEnv = { dir, surfaces: [], tempFiles: [] };
+  try {
+    const agentsDir = join(dir, ".pi", "agents");
+    mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
-  if (existsSync(TEST_AGENTS_SRC)) {
-    for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) {
-        const target = join(agentsDir, file);
-        cpSync(join(TEST_AGENTS_SRC, file), target);
-        // The approved model applies to parents AND profile-selected children.
-        writeFileSync(target, readFileSync(target, "utf8").replace(/^model:.*$/m, `model: ${TEST_MODEL}\nthinking: off`));
+    // Copy test agent definitions into the project-local agents dir
+    if (existsSync(TEST_AGENTS_SRC)) {
+      for (const file of readdirSync(TEST_AGENTS_SRC)) {
+        if (file.endsWith(".md")) {
+          const target = join(agentsDir, file);
+          cpSync(join(TEST_AGENTS_SRC, file), target);
+          // The approved model applies to parents AND profile-selected children.
+          writeFileSync(target, readFileSync(target, "utf8").replace(/^model:.*$/m, `model: ${TEST_MODEL}\nthinking: off`));
+        }
       }
     }
-  }
 
-  const env: TestEnv = { dir, surfaces: [], tempFiles: [] };
-  if (opts?.isolateRex) {
-    const created = rexJson(["new", `pi-lifecycle-${uniqueId()}`, "-c", dir, "--json", "--", "bash", "-c", "sleep 3600"]);
-    env.rexSession = created.session_id;
-    env.savedContext = {};
-    for (const key of ["REX_SESSION", "REX_BLOCK", ...Object.keys(process.env).filter((k) => k.startsWith("PI_SUBAGENT_"))]) {
-      env.savedContext[key] = process.env[key];
-      if (key.startsWith("PI_SUBAGENT_")) delete process.env[key];
+    if (opts?.isolateRex) {
+      const created = rexJson(["new", `pi-lifecycle-${uniqueId()}`, "-c", dir, "--json", "--", "bash", "-c", "sleep 3600"]);
+      // Record ownership before validating the rest of the response so rollback
+      // can kill a created session even when its initial block is malformed.
+      if (typeof created?.session_id === "string" && created.session_id.trim()) {
+        env.rexSession = created.session_id;
+      }
+      const initialWindow = Array.isArray(created?.initial_windows) ? created.initial_windows[0] : undefined;
+      const blockId = Array.isArray(initialWindow?.block_ids) ? initialWindow.block_ids[0] : undefined;
+      if (!env.rexSession || typeof blockId !== "string" || !blockId.trim()) {
+        throw new Error("Invalid Rex test session response: expected a session ID and an initial block ID");
+      }
+
+      const keys = ["REX_SESSION", "REX_BLOCK", ...Object.keys(process.env).filter((k) => k.startsWith("PI_SUBAGENT_"))];
+      env.savedContext = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+      for (const key of keys) {
+        if (key.startsWith("PI_SUBAGENT_")) delete process.env[key];
+      }
+      process.env.REX_SESSION = env.rexSession;
+      process.env.REX_BLOCK = blockId;
     }
-    process.env.REX_SESSION = created.session_id;
-    process.env.REX_BLOCK = created.initial_windows[0].block_ids[0];
+    return env;
+  } catch (error) {
+    try {
+      if (env.rexSession) rexExec(["kill", env.rexSession]);
+    } catch (cleanupError) {
+      console.warn("Failed to kill Rex test session:", cleanupError);
+    } finally {
+      cleanupLocalTestResources(env);
+    }
+    throw error;
   }
-  return env;
 }
 
 /**
@@ -167,30 +188,39 @@ export function cleanupTestEnv(env: TestEnv): void {
     } catch {}
   }
   try {
-    disposeRexSurfaces();
-    if (env.rexSession) {
-      // Only the exact session returned by this fixture's `rex new` is owned.
-      // This also cleans descendant panes that outlived a failed assertion.
-      rexExec(["kill", env.rexSession]);
-    }
-  } catch (error) {
-    // An already-closed session or RPC failure must not skip local cleanup or
-    // prevent the caller's post-cleanup assertions from running.
-    console.warn("Failed to clean up Rex test resources:", error);
-  } finally {
-    for (const [key, value] of Object.entries(env.savedContext ?? {})) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-    for (const file of env.tempFiles) {
-      try {
-        unlinkSync(file);
-      } catch {}
-    }
     try {
-      rmSync(env.dir, { recursive: true, force: true });
+      disposeRexSurfaces();
+    } catch (error) {
+      console.warn("Failed to dispose Rex surfaces:", error);
+    }
+    if (env.rexSession) {
+      try {
+        // Only the exact session returned by this fixture's `rex new` is owned.
+        // This also cleans descendant panes that outlived a failed assertion.
+        rexExec(["kill", env.rexSession]);
+      } catch (error) {
+        console.warn("Failed to kill Rex test session:", error);
+      }
+    }
+  } finally {
+    cleanupLocalTestResources(env);
+  }
+}
+
+/** Shared by normal teardown and setup rollback, even when Rex cleanup fails. */
+function cleanupLocalTestResources(env: TestEnv): void {
+  for (const [key, value] of Object.entries(env.savedContext ?? {})) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  for (const file of env.tempFiles) {
+    try {
+      unlinkSync(file);
     } catch {}
   }
+  try {
+    rmSync(env.dir, { recursive: true, force: true });
+  } catch {}
 }
 
 /**
