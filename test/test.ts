@@ -2538,19 +2538,31 @@ describe("subagent interruption", () => {
         try {
           if (guard === "in-memory") testApi.lostObservationSessions.add(resolve(sessionFile));
           else writeLostObservationMarker(sessionFile);
-          const presentation = testApi.resolveResultPresentation(
+          for (const { result, expected } of [
+            { result: { outcome: "failure" as const }, expected: /failed \(exit code 42\)/ },
             {
-              exitCode: 1,
-              elapsed: 10,
-              summary: "Subagent cancelled.",
-              outcome: "interrupted",
-              error: "cancelled",
-              sessionFile,
+              result: { outcome: "failure" as const, errorMessage: "Anthropic 529 Overloaded" },
+              expected: /failed after 10s[\s\S]*Error: Anthropic 529 Overloaded/,
             },
-            "guarded-worker",
-          );
-          assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
-          assert.doesNotMatch(presentation, /You can resume|Follow up with subagent_message/);
+            {
+              result: { outcome: "interrupted" as const, errorMessage: "Pane closed externally" },
+              expected: /was interrupted after 10s[\s\S]*Pane closed externally/,
+            },
+            {
+              result: { outcome: "interrupted" as const, error: "cancelled" },
+              expected: /was cancelled after 10s/,
+            },
+            { result: { outcome: "cancelled" as const }, expected: /was cancelled after 10s/ },
+          ]) {
+            const presentation = testApi.resolveResultPresentation(
+              { exitCode: 42, elapsed: 10, summary: "Real result", sessionFile, ...result },
+              "guarded-worker",
+            );
+            assert.match(presentation, expected);
+            assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+            assert.doesNotMatch(presentation, /infrastructure observation failure|pane was kept open/i);
+            assert.doesNotMatch(presentation, /resume the session with subagent_message|Follow up with subagent_message/);
+          }
         } finally {
           testApi.confirmProcessEnded(sessionFile);
         }
@@ -5237,70 +5249,93 @@ describe("subagent watcher disposal", () => {
 });
 
 describe("subagent watcher exit during shutdown", () => {
-  it("preserves a completed result when confirmProcessEnded cannot remove its marker", async (t) => {
-    const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
-    const { lostObservationMarkerPath, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
-    const testApi = subagentsModule.__test__;
-    const { api } = createMockExtensionApi();
-    const handlers = new Map<string, (...args: any[]) => void>();
-    api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
-    subagentsModule.default(api);
-    handlers.get("session_start")!({}, { hasUI: false });
-    const dir = createTestDir();
-    const id = "completed-marker-removal-failed";
-    const now = Date.now();
-    t.mock.method(Date, "now", () => now);
-    const warning = t.mock.method(console, "warn", () => {});
-    const sessionFile = createSessionFile(dir, [SESSION_HEADER, {
-      ...ASSISTANT_MSG,
-      message: { ...ASSISTANT_MSG.message, model: "test-model", usage: { input: 100, output: 50 } },
-    }]);
-    const expectedStats = summarizeSessionStats(sessionFile);
-    const running = {
-      id, name: id, task: "finished", surface: id, startTime: now - 12_000,
-      sessionFile, interactive: false,
-      statusState: createStatusState({ source: "pi", startTimeMs: now - 12_000 }),
-    };
-    registerSurfaceHandle({
-      id, name: id, kind: "split", status: "launched",
-      sessionId: "session:test", blockId: "block:completed-child",
-    });
-    // A directory at the marker path reliably makes non-recursive removal
-    // throw, including when tests run with elevated filesystem privileges.
-    mkdirSync(lostObservationMarkerPath(sessionFile));
-    testApi.lostObservationSessions.add(resolve(sessionFile));
-    testApi.lostObservationEntries.set(resolve(sessionFile), {
-      sessionFile, surface: id, blockId: "block:completed-child", sessionId: "session:test",
-    });
-    testApi.runningSubagents.set(id, running);
-    __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
+  for (const { label, exitCode, errorMessage } of [
+    { label: "completed", exitCode: 0, errorMessage: undefined },
+    { label: "nonzero exit", exitCode: 42, errorMessage: undefined },
+    { label: "provider error", exitCode: 1, errorMessage: "Anthropic 529 Overloaded after 3 retries" },
+  ]) {
+    it(`preserves a ${label} result when confirmProcessEnded cannot remove its marker`, async (t) => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const { lostObservationMarkerPath, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(api);
+      handlers.get("session_start")!({}, { hasUI: false });
+      const dir = createTestDir();
+      const id = "completed-marker-removal-failed";
+      const now = Date.now();
+      t.mock.method(Date, "now", () => now);
+      const warning = t.mock.method(console, "warn", () => {});
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, {
+        ...ASSISTANT_MSG,
+        message: { ...ASSISTANT_MSG.message, model: "test-model", usage: { input: 100, output: 50 } },
+      }]);
+      const expectedStats = summarizeSessionStats(sessionFile);
+      const running = {
+        id, name: id, task: "finished", surface: id, startTime: now - 12_000,
+        sessionFile, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: now - 12_000 }),
+      };
+      registerSurfaceHandle({
+        id, name: id, kind: "split", status: "launched",
+        sessionId: "session:test", blockId: "block:completed-child",
+      });
+      // A directory at the marker path reliably makes non-recursive removal
+      // throw, including when tests run with elevated filesystem privileges.
+      mkdirSync(lostObservationMarkerPath(sessionFile));
+      testApi.lostObservationSessions.add(resolve(sessionFile));
+      testApi.lostObservationEntries.set(resolve(sessionFile), {
+        sessionFile, surface: id, blockId: "block:completed-child", sessionId: "session:test",
+      });
+      testApi.runningSubagents.set(id, running);
+      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: exitCode, error: errorMessage } }));
 
-    try {
-      const result = await testApi.watchSubagent(running, new AbortController().signal);
-      assert.equal(result.outcome, "success");
-      assert.equal(result.summary, "Here is my plan...");
-      assert.equal(result.exitCode, 0);
-      assert.equal(result.elapsed, 12);
-      assert.equal(result.sessionId, SESSION_HEADER.id);
-      assert.deepEqual(result.stats, expectedStats);
-      assert.equal(result.error, undefined);
-      assert.equal(warning.mock.callCount(), 1);
-      assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to clear lost-observation marker/);
-      assert.equal(testApi.runningSubagents.has(id), false);
-      assert.equal(testApi.lostObservationSessions.has(resolve(sessionFile)), true);
-      assert.equal(testApi.lostObservationEntries.has(resolve(sessionFile)), true);
-      assert.equal(hasLostObservationMarker(sessionFile), true, "failed removal must retain the persistent resume guard");
-      assert.match(testApi.resolveResultPresentation(result, id), /completed/);
-    } finally {
-      handlers.get("session_shutdown")!({}, {});
-      testApi.runningSubagents.delete(id);
-      testApi.lostObservationSessions.delete(resolve(sessionFile));
-      testApi.lostObservationEntries.delete(resolve(sessionFile));
-      unregisterSurfaceHandle(id);
-      __rexTest__.setRexExecutor(null);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+      try {
+        const result = await testApi.watchSubagent(running, new AbortController().signal);
+        assert.equal(result.outcome, exitCode === 0 ? "success" : "failure");
+        assert.equal(result.summary, "Here is my plan...");
+        assert.equal(result.exitCode, exitCode);
+        assert.equal(result.errorMessage, errorMessage);
+        assert.notEqual(result.observationFailure, true);
+        assert.equal(result.elapsed, 12);
+        assert.equal(result.sessionId, SESSION_HEADER.id);
+        assert.deepEqual(result.stats, expectedStats);
+        assert.equal(result.error, undefined);
+        assert.equal(warning.mock.callCount(), 1);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to clear lost-observation marker/);
+        assert.equal(testApi.runningSubagents.has(id), false);
+        assert.equal(testApi.lostObservationSessions.has(resolve(sessionFile)), true);
+        assert.equal(testApi.lostObservationEntries.has(resolve(sessionFile)), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true, "failed removal must retain the persistent resume guard");
+        assert.equal(getSurfaceHandle(id), undefined, "a real process exit must close its pane despite marker cleanup failure");
+        const presentation = testApi.resolveResultPresentation(result, id);
+        if (exitCode === 0) {
+          assert.match(presentation, /completed/);
+        } else {
+          if (errorMessage) {
+            assert.match(presentation, /failed after 12s[\s\S]*provider\/agent error/);
+            assert.ok(presentation.includes(`Error: ${errorMessage}`));
+          } else {
+            assert.match(presentation, /failed \(exit code 42\)/);
+            assert.match(presentation, /Here is my plan/);
+          }
+          assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+          assert.doesNotMatch(presentation, /resume the session with subagent_message|Follow up with subagent_message/);
+        }
+        assert.doesNotMatch(presentation, /infrastructure observation failure|pane was kept open/i);
+      } finally {
+        handlers.get("session_shutdown")!({}, {});
+        testApi.runningSubagents.delete(id);
+        testApi.lostObservationSessions.delete(resolve(sessionFile));
+        testApi.lostObservationEntries.delete(resolve(sessionFile));
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   for (const exitObserved of [true, false]) {
     it(`clears a shutdown guard when exit is confirmed by ${exitObserved ? "polling" : "reconciliation"}`, async () => {
@@ -5885,7 +5920,7 @@ describe("Rex sizing lifecycle and bounded diagnostics", () => {
     registerSurfaceHandle({ id, kind: "split", name: id, blockId: "block:large", sessionId: "session:test", status: "launched" });
     __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
     __rexTest__.setCommandAvailabilityOverride(true);
-    const text = "long output\n".repeat(1_000_000) + "last line\n";
+    const text = 'long output with "quotes" and \\backslashes\n'.repeat(1_000_000) + "last line\n";
     let calls = 0;
     __rexTest__.setRexExecutor((args, options) => {
       calls++;
@@ -5895,8 +5930,11 @@ describe("Rex sizing lifecycle and bounded diagnostics", () => {
       if (args[6] === "format") return JSON.stringify({ content: text.slice(0, 100), id: 17, total: text.length });
       assert.equal(args[6], "blob_read");
       assert.equal(payload.id, 17);
-      assert.ok(payload.offset >= text.length - DIAGNOSTIC_MAX_BYTES);
-      return JSON.stringify({ data: text.slice(payload.offset), eof: true });
+      assert.equal(payload.offset, text.length - Math.floor(DIAGNOSTIC_MAX_BYTES / 2));
+      const data = text.slice(payload.offset);
+      assert.ok(Buffer.byteLength(JSON.stringify(data)) <= DIAGNOSTIC_MAX_BYTES,
+        "the tail must leave room for JSON escaping within the bounded reply");
+      return JSON.stringify({ data, eof: true });
     });
     try {
       assert.equal(readScreen(id, 1), "last line");

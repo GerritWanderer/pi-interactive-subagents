@@ -773,9 +773,9 @@ function diagnosticArgs(handle: RexSurfaceHandle, method: string, args: object):
 }
 function tailRequest(result: any): object | undefined {
   if (!Number.isInteger(result?.id) || !Number.isSafeInteger(result?.total) || result.total <= 0) return;
-  // max_bytes counts JSON-encoded bytes. Even worst-case escaped text fits in
-  // this tail budget (6 encoded bytes per input byte), without paginating it all.
-  return { id: result.id, offset: Math.max(0, result.total - Math.floor(DIAGNOSTIC_MAX_BYTES / 6)), max_bytes: DIAGNOSTIC_MAX_BYTES };
+  // max_bytes counts JSON-encoded bytes. Read up to 32 KiB of tail text,
+  // reserving half the 64 KiB reply budget for escaping without a third read.
+  return { id: result.id, offset: Math.max(0, result.total - Math.floor(DIAGNOSTIC_MAX_BYTES / 2)), max_bytes: DIAGNOSTIC_MAX_BYTES };
 }
 function diagnosticLines(text: unknown, lines: number): string {
   if (typeof text !== "string") return "";

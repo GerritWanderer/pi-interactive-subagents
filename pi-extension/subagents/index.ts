@@ -593,17 +593,7 @@ function resolveResultPresentation(
   >,
   name: string,
 ): string {
-  // Name is the persistent handle: the same name steers a running subagent or
-  // resumes a finished one, so follow-ups always reference it.
-  const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
-
-  const failedOrInterrupted = result.exitCode !== 0 ||
-    (result.outcome !== undefined && result.outcome !== "success") || !!result.errorMessage;
-  if (
-    result.observationFailure === true ||
-    (failedOrInterrupted && result.sessionFile &&
-      (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile)))
-  ) {
+  if (result.observationFailure === true) {
     return (
       `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
       `${result.summary}\n\n` +
@@ -611,19 +601,34 @@ function resolveResultPresentation(
     );
   }
 
+  // Marker cleanup can fail even after observing a real exit. A retained guard
+  // blocks resume, but must not replace the actual result with observation loss.
+  const failedOrInterrupted = result.exitCode !== 0 ||
+    (result.outcome !== undefined && result.outcome !== "success") || !!result.errorMessage;
+  const resumeBlocked = failedOrInterrupted && result.sessionFile &&
+    (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile));
+  // Name is the persistent handle: the same name steers a running subagent or
+  // resumes a finished one, so safe follow-ups always reference it.
+  const sessionRef = resumeBlocked
+    ? `\n\nResume is blocked until the previous process is confirmed finished.`
+    : `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  const resumeHint = resumeBlocked
+    ? sessionRef.trimStart()
+    : `You can resume the session with subagent_message.${sessionRef}`;
+
   if (result.outcome === "interrupted" || (result.outcome as string) === "cancelled") {
     const isCancelled = result.error === "cancelled" || (result.outcome as string) === "cancelled";
     if (isCancelled) {
       return (
         `Sub-agent "${name}" was cancelled after ${formatElapsed(result.elapsed)}.\n\n` +
-        `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
+        `The session data was preserved. ${resumeHint}`
       );
     }
     const detail = result.errorMessage ? `\n\n${result.errorMessage}` : "";
     return (
       `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
       `(pane closed externally before completion).${detail}\n\n` +
-      `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
+      `The session data was preserved. ${resumeHint}`
     );
   }
 
@@ -636,8 +641,8 @@ function resolveResultPresentation(
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
-      `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_message.${sessionRef}`
+      `The subagent did not produce a result. You can retry by spawning a new subagent` +
+      (resumeBlocked ? `.${sessionRef}` : ` or resume the session with subagent_message.${sessionRef}`)
     );
   }
 
