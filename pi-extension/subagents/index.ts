@@ -717,7 +717,7 @@ export function confirmProcessEnded(sessionFile: string): void {
 // report back. Expose a live count through a process-global symbol that both
 // modules share. (subagent-done.ts reads it; if absent it assumes zero.)
 const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-count");
-(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size;
+(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size + lostObservationSessions.size;
 
 // ── Widget management ──
 

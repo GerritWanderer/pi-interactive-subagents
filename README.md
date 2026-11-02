@@ -121,9 +121,10 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
   - Program status (`OSC 7501`) is checked before submitting input. If the child is blocked on a permission, question, or authentication dialog, delivery is refused with an actionable error and NO input is sent.
   - If program status is missing, unreadable, or untrustworthy, delivery fails fast rather than blindly sending raw keystrokes.
   - Ordinary waiting for input (e.g. `ask_question` reply) is distinguished from a blocked dialog and permits safe message delivery.
-- **Provider Failure vs. Interrupted Pane Closure**:
+- **Provider Failure vs. Interrupted Pane Closure vs. Observation Failure**:
   - *Provider / Agent Failure*: If an agent encounters an error or exhausts provider retries (e.g., Anthropic 529 overload), the failure is detected via the `.exit` sidecar or process exit code and reported as a provider/agent failure with `outcome: "failure"`.
   - *Externally Closed Pane*: If a human or external action closes a subagent pane while it is running, process observation detects the missing block (`not_found`) and reports `outcome: "interrupted"`. The session file and name registry are preserved so the work can be resumed.
+  - *Observation Failure*: If sustained multiplexer infrastructure errors prevent process observation, the pane is kept open to avoid terminating an active agent. A persistent `.lost-observation` marker is written beside the session file. To prevent concurrent corruption, name-based resume through `subagent_message` is refused until the process is confirmed ended (`confirmProcessEnded`). In-flight child counts also treat unresolved lost-observation sessions as pending children, suppressing premature auto-exit of nested parent sessions.
 - **Exiting Pi vs. Closing a Pane**:
   - In interactive subagent panes, exiting Pi normally (e.g., `/exit` or Ctrl+D) completes the session cleanly and triggers normal summary collection.
   - Closing the Rex pane/window externally halts the process abruptly and is classified as an interruption rather than a successful run or an internal provider crash.

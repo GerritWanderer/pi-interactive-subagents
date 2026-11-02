@@ -1687,6 +1687,35 @@ describe("subagent-done.ts", () => {
       });
     });
 
+    it("includes unresolved lost-observation sessions in the child count from index.ts", async () => {
+      const testApi = (subagentsModule as any).__test__;
+      const countKey = Symbol.for("pi-subagents/running-children-count");
+      const indexCountGetter = (globalThis as any)[countKey];
+      assert.equal(typeof indexCountGetter, "function", "index.ts must register running-children-count getter");
+
+      const savedRunning = new Map(testApi.runningSubagents);
+      const savedLost = new Set(testApi.lostObservationSessions);
+      try {
+        testApi.runningSubagents.clear();
+        testApi.lostObservationSessions.clear();
+        assert.equal(runningChildrenCount(), 0);
+
+        testApi.runningSubagents.set("run-1", { id: "run-1" } as any);
+        assert.equal(runningChildrenCount(), 1);
+
+        testApi.lostObservationSessions.add("/path/to/lost-session.jsonl");
+        assert.equal(runningChildrenCount(), 2);
+
+        testApi.runningSubagents.clear();
+        assert.equal(runningChildrenCount(), 1, "lost-observation sessions must keep pending count > 0");
+      } finally {
+        testApi.runningSubagents.clear();
+        for (const [k, v] of savedRunning) testApi.runningSubagents.set(k, v);
+        testApi.lostObservationSessions.clear();
+        for (const item of savedLost) testApi.lostObservationSessions.add(item);
+      }
+    });
+
     it("treats zero/negative/non-number/throwing getters as 0", () => {
       withGlobal(() => 0, () => assert.equal(runningChildrenCount(), 0));
       withGlobal(() => -1, () => assert.equal(runningChildrenCount(), 0));
@@ -3480,9 +3509,14 @@ describe("rex.ts unit tests", () => {
         /No program status records available/,
       );
       assert.equal(
-        executedCommands.some((c) => c.includes("block.event")),
+        executedCommands.some((c) => c[0] === "api" && c[1] === "call" && c[2] === "block.event"),
         false,
         "no input events should be sent when status is missing",
+      );
+      assert.equal(
+        executedCommands.some((c) => c.some((arg) => typeof arg === "string" && (arg.includes('"type":"paste"') || arg.includes('"key":"enter"')))),
+        false,
+        "no paste or enter events should be dispatched when status is missing",
       );
 
       // (b) Blocked/error status report rejects delivery and sends zero input events
@@ -3504,9 +3538,14 @@ describe("rex.ts unit tests", () => {
         /blocked on a permission dialog/,
       );
       assert.equal(
-        executedCommands.some((c) => c.includes("block.event")),
+        executedCommands.some((c) => c[0] === "api" && c[1] === "call" && c[2] === "block.event"),
         false,
         "no input events should be sent when subagent is blocked",
+      );
+      assert.equal(
+        executedCommands.some((c) => c.some((arg) => typeof arg === "string" && (arg.includes('"type":"paste"') || arg.includes('"key":"enter"')))),
+        false,
+        "no paste or enter events should be dispatched when subagent is blocked",
       );
 
       // (c) Valid unblocked Pi status report delivers paste event followed by Enter key event
@@ -4699,13 +4738,29 @@ describe("rex.ts unit tests", () => {
         // (d) autoExit: true with pending children suppresses exit
         let childShutdown = false;
         const countKey = Symbol.for("pi-subagents/running-children-count");
+        const prevCountGetter = (globalThis as any)[countKey];
         (globalThis as any)[countKey] = () => 2;
         try {
           emit("agent_start");
           emit("agent_end", { messages: [{ role: "assistant", stopReason: "end_turn" }] }, { shutdown() { childShutdown = true; } });
           assert.equal(childShutdown, false, "running children > 0 must suppress auto-exit");
         } finally {
-          delete (globalThis as any)[countKey];
+          (globalThis as any)[countKey] = prevCountGetter;
+        }
+
+        // (e) autoExit: true with unresolved lost-observation child suppresses exit
+        let lostObservationShutdown = false;
+        const testApi = (subagentsModule as any).__test__;
+        const savedLost = new Set(testApi.lostObservationSessions);
+        try {
+          testApi.lostObservationSessions.add(join(dir, "lost-child.jsonl"));
+          // Re-trigger running-children-count published by index.ts
+          emit("agent_start");
+          emit("agent_end", { messages: [{ role: "assistant", stopReason: "end_turn" }] }, { shutdown() { lostObservationShutdown = true; } });
+          assert.equal(lostObservationShutdown, false, "lost-observation child must suppress auto-exit");
+        } finally {
+          testApi.lostObservationSessions.clear();
+          for (const s of savedLost) testApi.lostObservationSessions.add(s);
         }
 
         // Restore env
