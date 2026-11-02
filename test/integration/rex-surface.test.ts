@@ -171,8 +171,13 @@ for (const backend of backends) {
             await waitForScreen(surface, /Slash commands/, 10_000);
             if (mode === "automatic") {
               sendMessage(surface, "/native-smoke-dialog");
+              let blockedRecords = queryProgramStatus(handle.blockId!, handle.sessionId);
               const blockedDeadline = Date.now() + 5000;
-              while (!queryProgramStatus(handle.blockId!, handle.sessionId).some((record) => record.state === "blocked") && Date.now() < blockedDeadline) await sleep(100);
+              while (!blockedRecords.some((record) => record.state === "blocked") && Date.now() < blockedDeadline) {
+                await sleep(100);
+                blockedRecords = queryProgramStatus(handle.blockId!, handle.sessionId);
+              }
+              assert.ok(blockedRecords.some((record) => record.state === "blocked"), JSON.stringify(blockedRecords));
               assert.throws(() => sendMessage(surface, "must not reach dialog"), /blocked on a .*dialog/);
             }
           }

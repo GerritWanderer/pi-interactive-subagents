@@ -2,7 +2,7 @@
 
 ## Scope and sources
 
-Milestone 5 of `port-subagents-to-rex` reuses Pi's native rendering and OSC 7501 reporter. The adapter only preserves explicit native environment choices in server-launched wrappers and consumes status before steering. No global Pi/Rex settings, keyboard bindings, or installed subagent implementation were modified or consulted.
+Milestone 5 of `port-subagents-to-rex` reuses Pi's native rendering and OSC 7501 reporter. The adapter only preserves explicit native environment choices in server-launched wrappers and consumes status before steering. Global configuration and the live server's keymap were inspected in read-only mode; no user/global Pi/Rex settings or keyboard bindings were modified, applied, or reloaded. The installed subagent implementation was neither modified nor consulted.
 
 Canonical Pi inputs were read from the installed **1.4.0** distribution (`pi/docs/terminal-setup.md`, `environment-variables.md`, `settings.md`, `configuration.md`, `keybindings.md`, `extensions.md`, `tui.md`, plus `CHANGELOG.md`). Changelog entries identify Rex hyperlinks/truecolor/images in **1.4.0**, and program status in **1.1.0**. See the [README capability and configuration guidance](../README.md#native-pi-capabilities--safe-steering) for supported override names and precedence. `PI_TERMINAL_STATUS` / `PI_IMAGE_SUPPORT` are not the documented 1.4.0 names.
 
