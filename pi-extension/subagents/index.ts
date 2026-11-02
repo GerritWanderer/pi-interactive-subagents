@@ -603,9 +603,7 @@ function resolveResultPresentation(
 
   // Marker cleanup can fail even after observing a real exit. A retained guard
   // blocks resume, but must not replace the actual result with observation loss.
-  const failedOrInterrupted = result.exitCode !== 0 ||
-    (result.outcome !== undefined && result.outcome !== "success") || !!result.errorMessage;
-  const resumeBlocked = failedOrInterrupted && result.sessionFile &&
+  const resumeBlocked = result.sessionFile &&
     (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile));
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so safe follow-ups always reference it.

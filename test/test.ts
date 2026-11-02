@@ -2539,6 +2539,7 @@ describe("subagent interruption", () => {
           if (guard === "in-memory") testApi.lostObservationSessions.add(resolve(sessionFile));
           else writeLostObservationMarker(sessionFile);
           for (const { result, expected } of [
+            { result: { outcome: "success" as const }, expected: /completed \(10s\)\.\n\nReal result/ },
             { result: { outcome: "failure" as const }, expected: /failed \(exit code 42\)/ },
             {
               result: { outcome: "failure" as const, errorMessage: "Anthropic 529 Overloaded" },
@@ -2555,7 +2556,7 @@ describe("subagent interruption", () => {
             { result: { outcome: "cancelled" as const }, expected: /was cancelled after 10s/ },
           ]) {
             const presentation = testApi.resolveResultPresentation(
-              { exitCode: 42, elapsed: 10, summary: "Real result", sessionFile, ...result },
+              { exitCode: result.outcome === "success" ? 0 : 42, elapsed: 10, summary: "Real result", sessionFile, ...result },
               "guarded-worker",
             );
             assert.match(presentation, expected);
@@ -2587,11 +2588,11 @@ describe("subagent interruption", () => {
           { exitCode: 0, elapsed: 12, summary: "Completed work", outcome: "success", sessionFile },
           "successful-worker",
         );
-        assert.match(presentation, /completed/);
-        assert.match(presentation, /Completed work/);
-        assert.doesNotMatch(presentation, /infrastructure observation failure|Resume is blocked/);
+        assert.match(presentation, /Sub-agent "successful-worker" completed \(12s\)\.\n\nCompleted work/);
+        assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+        assert.doesNotMatch(presentation, /infrastructure observation failure|Follow up with subagent_message/);
       }
-      assert.equal(statChecks, 0, "successful results must not inspect the resume guard on disk");
+      assert.equal(statChecks, 1, "check the disk guard unless the in-memory guard already blocks resume");
     } finally {
       __setStatSyncOverride(null);
       testApi.lostObservationSessions.delete(resolve(sessionFile));
@@ -5321,9 +5322,9 @@ describe("subagent watcher exit during shutdown", () => {
             assert.match(presentation, /failed \(exit code 42\)/);
             assert.match(presentation, /Here is my plan/);
           }
-          assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
-          assert.doesNotMatch(presentation, /resume the session with subagent_message|Follow up with subagent_message/);
         }
+        assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+        assert.doesNotMatch(presentation, /resume the session with subagent_message|Follow up with subagent_message/);
         assert.doesNotMatch(presentation, /infrastructure observation failure|pane was kept open/i);
       } finally {
         handlers.get("session_shutdown")!({}, {});
