@@ -3871,9 +3871,11 @@ describe("rex.ts unit tests", () => {
   });
 
   for (const failRename of [false, true]) {
-    it(`labels the returned top-level command pane${failRename ? " and cleans it up if labeling fails" : " without relying on focus"}`, async () => {
+    it(`labels the returned top-level command pane${failRename ? " and preserves it with a warning if labeling fails" : " without relying on focus"}`, async (t) => {
       const { createSurface, sendLongCommand, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
       const dir = mkdtempSync(join(tmpdir(), "rex-label-"));
+      const renameError = new Error("rename unavailable");
+      const warning = t.mock.method(console, "warn", () => {});
       const savedName = process.env.PI_SUBAGENT_NAME;
       const savedTop = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
       delete process.env.PI_SUBAGENT_NAME;
@@ -3884,21 +3886,27 @@ describe("rex.ts unit tests", () => {
       __rexTest__.setRexExecutor((args) => {
         calls.push(args);
         if (args[0] === "window" && args[1] === "new") return JSON.stringify({ window_id: "window:label", block_ids: ["block:created"] });
-        if (args[0] === "block" && args[1] === "rename" && failRename) throw new Error("rename unavailable");
+        if (args[0] === "block" && args[1] === "rename") {
+          assert.equal(getSurfaceHandle(surface)?.status, "launched", "command must be marked launched before labeling");
+          if (failRename) throw renameError;
+        }
         if (args[0] === "block" && args[1] === "inspect") return JSON.stringify({ block: { window_id: "window:label" } });
         if (args[0] === "window" && args[1] === "inspect") return JSON.stringify({ layers: [{ blocks: [{ block_id: "block:created" }] }] });
         return "{}";
       });
       const surface = createSurface("literal 'agent' $name");
       try {
-        const launch = () => sendLongCommand(surface, "true", { scriptPath: join(dir, "launch.sh") });
+        const scriptPath = join(dir, "launch.sh");
+        assert.equal(sendLongCommand(surface, "true", { scriptPath }), scriptPath);
+        assert.equal(getSurfaceHandle(surface)?.status, "launched");
+        assert.equal(getSurfaceHandle(surface)?.windowId, "window:label");
+        assert.equal(getSurfaceHandle(surface)?.blockId, "block:created");
+        assert.equal(calls.some((c) => c[1] === "close" || c[1] === "kill"), false,
+          "labeling must not close or kill the launched surface");
+        assert.equal(warning.mock.callCount(), failRename ? 1 : 0);
         if (failRename) {
-          assert.throws(launch, /rename unavailable/);
-          assert.equal(getSurfaceHandle(surface), undefined);
-          assert.ok(calls.some((c) => c[0] === "window" && c[1] === "close" && c.includes("window:label")));
-        } else {
-          launch();
-          assert.equal(getSurfaceHandle(surface)?.blockId, "block:created");
+          assert.deepEqual(warning.mock.calls[0].arguments,
+            ["Failed to set pane label for subagent \"literal 'agent' $name\":", renameError]);
         }
         assert.deepEqual(calls.find((c) => c[0] === "block" && c[1] === "rename"),
           ["block", "rename", "-s", "session:label", "block:created", "literal 'agent' $name"]);

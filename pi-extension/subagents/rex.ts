@@ -571,10 +571,15 @@ function launchRexSurface(handle: RexSurfaceHandle, scriptPath: string, cwd?: st
       throw new Error(`Failed to create Rex window for subagent: unexpected output ${JSON.stringify(res)}`);
     }
 
+    handle.status = "launched";
     // `window new LABEL` names only the tab; its command pane otherwise keeps
     // the generic shell label. Use the returned ID, never the focused block.
-    rexExec(["block", "rename", "-s", sessionId, handle.blockId!, label]);
-    handle.status = "launched";
+    // Labeling failure must not tear down the already-running command.
+    try {
+      rexExec(["block", "rename", "-s", sessionId, handle.blockId!, label]);
+    } catch (renameErr) {
+      console.warn(`Failed to set pane label for subagent "${label}":`, renameErr);
+    }
   } else {
     // rex split -s SESSION -b ANCHOR --split=DIRECTION --label=LABEL --focus=false --keep-open --json -- COMMAND...
     const anchor = handle.anchorBlockId;
