@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether Herdr is available
+ * - Detect whether Rex is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in Herdr panes
+ * - Start real pi sessions in Rex panes
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -17,6 +17,7 @@ import {
   existsSync,
   readFileSync,
   unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,9 +34,12 @@ import {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
-} from "../../pi-extension/subagents/herdr.ts";
+  disposeRexSurfaces,
+  rexJson,
+  rexExec,
+} from "../../pi-extension/subagents/rex.ts";
 
-// Re-export Herdr primitives for tests
+// Re-export Rex primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -79,11 +83,11 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether Herdr is available in the current environment.
- * Returns ["herdr"] or [].
+ * Detect whether Rex is available in the current environment.
+ * Returns ["rex"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["herdr"] : [];
+  return isMuxAvailable() ? ["rex"] : [];
 }
 
 export async function waitForFocusedSurface(
@@ -97,7 +101,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused Herdr pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused Rex pane ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
@@ -111,27 +115,82 @@ export interface TestEnv {
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
+  /** Optional dedicated Rex session: includes descendants even if a test fails. */
+  rexSession?: string;
+  /** Restore the invoking terminal's identity after isolated-session cleanup. */
+  savedContext?: Record<string, string | undefined>;
 }
 
 /**
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
  */
-export function createTestEnv(): TestEnv {
+export function createTestEnv(opts?: { isolateRex?: boolean; agentsSrc?: string }): TestEnv {
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
-  const agentsDir = join(dir, ".pi", "agents");
-  mkdirSync(agentsDir, { recursive: true });
+  const env: TestEnv = { dir, surfaces: [], tempFiles: [] };
+  try {
+    const agentsDir = join(dir, ".pi", "agents");
+    mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
-  if (existsSync(TEST_AGENTS_SRC)) {
-    for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+    // Allow isolated profile fixtures without modifying the shared test agents.
+    const agentsSrc = opts?.agentsSrc ?? TEST_AGENTS_SRC;
+    // Copy test agent definitions into the project-local agents dir
+    if (existsSync(agentsSrc)) {
+      for (const file of readdirSync(agentsSrc)) {
+        if (file.endsWith(".md")) {
+          const target = join(agentsDir, file);
+          cpSync(join(agentsSrc, file), target);
+          // Rewrite only frontmatter: body examples must not override this guard.
+          // The approved model applies to parents AND profile-selected children.
+          const content = readFileSync(target, "utf8").replace(/\r\n/g, "\n").replace(
+            /^---\n((?:[^\n]*\n)*?)---(?=\n|$)/,
+            (_match, frontmatter: string) => {
+              frontmatter = /^model:/m.test(frontmatter)
+                ? frontmatter.replace(/^model:.*$/gm, () => `model: ${TEST_MODEL}`)
+                : `${frontmatter}model: ${TEST_MODEL}\n`;
+              frontmatter = /^thinking:/m.test(frontmatter)
+                ? frontmatter.replace(/^thinking:.*$/gm, () => "thinking: off")
+                : `${frontmatter}thinking: off\n`;
+              return `---\n${frontmatter}---`;
+            },
+          );
+          writeFileSync(target, content);
+        }
       }
     }
-  }
 
-  return { dir, surfaces: [], tempFiles: [] };
+    if (opts?.isolateRex) {
+      const created = rexJson(["new", `pi-lifecycle-${uniqueId()}`, "-c", dir, "--json", "--", "bash", "-c", "sleep 3600"]);
+      // Record ownership before validating the rest of the response so rollback
+      // can kill a created session even when its initial block is malformed.
+      if (typeof created?.session_id === "string" && created.session_id.trim()) {
+        env.rexSession = created.session_id;
+      }
+      const initialWindow = Array.isArray(created?.initial_windows) ? created.initial_windows[0] : undefined;
+      const blockId = Array.isArray(initialWindow?.block_ids) ? initialWindow.block_ids[0] : undefined;
+      if (!env.rexSession || typeof blockId !== "string" || !blockId.trim()) {
+        throw new Error("Invalid Rex test session response: expected a session ID and an initial block ID");
+      }
+
+      const keys = ["REX_SESSION", "REX_BLOCK", ...Object.keys(process.env).filter((k) => k.startsWith("PI_SUBAGENT_"))];
+      env.savedContext = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+      for (const key of keys) {
+        if (key.startsWith("PI_SUBAGENT_")) delete process.env[key];
+      }
+      process.env.REX_SESSION = env.rexSession;
+      process.env.REX_BLOCK = blockId;
+    }
+    return env;
+  } catch (error) {
+    try {
+      if (env.rexSession) rexExec(["kill", env.rexSession]);
+    } catch (cleanupError) {
+      console.warn("Failed to kill Rex test session:", cleanupError);
+    } finally {
+      cleanupLocalTestResources(env);
+    }
+    throw error;
+  }
 }
 
 /**
@@ -142,6 +201,32 @@ export function cleanupTestEnv(env: TestEnv): void {
     try {
       closeSurface(surface);
     } catch {}
+  }
+  try {
+    try {
+      disposeRexSurfaces();
+    } catch (error) {
+      console.warn("Failed to dispose Rex surfaces:", error);
+    }
+    if (env.rexSession) {
+      try {
+        // Only the exact session returned by this fixture's `rex new` is owned.
+        // This also cleans descendant panes that outlived a failed assertion.
+        rexExec(["kill", env.rexSession]);
+      } catch (error) {
+        console.warn("Failed to kill Rex test session:", error);
+      }
+    }
+  } finally {
+    cleanupLocalTestResources(env);
+  }
+}
+
+/** Shared by normal teardown and setup rollback, even when Rex cleanup fails. */
+function cleanupLocalTestResources(env: TestEnv): void {
+  for (const [key, value] of Object.entries(env.savedContext ?? {})) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
   for (const file of env.tempFiles) {
     try {
@@ -185,7 +270,7 @@ export function untrackSurface(env: TestEnv, surface: string): void {
 
 /**
  * Start a pi session in a mux surface with the subagents extension loaded.
- * Returns immediately — the pi process runs asynchronously in the surface.
+ * Returns the explicit parent transcript path immediately; Pi runs asynchronously.
  *
  * The command ends with a sentinel so we can detect when pi exits:
  *   `pi ...; echo '__TEST_DONE_'$?'__'`
@@ -195,7 +280,8 @@ export function startPi(
   testDir: string,
   task: string,
   opts?: { model?: string; extraArgs?: string },
-): void {
+): string {
+  const sessionFile = join(testDir, `parent-${uniqueId()}.jsonl`);
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
 
@@ -209,15 +295,19 @@ export function startPi(
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
+    `--session ${shellEscape(sessionFile)}`,
+    `--thinking off --no-mcp --no-skills --no-prompt-templates --no-context-files`,
     extra,
     shellEscape(task),
   ]
     .filter(Boolean)
     .join(" ");
 
-  sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
-    scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
+  sendLongCommand(surface, `for key in \${!PI_SUBAGENT_@}; do unset "$key"; done\n${cmd}; status=$?; echo "__TEST_DONE_\${status}__"; exit "$status"`, {
+    cwd: testDir,
+    scriptPath: join(testDir, `test-launch-${uniqueId()}.sh`),
   });
+  return sessionFile;
 }
 
 // ── Polling helpers ──

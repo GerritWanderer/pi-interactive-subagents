@@ -17,7 +17,6 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  needsShellReadyDelay,
   createSurface,
   sendMessage,
   sendLongCommand,
@@ -25,7 +24,12 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./herdr.ts";
+  isRexInfrastructureError,
+  queryBlockProcess,
+  getSurfaceHandle,
+  getRexContext,
+  disposeRexSurfaces,
+} from "./rex.ts";
 
 import {
   countSessionEntryLines,
@@ -39,6 +43,10 @@ import {
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
+  writeLostObservationMarker,
+  readLostObservationMarker,
+  hasLostObservationMarker,
+  clearLostObservationMarker,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -71,6 +79,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const PARENT_PARKED_FOR_CHILDREN_KEY = Symbol.for("pi-subagents/parent-parked-for-children");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -275,17 +284,12 @@ function getProviderAuthExtensionPath(model: string | null | undefined): string 
   return existsSync(path) ? path : undefined;
 }
 
-/**
- * When this process was spawned as a restricted subagent, the parent pins the
- * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session, or an unrestricted child).
- */
-const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
+function getSubagentAllowlist(): Set<string> | null {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
   if (!raw) return null;
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? new Set(list) : null;
-})();
+}
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -370,7 +374,8 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   // When this process is itself a restricted subagent, only expose the agents
   // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
   const all = [...agents.values()];
-  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
+  const allowlist = getSubagentAllowlist();
+  return allowlist ? all.filter((a) => allowlist.has(a.name)) : all;
 }
 
 function resolveSubagentPaths(
@@ -533,18 +538,9 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
   }
 }
 
-/**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
-function getShellReadyDelayMs(): number {
-  if (!needsShellReadyDelay()) return 0;
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
+/** Preserve the real command status independently of the compatibility sentinel. */
+export function wrapLaunchCommand(baseCommand: string): string {
+  return `${baseCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
 }
 
 function muxUnavailableResult() {
@@ -552,10 +548,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require Herdr. ${muxSetupHint()}`,
+        text: `Subagents require Rex. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "herdr not available" },
+    details: { error: "rex not available" },
   };
 }
 
@@ -593,13 +589,46 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "outcome" | "error" | "observationFailure"
   >,
   name: string,
 ): string {
+  if (result.observationFailure === true) {
+    return (
+      `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
+      `${result.summary}\n\n` +
+      `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
+    );
+  }
+
+  // Marker cleanup can fail even after observing a real exit. A retained guard
+  // blocks resume, but must not replace the actual result with observation loss.
+  const resumeBlocked = result.sessionFile &&
+    (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile));
   // Name is the persistent handle: the same name steers a running subagent or
-  // resumes a finished one, so follow-ups always reference it.
-  const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  // resumes a finished one, so safe follow-ups always reference it.
+  const sessionRef = resumeBlocked
+    ? `\n\nResume is blocked until the previous process is confirmed finished.`
+    : `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  const resumeHint = resumeBlocked
+    ? sessionRef.trimStart()
+    : `You can resume the session with subagent_message.${sessionRef}`;
+
+  if (result.outcome === "interrupted" || (result.outcome as string) === "cancelled") {
+    const isCancelled = result.error === "cancelled" || (result.outcome as string) === "cancelled";
+    if (isCancelled) {
+      return (
+        `Sub-agent "${name}" was cancelled after ${formatElapsed(result.elapsed)}.\n\n` +
+        `The session data was preserved. ${resumeHint}`
+      );
+    }
+    const detail = result.errorMessage ? `\n\n${result.errorMessage}` : "";
+    return (
+      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
+      `(pane closed externally before completion).${detail}\n\n` +
+      `The session data was preserved. ${resumeHint}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -610,8 +639,8 @@ function resolveResultPresentation(
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
-      `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_message.${sessionRef}`
+      `The subagent did not produce a result. You can retry by spawning a new subagent` +
+      (resumeBlocked ? `.${sessionRef}` : ` or resume the session with subagent_message.${sessionRef}`)
     );
   }
 
@@ -634,6 +663,8 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  observationFailure?: boolean;
+  outcome?: "success" | "failure" | "interrupted" | "cancelled";
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
@@ -675,6 +706,130 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/** Set of resolved session file paths whose process observation was lost and not confirmed exited. */
+const lostObservationSessions = new Set<string>();
+
+interface LostObservationEntry {
+  sessionFile: string;
+  surface: string;
+  blockId?: string;
+  sessionId: string;
+  /** Background attempts only; exhausting the budget must never release the resume guard. */
+  automaticAttempts?: number;
+}
+const lostObservationEntries = new Map<string, LostObservationEntry>();
+const MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS = 10;
+
+/** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended.
+ * Throws if clearing the disk marker fails, preserving the in-memory guard.
+ */
+export function confirmProcessEnded(sessionFile: string): void {
+  clearLostObservationMarker(sessionFile);
+  lostObservationSessions.delete(resolve(sessionFile));
+  lostObservationEntries.delete(resolve(sessionFile));
+}
+
+const guardedSubagentRuns = new WeakSet<RunningSubagent>();
+
+/** Preserve resume safety without starting new work in a disposed runtime. */
+function recordLostObservation(running: RunningSubagent): Error | null {
+  const { sessionFile, surface } = running;
+  if (!sessionFile || guardedSubagentRuns.has(running)) return null;
+
+  // Shutdown records synchronously; its later watcher rejection must not
+  // recreate a guard that reconciliation has already cleared.
+  guardedSubagentRuns.add(running);
+
+  const resolvedPath = resolve(sessionFile);
+  const surfaceHandle = getSurfaceHandle(surface);
+  const entry = {
+    sessionFile,
+    surface,
+    blockId: surfaceHandle?.blockId,
+    sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
+  };
+  lostObservationSessions.add(resolvedPath);
+  lostObservationEntries.set(resolvedPath, entry);
+  try {
+    writeLostObservationMarker(sessionFile, entry);
+    return null;
+  } catch (err) {
+    console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, err);
+    return err instanceof Error ? err : new Error(String(err));
+  }
+}
+
+let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleLostObservationReconciliation(): void {
+  // Missing coordinates and exhausted retry budgets retain their safety guards,
+  // but must not keep an automatic polling loop alive.
+  const hasQueryableEntry = Array.from(lostObservationEntries.values()).some(
+    (entry) => entry.blockId?.trim() && entry.sessionId?.trim() &&
+      (entry.automaticAttempts ?? 0) < MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS,
+  );
+  if (hasQueryableEntry && !reconcileRetryTimer) {
+    reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
+    reconcileRetryTimer.unref?.();
+  }
+}
+
+export function reconcileLostObservations(sessionPathCheck?: string): void {
+  if (reconcileRetryTimer) {
+    clearTimeout(reconcileRetryTimer);
+    reconcileRetryTimer = null;
+  }
+  if (sessionPathCheck && !lostObservationEntries.has(resolve(sessionPathCheck))) {
+    const marker = readLostObservationMarker(sessionPathCheck);
+    if (marker?.blockId) {
+      lostObservationEntries.set(resolve(sessionPathCheck), {
+        sessionFile: sessionPathCheck,
+        surface: marker.surface ?? "",
+        blockId: marker.blockId,
+        sessionId: marker.sessionId ?? "",
+      });
+    }
+  }
+
+  let reconciled = false;
+  const requestedPath = sessionPathCheck ? resolve(sessionPathCheck) : undefined;
+  for (const [sessionPath, entry] of lostObservationEntries) {
+    if (!entry.blockId?.trim() || !entry.sessionId?.trim()) continue;
+    // Explicit resume checks can always query their target, even after its
+    // background budget is exhausted. Failed queries also consume that budget.
+    if (sessionPath !== requestedPath) {
+      if ((entry.automaticAttempts ?? 0) >= MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS) continue;
+      entry.automaticAttempts = (entry.automaticAttempts ?? 0) + 1;
+    }
+    try {
+      const proc = queryBlockProcess(entry.blockId, entry.sessionId);
+      if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
+        confirmProcessEnded(sessionPath);
+        reconciled = true;
+        if (entry.surface) safeCloseSurface(entry.surface);
+      }
+    } catch {}
+  }
+  scheduleLostObservationReconciliation();
+  if (
+    reconciled &&
+    sessionPathCheck === undefined &&
+    (globalThis as any)[PARENT_PARKED_FOR_CHILDREN_KEY] === true &&
+    runningSubagents.size + lostObservationSessions.size === 0
+  ) {
+    const content = "All child processes with lost observations are now confirmed ended. No child subagents remain pending.";
+    latestPi?.sendMessage(
+      {
+        customType: "subagent_status",
+        content,
+        display: true,
+        details: { lines: [content], overflow: 0 },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  }
+}
+
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
 // same process and needs to know whether this session still has children in
@@ -682,7 +837,7 @@ const runningSubagents = new Map<string, RunningSubagent>();
 // report back. Expose a live count through a process-global symbol that both
 // modules share. (subagent-done.ts reads it; if absent it assumes zero.)
 const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-count");
-(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size;
+(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size + lostObservationSessions.size;
 
 // ── Widget management ──
 
@@ -690,6 +845,51 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
+
+/** Set of surfaces pending cleanup after close failure, with retry state. */
+interface PendingCleanupEntry {
+  surface: string;
+  retriesLeft: number;
+}
+const pendingCleanups = new Map<string, PendingCleanupEntry>();
+let cleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function processPendingCleanups(): void {
+  cleanupRetryTimer = null;
+  reconcileLostObservations();
+  for (const [surface, entry] of pendingCleanups) {
+    try {
+      closeSurface(surface);
+      pendingCleanups.delete(surface);
+    } catch (err) {
+      entry.retriesLeft--;
+      if (entry.retriesLeft <= 0) {
+        console.error(`Failed to clean up surface ${surface} after retries exhausted: ${err}`);
+        pendingCleanups.delete(surface);
+      }
+    }
+  }
+  if (pendingCleanups.size > 0 && !cleanupRetryTimer) {
+    cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+    cleanupRetryTimer.unref?.();
+  }
+}
+
+function safeCloseSurface(surface: string): void {
+  try {
+    closeSurface(surface);
+    pendingCleanups.delete(surface);
+  } catch {
+    // Schedule bounded retry
+    if (!pendingCleanups.has(surface)) {
+      pendingCleanups.set(surface, { surface, retriesLeft: 5 });
+    }
+    if (!cleanupRetryTimer) {
+      cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+      cleanupRetryTimer.unref?.();
+    }
+  }
+}
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -1054,7 +1254,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
+        `Failed to deliver message to subagent "${running.name}" via Rex: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1167,7 +1367,6 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 
 export const __test__ = {
   borderLine,
-  getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1188,12 +1387,24 @@ export const __test__ = {
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  lostObservationSessions,
+  lostObservationEntries,
+  confirmProcessEnded,
+  reconcileLostObservations,
+  MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS,
   formatElapsed,
   formatTokens,
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  watchSubagent,
+  launchSubagent,
+  createSurface: (name: string) => createSurface(name),
+  wrapLaunchCommand,
+  pendingCleanups,
+  processPendingCleanups,
+  safeCloseSurface,
 };
 
 function startWidgetRefresh() {
@@ -1248,77 +1459,216 @@ async function launchSubagent(
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
+  const surface = options?.surface ?? __test__.createSurface(params.name);
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  try {
+    const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
-  if (launchBehavior.seededSessionMode) {
-    seedSubagentSessionFile({
-      mode: launchBehavior.seededSessionMode,
-      parentSessionFile: sessionFile,
-      childSessionFile: subagentSessionFile,
-      childCwd: targetCwdForSession,
-    });
-  }
-
-  const activityFile = getSubagentActivityFile(artifactDir, id);
-  mkdirSync(dirname(activityFile), { recursive: true });
-  const { inheritsConversationContext } = launchBehavior;
-
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
-    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
-  // An agent with a non-empty subagent_agents list is granted the spawning
-  // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
-  const identity = agentDefs?.body ?? null;
-  const systemPromptMode = agentDefs?.systemPromptMode;
-  const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = inheritsConversationContext
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
-    const sentinelFile = `/tmp/pi-claude-${id}-done`;
-    const pluginDir = join(SUBAGENTS_DIR, "plugin");
-
-    const cmdParts: string[] = [];
-    cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
-    cmdParts.push("claude");
-    cmdParts.push("--dangerously-skip-permissions");
-
-    if (existsSync(pluginDir)) {
-      cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+    if (launchBehavior.seededSessionMode) {
+      seedSubagentSessionFile({
+        mode: launchBehavior.seededSessionMode,
+        parentSessionFile: sessionFile,
+        childSessionFile: subagentSessionFile,
+        childCwd: targetCwdForSession,
+      });
     }
 
-    if (effectiveModel) {
-      cmdParts.push("--model", shellEscape(effectiveModel));
+    const activityFile = getSubagentActivityFile(artifactDir, id);
+    mkdirSync(dirname(activityFile), { recursive: true });
+    const { inheritsConversationContext } = launchBehavior;
+
+    // Build the task message
+    // Only full-context fork mode inherits prior conversation state.
+    // Blank-session modes need the wrapper instructions and artifact-backed handoff.
+    const modeHint = agentDefs?.autoExit
+      ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
+      : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
+    const summaryInstruction = agentDefs?.autoExit
+      ? "Your FINAL assistant message should summarize what you accomplished."
+      : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
+    // An agent with a non-empty subagent_agents list is granted the spawning
+    // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
+    const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+    const identity = agentDefs?.body ?? null;
+    const systemPromptMode = agentDefs?.systemPromptMode;
+    const identityInSystemPrompt = systemPromptMode && identity;
+    const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+    const fullTask = inheritsConversationContext
+      ? params.task
+      : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    // ── Claude Code CLI path ──
+    if (agentDefs?.cli === "claude") {
+      const sentinelFile = `/tmp/pi-claude-${id}-done`;
+      const pluginDir = join(SUBAGENTS_DIR, "plugin");
+
+      const cmdParts: string[] = [];
+      cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
+      cmdParts.push("claude");
+      cmdParts.push("--dangerously-skip-permissions");
+
+      if (existsSync(pluginDir)) {
+        cmdParts.push("--plugin-dir", shellEscape(pluginDir));
+      }
+
+      if (effectiveModel) {
+        cmdParts.push("--model", shellEscape(effectiveModel));
+      }
+
+      const sp = agentDefs.body;
+      if (sp) {
+        cmdParts.push("--append-system-prompt", shellEscape(sp));
+      }
+
+      // Always pass the task as the prompt — even for resumed sessions,
+      // the caller's task is the follow-up instruction.
+      cmdParts.push(shellEscape(params.task));
+
+      const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+      const command = wrapLaunchCommand(`${cdPrefix}${cmdParts.join(" ")}`);
+
+      const launchScriptName = `${(params.name || "subagent")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "")
+        .replace(/\s+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+      const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
+
+      sendLongCommand(surface, command, {
+        cwd: targetCwdForSession,
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Claude Code subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      });
+
+      const running: RunningSubagent = {
+        id,
+        name: params.name,
+        task: params.task,
+        agent: params.agent,
+        surface,
+        startTime,
+        sessionFile: subagentSessionFile,
+        launchScriptFile,
+        cli: "claude",
+        sentinelFile,
+        interactive: effectiveInteractive,
+        statusState: createStatusState({
+          source: "claude",
+          startTimeMs: startTime,
+        }),
+      };
+
+      runningSubagents.set(id, running);
+      return running;
     }
 
-    const sp = agentDefs.body;
-    if (sp) {
-      cmdParts.push("--append-system-prompt", shellEscape(sp));
+    // ── Pi CLI path ──
+
+    // Build pi command
+    const parts: string[] = ["pi"];
+    parts.push("--session", shellEscape(subagentSessionFile));
+
+    const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+    parts.push("-e", shellEscape(subagentDonePath));
+
+    // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
+    // else the propagated global dir. Captured once so the launch env and the
+    // resume snapshot agree.
+    const resolvedAgentDir =
+      localAgentDir && existsSync(localAgentDir)
+        ? localAgentDir
+        : process.env.PI_CODING_AGENT_DIR ?? null;
+
+    // Default-deny model: when an agent restricts its tools (or is granted the
+    // spawning toolset), we disable global extension discovery and re-enable only
+    // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
+    // restriction keep their full default toolset and all global extensions.
+    const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+
+    // Snapshot the fully-resolved sandbox beside the session file so a later
+    // `subagent_message({ name })` resume can replay the exact same
+    // restriction instead of relaunching pi with all global extensions + tools.
+    const loadout: SubagentLoadout = {
+      agent: params.agent ?? null,
+      toolAllowlist,
+      model: effectiveModel ?? null,
+      thinking: effectiveThinking ?? null,
+      systemPromptMode: systemPromptMode ?? null,
+      identity: identityInSystemPrompt ? identity : null,
+      spawnable: agentDefs?.subagentAgents ?? null,
+      autoExit: agentDefs?.autoExit ?? false,
+      cwd: targetCwdForSession,
+      agentDir: resolvedAgentDir,
+    };
+    writeSubagentLoadout(subagentSessionFile, loadout);
+
+    // Apply model, identity, and the default-deny tool/extension restriction via
+    // the shared helper (same code path resume uses — they can't drift).
+    applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+
+    // Build env prefix: subagent identity + config dir propagation + spawn allowlist
+    const envParts: string[] = [];
+
+    if (resolvedAgentDir) {
+      envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
     }
 
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
-    cmdParts.push(shellEscape(params.task));
+    if (grantSpawning && agentDefs?.subagentAgents) {
+      envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
+    }
+    envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+    if (params.agent) {
+      envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+    }
+    if (agentDefs?.autoExit) {
+      envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+    }
+    envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
+    envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+    envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+    envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+    const envPrefix = envParts.join(" ") + " ";
 
+    // Pass task and skill prompts to the sub-agent.
+    // Only full-context fork mode gets a direct task argument because it already
+    // inherits the parent conversation. Blank-session modes use artifact-backed
+    // handoff so the wrapper instructions arrive as the initial user message.
+    let taskArg: string;
+    if (launchBehavior.taskDelivery === "direct") {
+      taskArg = fullTask;
+    } else {
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const safeName = params.name
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
+        .replace(/\s+/g, "-") // spaces to hyphens
+        .replace(/-+/g, "-") // collapse multiple hyphens
+        .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
+      const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+      const artifactPath = join(artifactDir, artifactName);
+      mkdirSync(dirname(artifactPath), { recursive: true });
+      writeFileSync(artifactPath, fullTask, "utf8");
+      taskArg = `@${artifactPath}`;
+    }
+
+    for (const promptArg of buildPiPromptArgs({
+      effectiveSkills,
+      taskDelivery: launchBehavior.taskDelivery,
+      taskArg,
+    })) {
+      parts.push(shellEscape(promptArg));
+    }
+
+    // Resolve cwd — param overrides agent default, supports absolute and relative paths.
+    // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
+    const piCommand = cdPrefix + envPrefix + parts.join(" ");
+    const command = wrapLaunchCommand(piCommand);
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "")
@@ -1326,12 +1676,13 @@ async function launchSubagent(
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-
     sendLongCommand(surface, command, {
+      cwd: targetCwdForSession,
       scriptPath: launchScriptFile,
       scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
+        `# Subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
         `# Surface: ${surface}`,
       ].join("\n"),
     });
@@ -1345,158 +1696,25 @@ async function launchSubagent(
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
-      cli: "claude",
-      sentinelFile,
+      activityFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
-        source: "claude",
+        source: "pi",
         startTimeMs: startTime,
       }),
     };
 
     runningSubagents.set(id, running);
     return running;
+  } catch (launchErr) {
+    // Release surface reservation on preparation or launch failure
+    try {
+      safeCloseSurface(surface);
+    } catch {
+      // safeCloseSurface handles enqueueing pendingCleanups; preserve launchErr
+    }
+    throw launchErr;
   }
-
-  // ── Pi CLI path ──
-
-  // Build pi command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
-
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
-
-  // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
-  // else the propagated global dir. Captured once so the launch env and the
-  // resume snapshot agree.
-  const resolvedAgentDir =
-    localAgentDir && existsSync(localAgentDir)
-      ? localAgentDir
-      : process.env.PI_CODING_AGENT_DIR ?? null;
-
-  // Default-deny model: when an agent restricts its tools (or is granted the
-  // spawning toolset), we disable global extension discovery and re-enable only
-  // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
-  // restriction keep their full default toolset and all global extensions.
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
-
-  // Snapshot the fully-resolved sandbox beside the session file so a later
-  // `subagent_message({ name })` resume can replay the exact same
-  // restriction instead of relaunching pi with all global extensions + tools.
-  const loadout: SubagentLoadout = {
-    agent: params.agent ?? null,
-    toolAllowlist,
-    model: effectiveModel ?? null,
-    thinking: effectiveThinking ?? null,
-    systemPromptMode: systemPromptMode ?? null,
-    identity: identityInSystemPrompt ? identity : null,
-    spawnable: agentDefs?.subagentAgents ?? null,
-    autoExit: agentDefs?.autoExit ?? false,
-    cwd: effectiveCwd ?? null,
-    agentDir: resolvedAgentDir,
-  };
-  writeSubagentLoadout(subagentSessionFile, loadout);
-
-  // Apply model, identity, and the default-deny tool/extension restriction via
-  // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
-
-  // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
-
-  if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
-  }
-
-  if (grantSpawning && agentDefs?.subagentAgents) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
-  }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  if (agentDefs?.autoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
-  const envPrefix = envParts.join(" ") + " ";
-
-  // Pass task and skill prompts to the sub-agent.
-  // Only full-context fork mode gets a direct task argument because it already
-  // inherits the parent conversation. Blank-session modes use artifact-backed
-  // handoff so the wrapper instructions arrive as the initial user message.
-  let taskArg: string;
-  if (launchBehavior.taskDelivery === "direct") {
-    taskArg = fullTask;
-  } else {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
-    taskArg = `@${artifactPath}`;
-  }
-
-  for (const promptArg of buildPiPromptArgs({
-    effectiveSkills,
-    taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
-  }
-
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
-  const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
-
-  const running: RunningSubagent = {
-    id,
-    name: params.name,
-    task: params.task,
-    agent: params.agent,
-    surface,
-    startTime,
-    sessionFile: subagentSessionFile,
-    launchScriptFile,
-    activityFile,
-    interactive: effectiveInteractive,
-    statusState: createStatusState({
-      source: "pi",
-      startTimeMs: startTime,
-    }),
-  };
-
-  runningSubagents.set(id, running);
-  return running;
 }
 
 /**
@@ -1573,8 +1791,11 @@ async function watchSubagent(
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
+  // Capture this runtime's signal: reload installs a new global controller before
+  // the old watcher's rejection is handled.
+  const moduleSignal = getModuleAbortSignal();
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1583,6 +1804,18 @@ async function watchSubagent(
         deliverPendingQuestion(running);
       },
     });
+
+    // Shutdown may have recorded a guard after polling confirmed exit but
+    // before this continuation ran. The process is now known to have ended.
+    if (lostObservationSessions.has(resolve(sessionFile))) {
+      try {
+        confirmProcessEnded(sessionFile);
+      } catch (err) {
+        // Marker cleanup is not process observation: preserve the completed
+        // result and leave the resume guard in place if disk removal failed.
+        console.warn(`Failed to clear lost-observation marker for ${sessionFile}:`, err);
+      }
+    }
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -1616,10 +1849,25 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      safeCloseSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      const outcome: "success" | "failure" | "interrupted" =
+        result.reason === "interrupted"
+          ? "interrupted"
+          : result.exitCode === 0
+            ? "success"
+            : "failure";
+
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        outcome,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1644,8 +1892,15 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    safeCloseSurface(surface);
     runningSubagents.delete(running.id);
+
+    const outcome: "success" | "failure" | "interrupted" =
+      result.reason === "interrupted"
+        ? "interrupted"
+        : result.exitCode === 0
+          ? "success"
+          : "failure";
 
     return {
       name,
@@ -1655,26 +1910,56 @@ async function watchSubagent(
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
       exitCode: result.exitCode,
       elapsed,
+      outcome,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
-    runningSubagents.delete(running.id);
-
-    if (signal.aborted) {
+    if (signal.aborted || moduleSignal.aborted) {
+      // Shutdown/reload only disposes observation; the child may still be live.
+      // Only an explicit watcher cancellation may close its pane here.
+      if (moduleSignal.aborted) recordLostObservation(running);
+      else safeCloseSurface(surface);
+      runningSubagents.delete(running.id);
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: moduleSignal.aborted
+          ? "Observation disposed during session shutdown or reload. The pane was kept open and resume is blocked until process exit is confirmed."
+          : "Subagent cancelled.",
+        ...(moduleSignal.aborted ? { observationFailure: true } : {}),
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: moduleSignal.aborted ? "observation_lost" : "cancelled",
+        outcome: "interrupted",
         sessionFile,
       };
     }
+
+    if (isRexInfrastructureError(err)) {
+      // Sustained infrastructure failure observing the process.
+      // Do NOT kill or close a potentially live agent!
+      const markerError = recordLostObservation(running);
+      scheduleLostObservationReconciliation();
+      runningSubagents.delete(running.id);
+      const errorMsg = markerError
+        ? `${err?.message ?? String(err)} (and failed to persist safety marker: ${markerError?.message ?? String(markerError)})`
+        : (err?.message ?? String(err));
+      return {
+        name,
+        task,
+        summary: `Infrastructure observation failure: ${errorMsg}. Pane was kept open.`,
+        observationFailure: true,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: errorMsg,
+        outcome: "failure",
+        ...(sessionFile ? { sessionFile } : {}),
+      };
+    }
+
+    safeCloseSurface(surface);
+    runningSubagents.delete(running.id);
     return {
       name,
       task,
@@ -1682,6 +1967,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      outcome: "failure",
     };
   }
 }
@@ -1703,6 +1989,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    if (reconcileRetryTimer) {
+      clearTimeout(reconcileRetryTimer);
+      reconcileRetryTimer = null;
+    }
+    if (cleanupRetryTimer) {
+      clearTimeout(cleanupRetryTimer);
+      cleanupRetryTimer = null;
+    }
+    for (const [surface] of pendingCleanups) {
+      try {
+        closeSurface(surface);
+      } catch (err) {
+        console.error(`Failed to close surface ${surface} on session shutdown: ${err}`);
+      }
+    }
+    pendingCleanups.clear();
+    // Close retries above can schedule a final cosmetic pass: dispose afterwards.
+    disposeRexSurfaces();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1713,6 +2017,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+    // Persist guards synchronously before clearing live tracking: shutdown can
+    // complete before the aborted watchers' promise continuations run.
+    for (const agent of runningSubagents.values()) recordLostObservation(agent);
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {
@@ -1772,8 +2079,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // top-level `fork: true` clone, which has no role and inherits the
         // caller's own already-trusted toolset. Without this guard a missing or
         // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
+        const allowlist = getSubagentAllowlist();
+        const permittedAgents = allowlist
+          ? [...allowlist]
           : discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
@@ -1797,12 +2105,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 type: "text",
                 text:
                   `You may not spawn the "${params.agent}" agent — it is not ` +
-                  `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
+                  `${allowlist ? "in your allowlist" : "a known agent"}. ` +
                   `Available agents: ${permittedList}.`,
               },
             ],
             details: {
-              error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
+              error: allowlist ? "agent not in allowlist" : "unknown agent",
             },
           };
         }
@@ -1891,6 +2199,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
+                  ...(result.outcome ? { outcome: result.outcome } : {}),
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
@@ -2171,6 +2480,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        // Guard: refuse resume if observation of the previous process was lost and not confirmed exited.
+        // First try to reconcile any pending lost observations before enforcing the guard.
+        reconcileLostObservations(sessionPath);
+
+        // If marker is still on disk, check if it has process coordinates and query directly
+        if (hasLostObservationMarker(sessionPath)) {
+          const marker = readLostObservationMarker(sessionPath);
+          if (marker?.blockId?.trim() && marker?.sessionId?.trim()) {
+            try {
+              const proc = queryBlockProcess(marker.blockId, marker.sessionId);
+              if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
+                confirmProcessEnded(sessionPath);
+                if (marker.surface) safeCloseSurface(marker.surface);
+              }
+            } catch {}
+          }
+        }
+
+        // Check both in-memory set and persistent marker sidecar across restarts.
+        if (lostObservationSessions.has(resolve(sessionPath)) || hasLostObservationMarker(sessionPath)) {
+          const err =
+            `Cannot resume subagent "${requestedName}": observation of its previous run was lost and ` +
+            `the process may still be active in its open pane. Resuming could corrupt the session file.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
         // Guard: never resume a session that is still running — two processes
         // mutating the same .jsonl corrupts it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
@@ -2201,107 +2536,117 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
         const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
+        let running: RunningSubagent;
+        try {
+          // Build pi resume command
+          const parts = ["pi", "--session", shellEscape(sessionPath)];
 
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+          // Load subagent-done extension so the agent can self-terminate if needed
+          const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+          parts.push("-e", shellEscape(subagentDonePath));
 
-        const sessionId = ctx.sessionManager.getSessionId();
-        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
-        const activityFile = getSubagentActivityFile(artifactDir, id);
-        mkdirSync(dirname(activityFile), { recursive: true });
+          const sessionId = ctx.sessionManager.getSessionId();
+          const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+          const activityFile = getSubagentActivityFile(artifactDir, id);
+          mkdirSync(dirname(activityFile), { recursive: true });
 
-        // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
+          // Replay the model, identity, and default-deny tool/extension sandbox.
+          applySandboxToParts(parts, loadout, { artifactDir, name });
 
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
+          let resumeMsgFile: string | undefined;
+          if (params.message) {
+            const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            resumeMsgFile = join(
+              artifactDir,
+              "subagent-resume",
+              `${name
+                .toLowerCase()
+                .replace(/[^a-z0-9\s-]/g, "")
+                .replace(/\s+/g, "-")
+                .replace(/-+/g, "-")
+                .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            );
+            mkdirSync(dirname(resumeMsgFile), { recursive: true });
+            writeFileSync(resumeMsgFile, message, "utf8");
+            parts.push(shellEscape(`@${resumeMsgFile}`));
+          }
+
+          // Build env prefix — replay the snapshot's config dir + spawn whitelist
+          // so the resumed process resolves the same agents/extensions and keeps
+          // the same nested-spawn restriction it originally ran with.
+          const resumeEnvParts: string[] = [];
+          const resumeAgentDir = loadout.agentDir === null ? null : (loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null);
+          if (resumeAgentDir) {
+            resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
+          }
+          if (loadout.spawnable && loadout.spawnable.length > 0) {
+            resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
+          }
+          if (loadout.agent) {
+            resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
+          }
+          resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+          if (autoExit) {
+            resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+          }
+          const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+
+          // Resume in the subagent's original cwd so its tools (safe_bash, edits)
+          // operate where they did before.
+          const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
+
+          const command = wrapLaunchCommand(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
+          const launchScriptFile = join(
             artifactDir,
-            "subagent-resume",
+            "subagent-scripts",
             `${name
               .toLowerCase()
               .replace(/[^a-z0-9\s-]/g, "")
               .replace(/\s+/g, "-")
               .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+              .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
           );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
-        }
+          sendLongCommand(surface, command, {
+            cwd: loadout.cwd ?? undefined,
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
 
-        // Build env prefix — replay the snapshot's config dir + spawn whitelist
-        // so the resumed process resolves the same agents/extensions and keeps
-        // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
-        const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
-        if (resumeAgentDir) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
+          // Register as a running subagent for widget tracking
+          running = {
+            id,
+            name,
+            task: message,
+            surface,
+            startTime,
+            sessionFile: sessionPath,
+            launchScriptFile,
+            activityFile,
+            interactive,
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: startTime,
+            }),
+          };
+          runningSubagents.set(id, running);
+        } catch (prepErr) {
+          try {
+            safeCloseSurface(surface);
+          } catch {
+            // safeCloseSurface handles enqueueing pendingCleanups; preserve prepErr
+          }
+          throw prepErr;
         }
-        if (loadout.spawnable && loadout.spawnable.length > 0) {
-          resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
-        }
-        if (loadout.agent) {
-          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
-
-        // Resume in the subagent's original cwd so its tools (safe_bash, edits)
-        // operate where they did before.
-        const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
-
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-        const launchScriptFile = join(
-          artifactDir,
-          "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
-        );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
-
-        // Register as a running subagent for widget tracking
-        const running: RunningSubagent = {
-          id,
-          name,
-          task: message,
-          surface,
-          startTime,
-          sessionFile: sessionPath,
-          launchScriptFile,
-          activityFile,
-          interactive,
-          statusState: createStatusState({
-            source: "pi",
-            startTimeMs: startTime,
-          }),
-        };
-        runningSubagents.set(id, running);
         startWidgetRefresh();
         startStatusRefresh(pi);
 
@@ -2314,12 +2659,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
-              (result.errorMessage
-                ? `Subagent error: ${result.errorMessage}`
-                : result.exitCode !== 0
-                  ? `Resumed session exited with code ${result.exitCode}`
-                  : "Resumed session exited without new output");
+            const summary = result.observationFailure === true
+              ? result.summary
+              : findLastAssistantMessage(allEntries) ??
+                (result.errorMessage
+                  ? `Subagent error: ${result.errorMessage}`
+                  : result.exitCode !== 0
+                    ? `Resumed session exited with code ${result.exitCode}`
+                    : "Resumed session exited without new output");
             const presentation = resolveResultPresentation(
               { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
               name,
@@ -2337,6 +2684,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
+                  ...(result.outcome ? { outcome: result.outcome } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                 },
               },
@@ -2363,7 +2711,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name,
             sessionId: resumedSessionId,
             sessionFile: sessionPath,
-            launchScriptFile,
+            launchScriptFile: running.launchScriptFile,
             status: "started",
           },
         };

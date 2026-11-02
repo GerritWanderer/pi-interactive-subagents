@@ -18,6 +18,8 @@ import { Type } from "typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
+const PARENT_PARKED_FOR_CHILDREN_KEY = Symbol.for("pi-subagents/parent-parked-for-children");
+
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
@@ -216,6 +218,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
+    (globalThis as any)[PARENT_PARKED_FOR_CHILDREN_KEY] = false;
     agentStarted = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
@@ -233,6 +236,7 @@ export default function (pi: ExtensionAPI) {
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
+    (globalThis as any)[PARENT_PARKED_FOR_CHILDREN_KEY] = hasPendingChildren;
     const shouldExit =
       !awaitingAnswer &&
       !hasPendingChildren &&

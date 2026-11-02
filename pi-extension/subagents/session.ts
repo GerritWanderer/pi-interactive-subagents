@@ -9,6 +9,7 @@ import {
   readSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -119,6 +120,78 @@ export interface SubagentLoadout {
 /** Path of the loadout sidecar written next to a subagent session file. */
 export function loadoutSidecarPath(sessionFile: string): string {
   return `${sessionFile}.loadout.json`;
+}
+
+/** Path of the lost-observation marker written next to a subagent session file. */
+export function lostObservationMarkerPath(sessionFile: string): string {
+  return `${sessionFile}.lost-observation`;
+}
+
+let writeFileSyncFn: typeof writeFileSync = writeFileSync;
+
+export function __setWriteFileSyncOverride(fn: typeof writeFileSync | null): void {
+  writeFileSyncFn = fn ?? writeFileSync;
+}
+
+/** Persist a lost-observation marker beside the subagent's session file.
+ * Throws if the marker cannot be written.
+ */
+export function writeLostObservationMarker(
+  sessionFile: string,
+  details?: { blockId?: string; sessionId?: string; surface?: string },
+): void {
+  writeFileSyncFn(
+    lostObservationMarkerPath(sessionFile),
+    JSON.stringify({
+      lostAt: new Date().toISOString(),
+      ...(details?.blockId ? { blockId: details.blockId } : {}),
+      ...(details?.sessionId ? { sessionId: details.sessionId } : {}),
+      ...(details?.surface ? { surface: details.surface } : {}),
+    }),
+    "utf8",
+  );
+}
+
+export function readLostObservationMarker(
+  sessionFile: string,
+): { lostAt?: string; blockId?: string; sessionId?: string; surface?: string } | null {
+  try {
+    const raw = readFileSync(lostObservationMarkerPath(sessionFile), "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+let statSyncFn: (path: string) => any = statSync;
+
+export function __setStatSyncOverride(fn: ((path: string) => any) | null): void {
+  statSyncFn = fn ?? statSync;
+}
+
+/** Check whether a lost-observation marker exists beside the session file.
+ * Fails closed: if checking marker existence throws an unexpected error (permission/corrupt), returns true.
+ */
+export function hasLostObservationMarker(sessionFile: string): boolean {
+  const marker = lostObservationMarkerPath(sessionFile);
+  try {
+    statSyncFn(marker);
+    return true;
+  } catch (err: any) {
+    if (err && err.code === "ENOENT") {
+      return false;
+    }
+    // Fail closed: treat unreadable / permission / corrupt error as potentially unsafe
+    console.error(`Failed to check lost-observation marker at ${marker}, failing closed:`, err);
+    return true;
+  }
+}
+
+/** Clear the lost-observation marker beside the session file.
+ * Throws errors if marker removal fails.
+ */
+export function clearLostObservationMarker(sessionFile: string): void {
+  rmSync(lostObservationMarkerPath(sessionFile), { force: true });
 }
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
