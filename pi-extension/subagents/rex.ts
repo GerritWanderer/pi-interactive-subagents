@@ -32,7 +32,7 @@
  * typing into something unknown.
  *
  * Completion comes from the block's process record and the `.exit` sidecar,
- * never from scrollback.
+ * never from scrollback. Screen reads are bounded fallback diagnostics.
  */
 import { execFile, execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -781,22 +781,66 @@ export function lastLines(text: string, lines: number): string {
   return all.slice(-Math.max(1, lines)).join("\n") + "\n";
 }
 
-function captureArgs(block: string): string[] {
-  return ["capture", "-s", rexSession(), "-b", block, "--trim", "--unwrap"];
+/**
+ * Screen reads are fallback diagnostics, so they must never pull a block's
+ * whole scrollback (up to 64 MiB). `format` caps its reply; when the text is
+ * larger it also returns an id for `blob_read`, which fetches the tail.
+ */
+export const DIAGNOSTIC_MAX_BYTES = 64 * 1024;
+const DIAGNOSTIC_TIMEOUT_MS = 3_000;
+
+function formatArgs(block: string): string[] {
+  return [
+    "block", "call", "-s", rexSession(), "-b", block, "format",
+    JSON.stringify({ format: "text", trim: true, unwrap: true, max_bytes: DIAGNOSTIC_MAX_BYTES }),
+  ];
 }
 
-/** Read the last `lines` lines of a block's screen and scrollback (sync). */
+/**
+ * The `blob_read` that fetches a truncated reply's tail. It reads the last
+ * 32 KiB of text and leaves the rest of the reply budget for JSON escaping.
+ * Returns null when the reply already holds the whole screen.
+ */
+export function tailReadArgs(reply: any): { id: number; offset: number; max_bytes: number } | null {
+  if (!Number.isInteger(reply?.id) || !Number.isSafeInteger(reply?.total) || reply.total <= 0) return null;
+  return {
+    id: reply.id,
+    offset: Math.max(0, reply.total - Math.floor(DIAGNOSTIC_MAX_BYTES / 2)),
+    max_bytes: DIAGNOSTIC_MAX_BYTES,
+  };
+}
+
+function blobReadArgs(block: string, tail: object): string[] {
+  return ["block", "call", "-s", rexSession(), "-b", block, "blob_read", JSON.stringify(tail)];
+}
+
+function screenText(text: unknown, lines: number): string {
+  return typeof text === "string" ? lastLines(text, lines) : "";
+}
+
+/** Read the last `lines` lines of a block's screen and scrollback (sync, bounded). */
 export function readScreen(surface: string, lines = 50): string {
   requireRex();
-  return lastLines(rex(captureArgs(resolveBlock(surface))), lines);
+  const block = resolveBlock(surface);
+  const timeoutMs = DIAGNOSTIC_TIMEOUT_MS;
+  const reply = parseJson(rex(formatArgs(block), { timeoutMs }));
+  const tail = tailReadArgs(reply);
+  const text = tail ? parseJson(rex(blobReadArgs(block, tail), { timeoutMs }))?.data : reply?.content;
+  return screenText(text, lines);
 }
 
-/** Read the last `lines` lines of a block's screen and scrollback (async). */
+/** Read the last `lines` lines of a block's screen and scrollback (async, bounded). */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireRex();
-  const block = launched.get(surface) ?? surface;
   if (pending.has(surface)) return "";
-  return lastLines(await rexAsync(captureArgs(block)), lines);
+  const block = launched.get(surface) ?? surface;
+  const timeoutMs = DIAGNOSTIC_TIMEOUT_MS;
+  const reply = parseJson(await rexAsync(formatArgs(block), { timeoutMs }));
+  const tail = tailReadArgs(reply);
+  const text = tail
+    ? parseJson(await rexAsync(blobReadArgs(block, tail), { timeoutMs }))?.data
+    : reply?.content;
+  return screenText(text, lines);
 }
 
 /** Close a surface's block (or drop a reservation that never started). */

@@ -118,6 +118,19 @@ for (const backend of backends) {
       assert.deepEqual(await poll(surface), { reason: "done", exitCode: 0 });
     });
 
+    it("reads past a scrollback too large for one reply, without reading it all", async () => {
+      const surface = createTrackedSurface(env, "big-scrollback");
+      const marker = uniqueId();
+      // About 1.7 MiB: more than a Node child process buffers by default.
+      sendLongCommand(surface, `seq -f 'scrollback line %g padding' 1 70000; echo "TAIL_${marker}"; exit 6`);
+
+      assert.deepEqual(await poll(surface, 30_000), { reason: "error", exitCode: 6 });
+      const lines = readScreen(surface, 2).trimEnd().split("\n");
+      assert.equal(lines.at(-1), `TAIL_${marker}`);
+      assert.equal(lines.length, 2);
+      assert.ok(Buffer.byteLength(readScreen(surface, 1_000_000)) <= 64 * 1024, "reads must stay bounded");
+    });
+
     it("ends the run as interrupted when the block is closed by hand", async () => {
       const surface = createTrackedSurface(env, "closed-by-hand");
       sendLongCommand(surface, "sleep 30");

@@ -64,6 +64,7 @@ import {
   closeSurface,
   createArgs,
   createSurface,
+  DIAGNOSTIC_MAX_BYTES,
   exitStateOf,
   isRexAvailable,
   isRexInfrastructureError,
@@ -73,6 +74,7 @@ import {
   sendMessage,
   shellEscape,
   surfaceHandle,
+  tailReadArgs,
 } from "../pi-extension/subagents/rex.ts";
 
 // --- Helpers ---
@@ -3156,6 +3158,22 @@ describe("checkSteeringSafety", () => {
     assert.equal(checkSteeringSafety([pi("idle"), other]).ok, true);
     assert.equal(checkSteeringSafety([other]).ok, false);
     assert.equal(checkSteeringSafety([{ state: "idle", app: "cargo" }]).ok, false);
+  });
+});
+
+describe("bounded screen reads", () => {
+  it("fetches only the tail of a truncated reply", () => {
+    assert.deepEqual(tailReadArgs({ id: 4, total: 1_000_000, content: "head" }), {
+      id: 4,
+      offset: 1_000_000 - DIAGNOSTIC_MAX_BYTES / 2,
+      max_bytes: DIAGNOSTIC_MAX_BYTES,
+    });
+    assert.equal(tailReadArgs({ id: 4, total: 10 })?.offset, 0);
+  });
+
+  it("uses the reply itself when it holds the whole screen", () => {
+    assert.equal(tailReadArgs({ content: "all", eof: true, total: 3 }), null);
+    assert.equal(tailReadArgs(null), null);
   });
 });
 
