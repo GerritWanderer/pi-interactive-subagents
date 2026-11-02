@@ -2558,6 +2558,34 @@ describe("subagent interruption", () => {
     });
   });
 
+  it("preserves successful presentation despite marker stat errors or a retained guard", async (t) => {
+    const { __setStatSyncOverride } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    const sessionFile = join(tmpdir(), "successful-marker-stat-error.jsonl");
+    let statChecks = 0;
+    t.mock.method(console, "error", () => {});
+    __setStatSyncOverride(() => {
+      statChecks++;
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    });
+    try {
+      for (const guarded of [false, true]) {
+        if (guarded) testApi.lostObservationSessions.add(resolve(sessionFile));
+        const presentation = testApi.resolveResultPresentation(
+          { exitCode: 0, elapsed: 12, summary: "Completed work", outcome: "success", sessionFile },
+          "successful-worker",
+        );
+        assert.match(presentation, /completed/);
+        assert.match(presentation, /Completed work/);
+        assert.doesNotMatch(presentation, /infrastructure observation failure|Resume is blocked/);
+      }
+      assert.equal(statChecks, 0, "successful results must not inspect the resume guard on disk");
+    } finally {
+      __setStatSyncOverride(null);
+      testApi.lostObservationSessions.delete(resolve(sessionFile));
+    }
+  });
+
   it("does not infer observation failure from summary or error text", () => {
     for (const observationFailure of [undefined, false]) {
       const presentation = subagentsModule.__test__.resolveResultPresentation(
@@ -5209,6 +5237,71 @@ describe("subagent watcher disposal", () => {
 });
 
 describe("subagent watcher exit during shutdown", () => {
+  it("preserves a completed result when confirmProcessEnded cannot remove its marker", async (t) => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    const { lostObservationMarkerPath, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    const { api } = createMockExtensionApi();
+    const handlers = new Map<string, (...args: any[]) => void>();
+    api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+    subagentsModule.default(api);
+    handlers.get("session_start")!({}, { hasUI: false });
+    const dir = createTestDir();
+    const id = "completed-marker-removal-failed";
+    const now = Date.now();
+    t.mock.method(Date, "now", () => now);
+    const warning = t.mock.method(console, "warn", () => {});
+    const sessionFile = createSessionFile(dir, [SESSION_HEADER, {
+      ...ASSISTANT_MSG,
+      message: { ...ASSISTANT_MSG.message, model: "test-model", usage: { input: 100, output: 50 } },
+    }]);
+    const expectedStats = summarizeSessionStats(sessionFile);
+    const running = {
+      id, name: id, task: "finished", surface: id, startTime: now - 12_000,
+      sessionFile, interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: now - 12_000 }),
+    };
+    registerSurfaceHandle({
+      id, name: id, kind: "split", status: "launched",
+      sessionId: "session:test", blockId: "block:completed-child",
+    });
+    // A directory at the marker path reliably makes non-recursive removal
+    // throw, including when tests run with elevated filesystem privileges.
+    mkdirSync(lostObservationMarkerPath(sessionFile));
+    testApi.lostObservationSessions.add(resolve(sessionFile));
+    testApi.lostObservationEntries.set(resolve(sessionFile), {
+      sessionFile, surface: id, blockId: "block:completed-child", sessionId: "session:test",
+    });
+    testApi.runningSubagents.set(id, running);
+    __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
+
+    try {
+      const result = await testApi.watchSubagent(running, new AbortController().signal);
+      assert.equal(result.outcome, "success");
+      assert.equal(result.summary, "Here is my plan...");
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.elapsed, 12);
+      assert.equal(result.sessionId, SESSION_HEADER.id);
+      assert.deepEqual(result.stats, expectedStats);
+      assert.equal(result.error, undefined);
+      assert.equal(warning.mock.callCount(), 1);
+      assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to clear lost-observation marker/);
+      assert.equal(testApi.runningSubagents.has(id), false);
+      assert.equal(testApi.lostObservationSessions.has(resolve(sessionFile)), true);
+      assert.equal(testApi.lostObservationEntries.has(resolve(sessionFile)), true);
+      assert.equal(hasLostObservationMarker(sessionFile), true, "failed removal must retain the persistent resume guard");
+      assert.match(testApi.resolveResultPresentation(result, id), /completed/);
+    } finally {
+      handlers.get("session_shutdown")!({}, {});
+      testApi.runningSubagents.delete(id);
+      testApi.lostObservationSessions.delete(resolve(sessionFile));
+      testApi.lostObservationEntries.delete(resolve(sessionFile));
+      unregisterSurfaceHandle(id);
+      __rexTest__.setRexExecutor(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   for (const exitObserved of [true, false]) {
     it(`clears a shutdown guard when exit is confirmed by ${exitObserved ? "polling" : "reconciliation"}`, async () => {
       const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
@@ -5425,6 +5518,107 @@ describe("lost-observation reconciliation timers", () => {
     }
   });
 
+  for (const queryFails of [false, true]) {
+    it(`bounds automatic retries for ${queryFails ? "failed queries" : "active processes"} without releasing the resume guard`, async (t) => {
+      const { writeLostObservationMarker, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      let shutdown = () => {};
+      api.on = (event: string, handler: () => void) => {
+        if (event === "session_shutdown") shutdown = handler;
+      };
+      subagentsModule.default(api);
+      shutdown();
+      const savedLost = new Set(testApi.lostObservationSessions);
+      const savedEntries = new Map(testApi.lostObservationEntries);
+      const dir = createTestDir();
+      const sessionFile = join(dir, "bounded-retries.jsonl");
+      const coordinates = { blockId: "block:bounded-retries", sessionId: "session:mock" };
+      let processQueries = 0;
+      let exited = false;
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const scheduled = t.mock.method(globalThis, "setTimeout");
+      __rexTest__.setRexExecutor(() => {
+        processQueries++;
+        if (queryFails && !exited) throw new Error("server unavailable");
+        return JSON.stringify({ last_exit: exited ? { exit_code: 0 } : null });
+      });
+
+      try {
+        testApi.lostObservationSessions.clear();
+        testApi.lostObservationEntries.clear();
+        writeLostObservationMarker(sessionFile, coordinates);
+        testApi.lostObservationSessions.add(sessionFile);
+        testApi.lostObservationEntries.set(sessionFile, { sessionFile, surface: "", ...coordinates });
+        testApi.reconcileLostObservations();
+        const limit = testApi.MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS;
+        for (let i = 0; i < limit + 5; i++) t.mock.timers.tick(1000);
+        assert.equal(processQueries, limit, "automatic polling must stop at the per-entry limit");
+        assert.equal(scheduled.mock.callCount(), limit - 1, "exhausted entries must not schedule further timers");
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+        assert.equal(testApi.lostObservationEntries.has(sessionFile), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true);
+
+        testApi.reconcileLostObservations();
+        assert.equal(processQueries, limit, "unrelated background calls must not reset an exhausted budget");
+        testApi.reconcileLostObservations(sessionFile);
+        assert.equal(processQueries, limit + 1, "on-demand resume checks must bypass the limit");
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true, "inconclusive resume checks must retain both guards");
+        assert.equal(scheduled.mock.callCount(), limit - 1, "on-demand checks must not restart exhausted polling");
+
+        exited = true;
+        testApi.reconcileLostObservations(sessionFile);
+        assert.equal(processQueries, limit + 2);
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), false);
+        assert.equal(testApi.lostObservationEntries.has(sessionFile), false);
+        assert.equal(hasLostObservationMarker(sessionFile), false, "confirmed exit must still clear both guards on demand");
+      } finally {
+        shutdown();
+        testApi.lostObservationSessions.clear();
+        for (const value of savedLost) testApi.lostObservationSessions.add(value);
+        testApi.lostObservationEntries.clear();
+        for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("unrefs both initial and subsequent cleanup retry timers", async (t) => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    const testApi = subagentsModule.__test__;
+    const { api } = createMockExtensionApi();
+    let shutdown = () => {};
+    api.on = (event: string, handler: () => void) => {
+      if (event === "session_shutdown") shutdown = handler;
+    };
+    subagentsModule.default(api);
+    shutdown();
+    const scheduled = t.mock.method(globalThis, "setTimeout");
+    t.mock.method(console, "error", () => {});
+    const id = "unref-cleanup-retry";
+    registerSurfaceHandle({ id, name: id, kind: "split", status: "launched", sessionId: "session:mock", blockId: "block:retry" });
+    __rexTest__.setRexExecutor((args) => {
+      if (args[1] === "close") throw new Error("server unavailable");
+      return "{}";
+    });
+    const retryTimers = () => scheduled.mock.calls.filter((call) => call.arguments[1] === 1000).map((call) => call.result);
+    try {
+      testApi.safeCloseSurface(id);
+      assert.equal(retryTimers().length, 1);
+      assert.equal(retryTimers()[0]!.hasRef(), false, "initial cleanup retry must be unref'ed");
+      clearTimeout(retryTimers()[0]);
+      testApi.processPendingCleanups();
+      assert.equal(retryTimers().length, 2);
+      assert.equal(retryTimers()[1]!.hasRef(), false, "subsequent cleanup retries must be unref'ed");
+    } finally {
+      shutdown();
+      unregisterSurfaceHandle(id);
+      __rexTest__.setRexExecutor(null);
+    }
+  });
+
   it("keeps one retry chain across direct calls and cancels it on shutdown", async (t) => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
     const testApi = subagentsModule.__test__;
@@ -5538,6 +5732,42 @@ describe("Rex sizing lifecycle and bounded diagnostics", () => {
     assert.equal(calls.filter((c) => c[0] === "api").length, 1);
     assert.equal(JSON.parse(calls.at(-1)![3]).before_block_id, "block:a");
   });
+
+  for (const refreshFails of [false, true]) {
+    it(`bounds pre-close tab lookup and reuses its ${refreshFails ? "failed" : "successful"} result during retries`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const id = `close-lookup-${refreshFails}`;
+      let lookups = 0;
+      let closes = 0;
+      __rexTest__.setRexExecutor((args, options) => {
+        if (args[0] === "block" && args[1] === "inspect") {
+          lookups++;
+          assert.equal(options?.timeoutMs, 3000, "pre-close tab refresh must not use the 15-second default");
+          if (refreshFails) throw new Error("lookup timed out");
+          return JSON.stringify({ block: { window_id: "window:target" } });
+        }
+        if (args[0] === "block" && args[1] === "close") {
+          closes++;
+          if (closes < 3) throw new Error("transient close failure");
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "split", name: id, sessionId: "session:test", windowId: "window:old-before-move", blockId: "block:removed", status: "launched" });
+      try {
+        for (let i = 0; i < 2; i++) {
+          assert.throws(() => closeSurface(id), /transient close failure/);
+          assert.ok(getSurfaceHandle(id));
+          assert.equal(lookups, 1, "cleanup retries must not repeat the tab lookup");
+        }
+        closeSurface(id);
+        assert.equal(lookups, 1);
+        assert.equal(closes, 3);
+        assert.equal(getSurfaceHandle(id), undefined);
+      } finally {
+        unregisterSurfaceHandle(id);
+      }
+    });
+  }
 
   it("balances a confirmed externally removed pane's remembered tab, but skips unknown transport failures", async () => {
     const { registerSurfaceHandle, closeSurface } = await import("../pi-extension/subagents/rex.ts");

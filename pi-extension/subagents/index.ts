@@ -597,9 +597,11 @@ function resolveResultPresentation(
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
 
+  const failedOrInterrupted = result.exitCode !== 0 ||
+    (result.outcome !== undefined && result.outcome !== "success") || !!result.errorMessage;
   if (
     result.observationFailure === true ||
-    (result.sessionFile &&
+    (failedOrInterrupted && result.sessionFile &&
       (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile)))
   ) {
     return (
@@ -709,8 +711,11 @@ interface LostObservationEntry {
   surface: string;
   blockId?: string;
   sessionId: string;
+  /** Background attempts only; exhausting the budget must never release the resume guard. */
+  automaticAttempts?: number;
 }
 const lostObservationEntries = new Map<string, LostObservationEntry>();
+const MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS = 10;
 
 /** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended.
  * Throws if clearing the disk marker fails, preserving the in-memory guard.
@@ -754,9 +759,11 @@ function recordLostObservation(running: RunningSubagent): Error | null {
 let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 function scheduleLostObservationReconciliation(): void {
-  // Missing process coordinates must keep their safety guard, but cannot be polled.
+  // Missing coordinates and exhausted retry budgets retain their safety guards,
+  // but must not keep an automatic polling loop alive.
   const hasQueryableEntry = Array.from(lostObservationEntries.values()).some(
-    (entry) => entry.blockId?.trim() && entry.sessionId?.trim(),
+    (entry) => entry.blockId?.trim() && entry.sessionId?.trim() &&
+      (entry.automaticAttempts ?? 0) < MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS,
   );
   if (hasQueryableEntry && !reconcileRetryTimer) {
     reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
@@ -782,8 +789,15 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
   }
 
   let reconciled = false;
+  const requestedPath = sessionPathCheck ? resolve(sessionPathCheck) : undefined;
   for (const [sessionPath, entry] of lostObservationEntries) {
     if (!entry.blockId?.trim() || !entry.sessionId?.trim()) continue;
+    // Explicit resume checks can always query their target, even after its
+    // background budget is exhausted. Failed queries also consume that budget.
+    if (sessionPath !== requestedPath) {
+      if ((entry.automaticAttempts ?? 0) >= MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS) continue;
+      entry.automaticAttempts = (entry.automaticAttempts ?? 0) + 1;
+    }
     try {
       const proc = queryBlockProcess(entry.blockId, entry.sessionId);
       if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
@@ -854,6 +868,7 @@ function processPendingCleanups(): void {
   }
   if (pendingCleanups.size > 0 && !cleanupRetryTimer) {
     cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+    cleanupRetryTimer.unref?.();
   }
 }
 
@@ -868,6 +883,7 @@ function safeCloseSurface(surface: string): void {
     }
     if (!cleanupRetryTimer) {
       cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+      cleanupRetryTimer.unref?.();
     }
   }
 }
@@ -1372,6 +1388,7 @@ export const __test__ = {
   lostObservationEntries,
   confirmProcessEnded,
   reconcileLostObservations,
+  MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1787,7 +1804,15 @@ async function watchSubagent(
 
     // Shutdown may have recorded a guard after polling confirmed exit but
     // before this continuation ran. The process is now known to have ended.
-    if (lostObservationSessions.has(resolve(sessionFile))) confirmProcessEnded(sessionFile);
+    if (lostObservationSessions.has(resolve(sessionFile))) {
+      try {
+        confirmProcessEnded(sessionFile);
+      } catch (err) {
+        // Marker cleanup is not process observation: preserve the completed
+        // result and leave the resume guard in place if disk removal failed.
+        console.warn(`Failed to clear lost-observation marker for ${sessionFile}:`, err);
+      }
+    }
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 

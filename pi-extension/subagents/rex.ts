@@ -347,6 +347,8 @@ export interface RexSurfaceHandle {
   kind: "tab" | "split";
   name: string;
   windowId?: string;
+  /** Pre-close refresh result, retained across close retries (null means unavailable). */
+  closingWindowId?: string | null;
   blockId?: string;
   sessionId: string;
   anchorBlockId?: string;
@@ -804,13 +806,13 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   return diagnosticLines(text, lines);
 }
 
-export function getSurfaceTab(surface: string, refresh = false): string | null {
+export function getSurfaceTab(surface: string, refresh = false, timeoutMs?: number): string | null {
   const handle = getSurfaceHandle(surface);
   if (handle?.windowId && (!refresh || !handle.blockId)) return handle.windowId;
   if (!handle?.blockId) return null;
 
   try {
-    const raw = rexExec(["block", "inspect", "-s", handle.sessionId, handle.blockId, "--json"]);
+    const raw = rexExec(["block", "inspect", "-s", handle.sessionId, handle.blockId, "--json"], { timeoutMs });
     const parsed = JSON.parse(raw);
     const windowId = parsed?.block?.window_id || parsed?.window || parsed?.window_id || null;
     if (windowId) handle.windowId = windowId;
@@ -846,8 +848,11 @@ export function closeSurface(surface: string): void {
   const handle = getSurfaceHandle(surface);
   if (!handle) return;
 
-  // Resolve before close: a vanished block can no longer tell us its window.
-  const affectedWindow = getSurfaceTab(surface, true);
+  // Refresh once before close: a vanished block can no longer tell us its
+  // window. Bound this cosmetic lookup and reuse it across cleanup retries.
+  const affectedWindow = handle.closingWindowId !== undefined
+    ? handle.closingWindowId
+    : (handle.closingWindowId = getSurfaceTab(surface, true, 3000));
   try {
     if (handle.kind === "tab" && handle.windowId) {
       if (handle.blockId) {
