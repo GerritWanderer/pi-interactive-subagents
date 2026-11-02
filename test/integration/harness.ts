@@ -2,9 +2,9 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether Herdr is available
+ * - Detect whether Rex is available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in Herdr panes
+ * - Start real pi sessions in Rex blocks
  * - Poll for file creation and screen output
  * - Clean up panes and temp files after tests
  */
@@ -17,10 +17,12 @@ import {
   existsSync,
   readFileSync,
   unlinkSync,
+  statSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import {
   isMuxAvailable,
   createSurface,
@@ -33,9 +35,12 @@ import {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
-} from "../../pi-extension/subagents/herdr.ts";
+  surfaceBlock,
+  sendMessage,
+  pollForExit,
+} from "../../pi-extension/subagents/rex.ts";
 
-// Re-export Herdr primitives for tests
+// Re-export Rex primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -47,6 +52,9 @@ export {
   shellEscape,
   getFocusedSurface,
   getSurfaceTab,
+  surfaceBlock,
+  sendMessage,
+  pollForExit,
 };
 
 // ── Paths ──
@@ -71,7 +79,7 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used for integration tests. Override with PI_TEST_MODEL env var. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "anthropic/claude-haiku-4-5";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "github-copilot/gemini-3.8-flash";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -79,11 +87,11 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether Herdr is available in the current environment.
- * Returns ["herdr"] or [].
+ * Detect whether Rex is available in the current environment.
+ * Returns ["rex"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["herdr"] : [];
+  return isMuxAvailable() ? ["rex"] : [];
 }
 
 export async function waitForFocusedSurface(
@@ -97,7 +105,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused Herdr pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused Rex block ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
@@ -111,6 +119,8 @@ export interface TestEnv {
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
+  /** Unique names of subagents the tests spawn through a real pi (see trackChildName) */
+  childNames: string[];
 }
 
 /**
@@ -131,7 +141,7 @@ export function createTestEnv(): TestEnv {
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  return { dir, surfaces: [], tempFiles: [], childNames: [] };
 }
 
 /**
@@ -143,6 +153,7 @@ export function cleanupTestEnv(env: TestEnv): void {
       closeSurface(surface);
     } catch {}
   }
+  closeChildPanes(env);
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
@@ -150,6 +161,39 @@ export function cleanupTestEnv(env: TestEnv): void {
   }
   try {
     rmSync(env.dir, { recursive: true, force: true });
+  } catch {}
+}
+
+/**
+ * Record the name of a subagent a test asks a real pi to spawn. Tests can end
+ * before that pi closes its child's pane, and a killed parent never will, so
+ * cleanup closes panes left behind under these names. Names must be unique to
+ * the test (they embed a uniqueId) so nothing else can match.
+ */
+export function trackChildName(env: TestEnv, name: string): string {
+  env.childNames.push(name);
+  return name;
+}
+
+function closeChildPanes(env: TestEnv): void {
+  if (env.childNames.length === 0) return;
+  const session = process.env.REX_SESSION;
+  if (!session) return;
+  const rexBin = process.env.PI_SUBAGENT_REX_BIN?.trim() || "rex";
+  try {
+    const view = JSON.parse(
+      execFileSync(rexBin, ["session", "inspect", session, "--json"], { encoding: "utf8" }),
+    );
+    for (const window of view?.windows ?? []) {
+      for (const layer of window?.layers ?? []) {
+        for (const block of layer?.blocks ?? []) {
+          if (!env.childNames.includes(block?.label)) continue;
+          try {
+            execFileSync(rexBin, ["block", "close", "-s", session, block.block_id], { stdio: "ignore" });
+          } catch {}
+        }
+      }
+    }
   } catch {}
 }
 
@@ -301,4 +345,40 @@ export function uniqueId(): string {
  */
 export function trackTempFile(env: TestEnv, path: string): void {
   env.tempFiles.push(path);
+}
+
+/**
+ * The session file a subagent spawn recorded under `name`, found by scanning
+ * every `subagent-registry.json` under the pi sessions directory. Returns the
+ * most recently written match, or null when no registry knows the name.
+ */
+export function findRegisteredSessionFile(name: string): string | null {
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+  const root = join(agentDir, "sessions");
+  const found: { best: { file: string; mtime: number } | null } = { best: null };
+  const walk = (dir: string, depth: number) => {
+    if (depth > 6) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(path, depth + 1);
+      } else if (entry.name === "subagent-registry.json") {
+        try {
+          const file = JSON.parse(readFileSync(path, "utf8"))?.[name]?.sessionFile;
+          const mtime = statSync(path).mtimeMs;
+          if (typeof file === "string" && (!found.best || mtime > found.best.mtime)) {
+            found.best = { file, mtime };
+          }
+        } catch {}
+      }
+    }
+  };
+  walk(root, 0);
+  return found.best?.file ?? null;
 }

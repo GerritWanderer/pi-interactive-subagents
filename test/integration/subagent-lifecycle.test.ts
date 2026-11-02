@@ -1,18 +1,18 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
- * Each test creates a Herdr pane, runs pi with a task that uses the subagent
+ * These tests spawn REAL pi sessions with REAL LLM calls (gemini-3.8-flash by default).
+ * Each test creates a Rex block, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
+ * Costs: ~$0.01-0.05 per test run (gemini-3.8-flash).
  * Duration: ~30-90s per test.
  *
- * Run from a shell inside a Herdr pane:
+ * Run from a shell inside a Rex terminal:
  *   npm run test:integration
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: github-copilot/gemini-3.8-flash)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
@@ -32,13 +32,15 @@ import {
   readScreen,
   PI_TIMEOUT,
   type TestEnv,
+  findRegisteredSessionFile,
+  trackChildName,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
 
 if (backends.length === 0) {
-  console.log("⚠️  Herdr is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside a Herdr pane to enable these tests.");
+  console.log("⚠️  Rex is not available — skipping subagent lifecycle integration tests");
+  console.log("   Run inside a Rex terminal to enable these tests.");
 }
 
 for (const backend of backends) {
@@ -72,6 +74,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
+      trackChildName(env, `Echo-${id}`);
       startPi(surface, env.dir, task);
 
       // Verify: subagent created the marker file
@@ -124,6 +127,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
 
+      trackChildName(env, `Status-${id}`);
       startPi(surface, env.dir, task);
 
       const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
@@ -176,6 +180,8 @@ for (const backend of backends) {
         `Call both subagent tools NOW, do not wait between them.`,
       ].join("\n");
 
+      trackChildName(env, `ParaA-${id}`);
+      trackChildName(env, `ParaB-${id}`);
       startPi(surface, env.dir, task);
 
       // Both marker files should appear
@@ -200,13 +206,13 @@ for (const backend of backends) {
 
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
+        `  agent: "test-fork"`,
         `  name: "Fork-${id}"`,
-        `  fork: true`,
         `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
+      trackChildName(env, `Fork-${id}`);
       startPi(surface, env.dir, task);
 
       // Verify: forked subagent created the file
@@ -220,54 +226,76 @@ for (const backend of backends) {
         PI_TIMEOUT,
       );
 
-      // Verify: the forked session has a parent link
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
+      // Verify: the forked session has a parent link. Every spawn records
+      // name -> session file in the parent's subagent-registry.json.
+      const sessionFile = findRegisteredSessionFile(`Fork-${id}`);
+      assert.ok(sessionFile, `Fork-${id} should be in a subagent registry`);
+      assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
 
-        const entries = readFileSync(sessionFile, "utf8")
-          .trim()
-          .split("\n")
-          .map((l) => JSON.parse(l));
-        const header = entries[0];
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.parentSession, "Fork session should have parentSession field");
-        // Fork sessions include parent context (model_change entries etc.)
-        assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
-      }
+      const entries = readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      const header = entries[0];
+      assert.equal(header.type, "session", "First entry should be session header");
+      assert.ok(header.parentSession, "Fork session should have parentSession field");
+      // Fork sessions include parent context (model_change entries etc.)
+      assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
     });
 
-    // ── caller_ping ──
+    // ── ask_question ──
 
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    it("subagent ask_question round-trips through the parent's subagent_message", async () => {
       const id = uniqueId();
+      const name = `Ask-${id}`;
+      const answer = `ANSWER_${id}`;
+      const markerFile = `/tmp/pi-integ-ask-${id}.txt`;
+      trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = createTrackedSurface(env, `ask-${id}`);
       await sleep(1000);
 
+      // The answer appears only in the parent's prompt, so it can reach the
+      // file only via question -> parent -> subagent_message -> child.
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
+        `  name: "${name}"`,
+        `  agent: "test-ask"`,
+        `  task: "Write the answer to the file ${markerFile}"`,
+        `The sub-agent will ask you a question. Answer it by calling subagent_message`,
+        `with name "${name}" and message "${answer}". Do not do anything else yourself.`,
+        `After you receive the sub-agent's result, say ASK_COMPLETE.`,
       ].join("\n");
 
+      trackChildName(env, name);
       startPi(surface, env.dir, task);
 
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
+      const content = await waitForFile(markerFile, PI_TIMEOUT, new RegExp(answer));
+      assert.equal(content.trim(), answer, "the child should write exactly the parent's reply");
 
-      assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
+      // The child's session shows the question, then the reply as its next
+      // user message (delivered into the still-open session, not a resume).
+      const sessionFile = findRegisteredSessionFile(name);
+      assert.ok(sessionFile && existsSync(sessionFile), `${name} should have a registered session file`);
+      const messages = readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l))
+        .filter((e) => e.type === "message")
+        .map((e) => e.message);
+      const askIndex = messages.findIndex(
+        (m) => m.role === "assistant" && m.content?.some((c: any) => c.type === "toolCall" && c.name === "ask_question"),
       );
+      assert.ok(askIndex >= 0, "the child should have called ask_question");
+      const replyIndex = messages.findIndex(
+        (m, i) =>
+          i > askIndex &&
+          m.role === "user" &&
+          m.content?.some((c: any) => c.type === "text" && c.text.includes(answer)),
+      );
+      assert.ok(replyIndex > askIndex, "the parent's reply should arrive as a user message after the question");
+
+      await waitForScreen(surface, /ASK_COMPLETE/, PI_TIMEOUT);
     });
 
     // ── Agent discovery ──
@@ -291,6 +319,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
+      trackChildName(env, `Disco-${id}`);
       startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
@@ -317,6 +346,7 @@ for (const backend of backends) {
         `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
       ].join("\n");
 
+      trackChildName(env, `SysP-${id}`);
       startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);

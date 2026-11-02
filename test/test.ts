@@ -1,6 +1,7 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -30,7 +31,6 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/herdr.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -57,17 +57,25 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
-import { __pollForExitTest__, __layoutTest__ } from "../pi-extension/subagents/herdr.ts";
 import {
+  __pollForExitTest__,
+  __layoutTest__,
+  checkSteeringSafety,
+  closeSurface,
+  createArgs,
+  createSurface,
+  DIAGNOSTIC_MAX_BYTES,
   exitStateOf,
-  freshTabId,
-  isHerdrDesktopEnv,
+  isRexAvailable,
+  isRexInfrastructureError,
   lastLines,
-  launchArgv,
-  runArgs,
-  terminalName,
-  uniqueTerminalName,
-} from "../pi-extension/subagents/herdr-desktop.ts";
+  pollForExit,
+  rexSplitDirection,
+  sendMessage,
+  shellEscape,
+  surfaceHandle,
+  tailReadArgs,
+} from "../pi-extension/subagents/rex.ts";
 
 // --- Helpers ---
 
@@ -1855,16 +1863,14 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("herdr.ts interpretExitSidecar", () => {
+describe("rex.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+  it("treats a retired ping payload as a failure, since nothing writes one now", () => {
+    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar.
+    const result = interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" });
+    assert.equal(result.reason, "error");
+    assert.match(result.errorMessage ?? "", /Unrecognized/);
   });
 
   it("decodes done payloads", () => {
@@ -1896,9 +1902,12 @@ describe("herdr.ts interpretExitSidecar", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("reports unknown payload shapes as failures, never as success", () => {
+    for (const payload of [{}, null, "done", { type: "nope" }]) {
+      const result = interpretExitSidecar(payload);
+      assert.equal(result.reason, "error", JSON.stringify(payload));
+      assert.equal(result.exitCode, 1);
+    }
   });
 });
 describe("commands", () => {
@@ -2576,39 +2585,17 @@ describe("subagent status renderer", () => {
 });
 
 describe("subagent startup delay", () => {
-  // The delay only applies outside the Herdr desktop app, which these tests may run in.
-  const originalTerminalId = process.env.HC_TERMINAL_ID;
-  beforeEach(() => {
-    delete process.env.HC_TERMINAL_ID;
-  });
-  after(() => {
-    if (originalTerminalId != null) process.env.HC_TERMINAL_ID = originalTerminalId;
-  });
-
-  it("defaults to 500ms when no env var is set", () => {
+  it("never waits for a shell, because Rex starts blocks directly on the launch script", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.getShellReadyDelayMs, "function");
 
     const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
     try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
+      delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      assert.equal(testApi.getShellReadyDelayMs(), 0);
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+      assert.equal(testApi.getShellReadyDelayMs(), 0, "the env var is moot without a shell to wait for");
     } finally {
       if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
       else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
@@ -2777,102 +2764,83 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("herdr.ts layout", () => {
-  const { planEvenSplits, chooseSplitDirection, chooseSurfaceKind } = __layoutTest__;
-  const rect = (x: number, y: number, width: number, height: number) => ({ x, y, width, height });
-  const pane = (pane_id: string, r: ReturnType<typeof rect>) => ({ pane_id, focused: false, rect: r });
+describe("rex.ts layout", () => {
+  const { planEvenSplits, chooseSplitDirection, chooseSurfaceKind, findWindowOfBlock } = __layoutTest__;
+  const leaf = (block_id: string) => ({ block_id });
+  const split = (
+    direction: "horizontal" | "vertical",
+    ratio: number,
+    before: any,
+    after: any,
+  ) => ({ split: { split_id: `split:${Math.random()}`, direction, ratio, before, after } });
 
-  // Real snapshot shape from `herdr pane layout` after splitting w1:p1 right
-  // three times: panes 18/18/24/60 wide, tree left-nested under the root.
-  const lopsided = {
-    zoomed: false,
-    area: rect(0, 0, 120, 40),
-    focused_pane_id: "w1:p1",
-    panes: [
-      pane("w1:p1", rect(0, 0, 18, 40)),
-      pane("w1:p4", rect(18, 0, 18, 40)),
-      pane("w1:p3", rect(36, 0, 24, 40)),
-      pane("w1:p2", rect(60, 0, 60, 40)),
-    ],
-    splits: [
-      { id: "split_0_root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) },
-      { id: "split_1_0", direction: "right" as const, ratio: 0.6, rect: rect(0, 0, 60, 40) },
-      { id: "split_2_00", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 36, 40) },
-    ],
-  };
+  // Real shape from `rex session inspect --json` after splitting b1 right,
+  // then splitting the new block right again: 50% / 25% / 25%.
+  const lopsided = split("horizontal", 0.5, leaf("b1"), split("horizontal", 0.5, leaf("b2"), leaf("b3")));
 
   describe("planEvenSplits", () => {
-    it("targets the pane whose right edge sits on each split boundary, with a ratio delta", () => {
-      const steps = planEvenSplits(lopsided);
-      // root: 3 of 4 columns on the left -> 0.75 (grow from 0.5, owner p3)
-      // split_1_0: 2 of 3 columns -> 0.667 (grow from 0.6, owner p4)
-      // split_2_00: 1 of 2 columns -> 0.5 (already even, skipped)
-      assert.deepEqual(
-        steps.map((s) => [s.pane, s.direction, Number(s.amount.toFixed(3))]),
-        [
-          ["w1:p3", "right", 0.25],
-          ["w1:p4", "right", 0.067],
-        ],
+    it("gives each column an equal share, resizing across the blocks that touch each border", () => {
+      assert.deepEqual(planEvenSplits(lopsided), [
+        { direction: "horizontal", beforeBlock: "b1", afterBlock: "b2", ratio: 1 / 3 },
+      ]);
+    });
+
+    it("picks the blocks adjacent to the border when both sides are nested", () => {
+      const nested = split(
+        "horizontal",
+        0.5,
+        split("horizontal", 0.5, leaf("a1"), leaf("a2")),
+        leaf("b1"),
       );
+      assert.deepEqual(planEvenSplits(nested), [
+        { direction: "horizontal", beforeBlock: "a2", afterBlock: "b1", ratio: 2 / 3 },
+      ]);
     });
 
-    it("shrinks with `left` when the first side is too wide, since herdr ignores the sign of --amount", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 90, 40)), pane("w1:p2", rect(90, 0, 30, 40))],
-        splits: [{ id: "root", direction: "right", ratio: 0.75, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "left", amount: 0.25 }]);
+    it("counts stacked blocks as one column so a vertical split inside a column does not skew the share", () => {
+      const layout = split("horizontal", 0.5, leaf("b1"), split("vertical", 0.5, leaf("b2"), leaf("b3")));
+      assert.deepEqual(planEvenSplits(layout), []);
     });
 
-    it("balances vertical splits with up/down", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 120, 10)), pane("w1:p2", rect(0, 10, 120, 30))],
-        splits: [{ id: "root", direction: "down", ratio: 0.25, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "down", amount: 0.25 }]);
+    it("balances vertical splits too", () => {
+      const layout = split("vertical", 0.25, leaf("top"), leaf("bottom"));
+      assert.deepEqual(planEvenSplits(layout), [
+        { direction: "vertical", beforeBlock: "top", afterBlock: "bottom", ratio: 0.5 },
+      ]);
     });
 
-    it("counts stacked panes as one column so a down split inside a column does not skew the share", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [
-          pane("w1:p1", rect(0, 0, 60, 40)),
-          pane("w1:p2", rect(60, 0, 60, 20)),
-          pane("w1:p3", rect(60, 20, 60, 20)),
+    it("leaves a window alone when every split is already even, or holds one block", () => {
+      assert.deepEqual(planEvenSplits(split("horizontal", 0.5, leaf("b1"), leaf("b2"))), []);
+      assert.deepEqual(planEvenSplits(leaf("b1")), []);
+      assert.deepEqual(planEvenSplits(null), []);
+    });
+  });
+
+  describe("findWindowOfBlock", () => {
+    it("finds the window whose tiled layer holds a block", () => {
+      const view = {
+        windows: [
+          { window_id: "w1", layers: [{ kind: "tiled", layout: leaf("b0") }] },
+          { window_id: "w2", layers: [{ kind: "floating", layout: leaf("b3") }, { kind: "tiled", layout: lopsided }] },
         ],
-        splits: [
-          { id: "root", direction: "right", ratio: 0.5, rect: rect(0, 0, 120, 40) },
-          { id: "col", direction: "down", ratio: 0.5, rect: rect(60, 0, 60, 40) },
-        ],
-      });
-      assert.deepEqual(steps, []);
-    });
-
-    it("leaves a tab alone when every split is already even", () => {
-      const even = {
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 60, 40)), pane("w1:p2", rect(60, 0, 60, 40))],
-        splits: [{ id: "root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) }],
       };
-      assert.deepEqual(planEvenSplits(even), []);
+      assert.equal(findWindowOfBlock(view, "b3")?.windowId, "w2");
+      assert.equal(findWindowOfBlock(view, "b0")?.windowId, "w1");
+      assert.equal(findWindowOfBlock(view, "nope"), null);
     });
   });
 
   describe("chooseSplitDirection", () => {
-    it("splits a wide pane right and a narrow or tall pane down (herdr geometry rule; cells are ~2:1)", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "auto"), "down"); // 60x40
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "auto"), "down"); // 18x40
-      const wide = { ...lopsided, panes: [pane("w1:p1", rect(0, 0, 175, 64))] };
-      assert.equal(chooseSplitDirection(wide, "w1:p1", "auto"), "right");
+    it("splits a wide block right and a narrow or tall block down (cells are ~2:1)", () => {
+      assert.equal(chooseSplitDirection({ columns: 200, rows: 50 }, "auto"), "right");
+      assert.equal(chooseSplitDirection({ columns: 80, rows: 50 }, "auto"), "down");
     });
 
-    it("honours an explicit setting and falls back to right without a layout", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "right"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "down"), "down");
-      assert.equal(chooseSplitDirection(undefined, "w1:p1", "auto"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p99", "auto"), "right");
+    it("honours an explicit setting and falls back to right without a size", () => {
+      assert.equal(chooseSplitDirection({ columns: 80, rows: 50 }, "right"), "right");
+      assert.equal(chooseSplitDirection({ columns: 200, rows: 50 }, "down"), "down");
+      assert.equal(chooseSplitDirection(undefined, "auto"), "right");
+      assert.equal(chooseSplitDirection({ columns: 80, rows: 0 }, "auto"), "right");
     });
   });
 
@@ -2901,7 +2869,7 @@ describe("herdr.ts layout", () => {
   });
 });
 
-describe("herdr.ts", () => {
+describe("rex.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -2924,71 +2892,317 @@ describe("herdr.ts", () => {
       assert.ok(escaped.includes("$world"));
     });
   });
-});
 
-describe("herdr-desktop.ts", () => {
-  it("detects the desktop app by the HC_TERMINAL_ID herdr-core exports", () => {
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: "t2" }), true);
-    assert.equal(isHerdrDesktopEnv({ HERDR_ENV: "1" }), false);
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: " " }), false);
+  it("detects Rex by the REX_SESSION and REX_BLOCK it exports into every terminal", () => {
+    assert.equal(isRexAvailable({}), false);
+    assert.equal(isRexAvailable({ REX_SESSION: "session:1" }), false, "a block is needed to split beside");
+    assert.equal(isRexAvailable({ REX_SESSION: " ", REX_BLOCK: "block:1" }), false);
   });
 
-  it("turns a subagent name into a valid hc terminal name", () => {
-    assert.equal(terminalName("Scout: Map the API!"), "scout-map-the-api");
-    assert.equal(terminalName("worker_2"), "worker_2");
-    assert.equal(terminalName("a".repeat(40))?.length, 32, "hc caps names at 32 characters");
-    assert.equal(terminalName("x".repeat(31) + "-y"), "x".repeat(31), "no trailing dash after the cut");
-    assert.equal(terminalName("!!!"), null, "nothing usable is left");
-  });
-
-  it("skips names live terminals already hold, within hc's 32 characters", () => {
-    assert.equal(uniqueTerminalName("scout", new Set()), "scout");
-    assert.equal(uniqueTerminalName("scout", new Set(["scout", "scout-2"])), "scout-3");
-    const long = "x".repeat(32);
-    assert.equal(uniqueTerminalName(long, new Set([long])), "x".repeat(30) + "-2");
-  });
-
-  it("starts subagents without notes, focus or a tie to the parent's lifetime", () => {
-    const args = runArgs({
-      cwd: "/repo", space: "sp1", tab: "tb1", name: "scout", argv: ["bash", "/s.sh"],
-    });
-    assert.deepEqual(args, [
-      "run", "--bg", "--keep", "--no-notify", "--outlive-parent",
-      "--cwd", "/repo", "--name", "scout",
-      "--label", "herdr.space=sp1", "--label", "herdr.tab=tb1",
-      "--", "bash", "/s.sh",
-    ]);
-  });
-
-  it("runs the launch script through the login shell, so the child gets the person's PATH", () => {
+  it("opens a top-level subagent in an unfocused window that stays open for its exit status", () => {
     assert.deepEqual(
-      launchArgv("/tmp/it's.sh", { shell: "/bin/zsh", platform: "darwin" }),
-      ["/bin/zsh", "-l", "-i", "-c", "exec bash '/tmp/it'\\''s.sh'"],
+      createArgs({ session: "s1", kind: "tab", label: "map-auth", cwd: "/repo", argv: ["bash", "/s.sh"] }),
+      ["window", "new", "-s", "s1", "map-auth", "--focus=false", "--keep-open", "-c", "/repo", "--json", "--", "bash", "/s.sh"],
     );
-    assert.equal(launchArgv("/s.sh", { platform: "linux" })[0], "/bin/sh", "no $SHELL falls back to sh");
-    assert.deepEqual(launchArgv("C:\\s.sh", { platform: "win32" }), ["bash", "C:\\s.sh"]);
   });
 
-  it("knows a subagent ended from herdr-core's record, not its screen", () => {
-    assert.deepEqual(exitStateOf({ state: "live" }), { finished: false });
-    assert.deepEqual(exitStateOf({ state: "finished", exit_code: 0 }), { finished: true, exitCode: 0 });
+  it("splits a nested subagent off its parent's block in rex's direction words", () => {
     assert.deepEqual(
-      exitStateOf({ state: "finished", exit_code: null }),
+      createArgs({ session: "s1", kind: "pane", label: "scout", cwd: "/repo", anchor: "block:p", direction: "down" }),
+      ["split", "-s", "s1", "-b", "block:p", "--split", "below", "--label", "scout", "--focus=false", "--keep-open", "-c", "/repo", "--json"],
+    );
+    assert.equal(rexSplitDirection("up"), "above");
+    assert.equal(rexSplitDirection("left"), "left");
+  });
+
+  it("hands out reservation handles that cannot be mistaken for block ids", () => {
+    const handle = surfaceHandle("Scout: Map the API!");
+    assert.match(handle, /^rex-surface:scout-map-the-api-[0-9a-f]{8}$/);
+    assert.notEqual(handle, surfaceHandle("Scout: Map the API!"));
+    assert.match(surfaceHandle("!!!"), /^rex-surface:subagent-/);
+  });
+
+  it("rejects a process record it can't interpret", () => {
+    for (const record of [{}, null, { last_exit: "nope" }, { last_exit: {} }]) {
+      assert.throws(() => exitStateOf(record), /Malformed/, JSON.stringify(record));
+    }
+  });
+
+  it("knows a subagent ended from the block's exit record, not its screen", () => {
+    assert.deepEqual(exitStateOf({ last_exit: null, child: { pid: 1 } }), { finished: false });
+    assert.deepEqual(exitStateOf({ last_exit: { exit_code: 0 } }), { finished: true, exitCode: 0 });
+    assert.deepEqual(exitStateOf({ last_exit: { exit_code: 7, error: "exit status 7" } }), { finished: true, exitCode: 7 });
+    assert.deepEqual(
+      exitStateOf({ last_exit: { exit_code: -1, error: "signal: killed" } }),
       { finished: true, exitCode: 1 },
-      "a killed terminal has no exit code and counts as a failure",
+      "a program ended by a signal has no exit code and counts as a failure",
     );
   });
 
-  it("makes a tab id the app has not seen, so it opens a new tab", () => {
-    const id = freshTabId();
-    assert.match(id, /^tb[0-9a-f]{32}$/);
-    assert.notEqual(id, freshTabId());
-  });
-
-  it("keeps only the last lines of what hc read prints", () => {
+  it("keeps only the last lines of a capture", () => {
     const screen = "one\ntwo\nthree\n__SUBAGENT_DONE_0__\n\n\n";
     assert.equal(lastLines(screen, 2), "three\n__SUBAGENT_DONE_0__\n");
     assert.equal(lastLines(screen, 0), "__SUBAGENT_DONE_0__\n", "at least one line");
+  });
+});
+
+describe("rex.ts failure handling", () => {
+  // A stand-in for the rex CLI. `process` replies come from a queue file, one
+  // per line; the last line repeats. "ERR <text>" fails with that stderr.
+  let dir: string;
+  const saved: Record<string, string | undefined> = {};
+  const keys = ["PI_SUBAGENT_REX_BIN", "REX_SESSION", "REX_BLOCK"];
+  const write = (name: string, content: string) => writeFileSync(join(dir, name), content);
+  const calls = () => (existsSync(join(dir, "calls")) ? readFileSync(join(dir, "calls"), "utf8") : "");
+  const poll = (surface: string, options: Record<string, unknown> = {}) =>
+    pollForExit(surface, AbortSignal.timeout(5000), { interval: 1, ...options });
+
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), "fake-rex-"));
+    for (const key of keys) saved[key] = process.env[key];
+    const script = `#!/bin/bash
+D=${JSON.stringify(dir)}
+echo "$*" >> "$D/calls"
+fail() { echo "Error: $1" >&2; exit 3; }
+case "$*" in
+  *" process")
+    line=$(head -n1 "$D/process")
+    if [ "$(wc -l < "$D/process")" -gt 1 ]; then sed -i 1d "$D/process"; fi
+    case "$line" in "ERR "*) fail "\${line#ERR }";; esac
+    echo "$line" ;;
+  *" program_status") case "$(cat "$D/status")" in "ERR "*) fail transport;; esac; cat "$D/status" ;;
+  *" format "*) echo '{"content":"","eof":true,"total":0}' ;;
+  "session inspect"*) echo '{"windows":[]}' ;;
+  "block close"*)
+    n=$(cat "$D/close-failures" 2>/dev/null || echo 0)
+    if [ "$n" -gt 0 ]; then echo $((n-1)) > "$D/close-failures"; fail "transport down"; fi ;;
+  *) echo '{}' ;;
+esac
+`;
+    write("rex", script);
+    chmodSync(join(dir, "rex"), 0o755);
+    process.env.PI_SUBAGENT_REX_BIN = join(dir, "rex");
+    process.env.REX_SESSION = "session:test";
+    process.env.REX_BLOCK = "block:parent";
+  });
+  beforeEach(() => {
+    rmSync(join(dir, "calls"), { force: true });
+    rmSync(join(dir, "close-failures"), { force: true });
+  });
+  after(() => {
+    for (const key of keys) restoreEnvVar(key, saved[key]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  describe("pollForExit", () => {
+    it("reports the process's real exit code", async () => {
+      write("process", '{"last_exit":null}\n{"last_exit":{"exit_code":5}}\n');
+      assert.deepEqual(await poll("block:c"), { reason: "error", exitCode: 5 });
+      write("process", '{"last_exit":{"exit_code":0}}\n');
+      assert.deepEqual(await poll("block:c"), { reason: "done", exitCode: 0 });
+    });
+
+    it("survives transient CLI failures", async () => {
+      write("process", 'ERR transport down\nnot json\n{"last_exit":{"exit_code":2}}\n');
+      assert.deepEqual(await poll("block:c"), { reason: "error", exitCode: 2 });
+    });
+
+    it("gives up after sustained failures instead of polling forever", async () => {
+      write("process", "ERR transport down\n");
+      await assert.rejects(
+        poll("block:c", { maxConsecutiveErrors: 3 }),
+        (error: any) => isRexInfrastructureError(error) && /3 failed checks.*transport down/.test(error.message),
+      );
+    });
+
+    it("counts malformed process records as failures, not as a running child", async () => {
+      write("process", '{"last_exit":"nope"}\n');
+      await assert.rejects(poll("block:c", { maxConsecutiveErrors: 2 }), isRexInfrastructureError);
+    });
+
+    it("resets the failure count after a good reply", async () => {
+      write("process", 'ERR a\nERR b\n{"last_exit":null}\nERR c\nERR d\n{"last_exit":{"exit_code":0}}\n');
+      assert.equal((await poll("block:c", { maxConsecutiveErrors: 3 })).reason, "done");
+    });
+
+    it("reports a vanished block as interrupted, not as a provider error", async () => {
+      write("process", 'ERR block target "block:c" not found\n');
+      const result = await poll("block:c");
+      assert.equal(result.reason, "interrupted");
+      assert.equal(result.exitCode, 1);
+    });
+
+    it("doesn't mistake other not-found errors for a closed pane", async () => {
+      write("process", "ERR bash: rex: command not found\n");
+      await assert.rejects(poll("block:c", { maxConsecutiveErrors: 2 }), isRexInfrastructureError);
+    });
+
+    it("waits for the process after an error sidecar and keeps its message", async () => {
+      const sessionFile = join(dir, "s1.jsonl");
+      write("s1.jsonl.exit", JSON.stringify({ type: "error", errorMessage: "529 Overloaded" }));
+      write("process", '{"last_exit":null}\n{"last_exit":null}\n{"last_exit":{"exit_code":0}}\n');
+      const result = await poll("block:c", { sessionFile });
+      assert.deepEqual(result, { reason: "error", exitCode: 1, errorMessage: "529 Overloaded" });
+      assert.equal(calls().match(/ process$/gm)?.length, 3, "must not return while the process is live");
+    });
+
+    it("keeps a non-zero exit code alongside the sidecar's message", async () => {
+      const sessionFile = join(dir, "s2.jsonl");
+      write("s2.jsonl.exit", JSON.stringify({ type: "error", errorMessage: "boom" }));
+      write("process", '{"last_exit":{"exit_code":9}}\n');
+      assert.deepEqual(await poll("block:c", { sessionFile }), { reason: "error", exitCode: 9, errorMessage: "boom" });
+    });
+
+    it("prefers a collected sidecar over interrupted when the block is gone", async () => {
+      const sessionFile = join(dir, "s3.jsonl");
+      write("s3.jsonl.exit", JSON.stringify({ type: "error", errorMessage: "boom" }));
+      write("process", 'ERR block target "block:c" not found\n');
+      assert.equal((await poll("block:c", { sessionFile })).errorMessage, "boom");
+    });
+
+    it("returns on the Claude sentinel while Claude is still open", async () => {
+      const sentinelFile = join(dir, "claude-done");
+      write("claude-done", "summary");
+      write("process", '{"last_exit":null}\n');
+      assert.deepEqual(await poll("block:c", { sentinelFile }), { reason: "sentinel", exitCode: 0 });
+    });
+  });
+
+  describe("sendMessage", () => {
+    const delivered = () => /block\.event|send-key/.test(calls());
+
+    it("delivers when a current pi record says it is safe", () => {
+      write("status", JSON.stringify({ records: [{ state: "idle", app: "pi", effective_app: "pi" }] }));
+      sendMessage("block:c", "hello");
+      assert.ok(calls().includes("block.event"));
+      assert.ok(calls().includes("send-key"));
+    });
+
+    for (const [label, status] of [
+      ["no records", '{"records":[]}'],
+      ["a query failure", "ERR transport"],
+      ["a blocked record", JSON.stringify({ records: [{ state: "blocked", app: "pi", kind: "permission" }] })],
+    ] as const) {
+      it(`sends nothing with ${label}`, () => {
+        write("status", status);
+        assert.throws(() => sendMessage("block:c", "hello"), /Cannot deliver message/);
+        assert.equal(delivered(), false);
+      });
+    }
+
+    it("won't start a reserved surface just to type into it", () => {
+      const surface = createSurface("not-started");
+      assert.throws(() => sendMessage(surface, "hello"), /has not started/);
+      assert.equal(delivered(), false);
+      closeSurface(surface);
+    });
+  });
+
+  describe("safeCloseSurface", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    it("doesn't throw when a close fails, and retries until it works", () => {
+      write("close-failures", "1");
+      testApi.safeCloseSurface("block:c");
+      assert.equal(testApi.pendingCleanups.has("block:c"), true);
+      testApi.processPendingCleanups();
+      assert.equal(testApi.pendingCleanups.has("block:c"), false);
+      assert.equal(calls().match(/^block close/gm)?.length, 2);
+    });
+
+    it("stops retrying after a limited number of attempts", () => {
+      write("close-failures", "99");
+      const error = console.error;
+      console.error = () => {};
+      try {
+        testApi.safeCloseSurface("block:c");
+        for (let i = 0; i < 5; i++) testApi.processPendingCleanups();
+      } finally {
+        console.error = error;
+      }
+      assert.equal(testApi.pendingCleanups.size, 0);
+      assert.equal(calls().match(/^block close/gm)?.length, 6);
+    });
+  });
+});
+
+describe("checkSteeringSafety", () => {
+  const pi = (state: string, extra: object = {}) => ({ state, app: "pi", effective_app: "pi", ...extra });
+
+  it("allows a current record from a known agent", () => {
+    for (const state of ["idle", "working", "done"]) {
+      assert.equal(checkSteeringSafety([pi(state)]).ok, true, state);
+    }
+    assert.equal(checkSteeringSafety([{ state: "working", effective_app: "claude-code" }]).ok, true);
+  });
+
+  it("refuses missing or malformed status", () => {
+    for (const records of [undefined, null, [], "nope", [null], [{ state: "idle" }]]) {
+      assert.equal(checkSteeringSafety(records).ok, false, JSON.stringify(records));
+    }
+  });
+
+  it("refuses a blocked or failed agent, even on a child record", () => {
+    const blocked = checkSteeringSafety([pi("working"), pi("blocked", { id: "tool", kind: "question", msg: "Sure?" })]);
+    assert.equal(blocked.ok, false);
+    assert.match((blocked as any).error, /agent_blocked.*question dialog: Sure\?/);
+    assert.equal(checkSteeringSafety([pi("error", { msg: "boom" })]).ok, false);
+  });
+
+  it("treats an unattributed blocked record as the agent's", () => {
+    assert.equal(checkSteeringSafety([pi("idle"), { state: "blocked" }]).ok, false);
+  });
+
+  it("isn't blocked or approved by a record another program owns", () => {
+    const other = { state: "blocked", app: "terraform", effective_app: "terraform" };
+    assert.equal(checkSteeringSafety([pi("idle"), other]).ok, true);
+    assert.equal(checkSteeringSafety([other]).ok, false);
+    assert.equal(checkSteeringSafety([{ state: "idle", app: "cargo" }]).ok, false);
+  });
+});
+
+describe("bounded screen reads", () => {
+  it("fetches only the tail of a truncated reply", () => {
+    assert.deepEqual(tailReadArgs({ id: 4, total: 1_000_000, content: "head" }), {
+      id: 4,
+      offset: 1_000_000 - DIAGNOSTIC_MAX_BYTES / 2,
+      max_bytes: DIAGNOSTIC_MAX_BYTES,
+    });
+    assert.equal(tailReadArgs({ id: 4, total: 10 })?.offset, 0);
+  });
+
+  it("uses the reply itself when it holds the whole screen", () => {
+    assert.equal(tailReadArgs({ content: "all", eof: true, total: 3 }), null);
+    assert.equal(tailReadArgs(null), null);
+  });
+});
+
+describe("launch results", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("makes the launch script exit with the agent's status, not the sentinel echo's", () => {
+    const run = (command: string) => spawnSync("bash", ["-c", testApi.wrapLaunchCommand(command)], { encoding: "utf8" });
+    const failed = run("(exit 5)");
+    assert.equal(failed.status, 5);
+    assert.match(failed.stdout, /__SUBAGENT_DONE_5__/);
+    assert.equal(run("true").status, 0);
+    assert.equal(run("cd /nonexistent-dir-xyz 2>/dev/null && true").status, 1);
+  });
+
+  it("presents an interrupted run as neither a provider failure nor a crash", () => {
+    const text = testApi.resolveResultPresentation(
+      { exitCode: 1, elapsed: 3, summary: "partial work", interrupted: true, errorMessage: "pane closed" },
+      "scout",
+    );
+    assert.match(text, /was interrupted/);
+    assert.match(text, /partial work/);
+    assert.match(text, /subagent_message/);
+    assert.doesNotMatch(text, /auto-retry/);
+  });
+
+  it("still presents provider errors as failures", () => {
+    const text = testApi.resolveResultPresentation({ exitCode: 1, elapsed: 3, summary: "", errorMessage: "529" }, "scout");
+    assert.match(text, /provider\/agent error/);
   });
 });
 

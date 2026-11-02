@@ -25,7 +25,8 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./herdr.ts";
+  isRexInfrastructureError,
+} from "./rex.ts";
 
 import {
   countSessionEntryLines,
@@ -547,15 +548,68 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/** Pane closes that failed and will be retried a limited number of times. */
+const pendingCleanups = new Map<string, { retriesLeft: number }>();
+let cleanupRetryTimer: ReturnType<typeof setTimeout> | null = null;
+const CLEANUP_RETRIES = 5;
+const CLEANUP_RETRY_MS = 1000;
+
+function scheduleCleanupRetry(): void {
+  if (cleanupRetryTimer || pendingCleanups.size === 0) return;
+  cleanupRetryTimer = setTimeout(processPendingCleanups, CLEANUP_RETRY_MS);
+  cleanupRetryTimer.unref?.();
+}
+
+function processPendingCleanups(): void {
+  cleanupRetryTimer = null;
+  for (const [surface, entry] of pendingCleanups) {
+    try {
+      closeSurface(surface);
+      pendingCleanups.delete(surface);
+    } catch (err) {
+      entry.retriesLeft--;
+      if (entry.retriesLeft <= 0) {
+        console.error(`Failed to close subagent surface ${surface}: ${err}`);
+        pendingCleanups.delete(surface);
+      }
+    }
+  }
+  scheduleCleanupRetry();
+}
+
+/**
+ * Close a finished subagent's pane without letting a failure replace the
+ * result already collected. A failed close is retried in the background.
+ */
+function safeCloseSurface(surface: string): void {
+  try {
+    closeSurface(surface);
+    pendingCleanups.delete(surface);
+  } catch {
+    if (!pendingCleanups.has(surface)) {
+      pendingCleanups.set(surface, { retriesLeft: CLEANUP_RETRIES });
+    }
+    scheduleCleanupRetry();
+  }
+}
+
+/**
+ * End a launch command so the script exits with the agent's real status. The
+ * sentinel is only for people reading the pane; completion uses the exit code.
+ */
+export function wrapLaunchCommand(baseCommand: string): string {
+  return `${baseCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
+}
+
 function muxUnavailableResult() {
   return {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require Herdr. ${muxSetupHint()}`,
+        text: `Subagents require Rex. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "herdr not available" },
+    details: { error: "rex not available" },
   };
 }
 
@@ -593,13 +647,21 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "interrupted"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+
+  if (result.interrupted) {
+    return (
+      `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)}: ` +
+      `its pane closed before it finished. This is not a provider failure, and the ` +
+      `session data was preserved.\n\n${result.summary}${sessionRef}`
+    );
+  }
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -636,6 +698,8 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** The pane closed before the subagent finished. */
+  interrupted?: boolean;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
 }
@@ -1054,7 +1118,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via Herdr: ` +
+        `Failed to deliver message to subagent "${running.name}" via Rex: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1168,6 +1232,11 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
+  wrapLaunchCommand,
+  resolveResultPresentation,
+  safeCloseSurface,
+  processPendingCleanups,
+  pendingCleanups,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1185,7 +1254,6 @@ export const __test__ = {
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
-  resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
@@ -1317,7 +1385,7 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    const command = wrapLaunchCommand(`${cdPrefix}${cmdParts.join(" ")}`);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1460,7 +1528,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = wrapLaunchCommand(piCommand);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1616,10 +1684,18 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      safeCloseSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        ...(result.reason === "interrupted" ? { interrupted: true } : {}),
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1644,7 +1720,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    safeCloseSurface(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1656,13 +1732,30 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      ...(result.reason === "interrupted" ? { interrupted: true } : {}),
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
     runningSubagents.delete(running.id);
+
+    if (isRexInfrastructureError(err)) {
+      // Rex can't be observed, so the child may still be running: leave its
+      // pane alone, and warn that resuming could start a second process.
+      return {
+        name,
+        task,
+        summary:
+          `${err?.message ?? String(err)}\n\nThe pane was left open because the subagent may ` +
+          `still be running. Check it before using subagent_message: a resume started while ` +
+          `the old process is alive would run two processes on one session.`,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        error: err?.message ?? String(err),
+        sessionFile,
+      };
+    }
+
+    safeCloseSurface(surface);
 
     if (signal.aborted) {
       return {
@@ -1719,6 +1812,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    if (cleanupRetryTimer) {
+      clearTimeout(cleanupRetryTimer);
+      cleanupRetryTimer = null;
+    }
+    for (const surface of pendingCleanups.keys()) {
+      try {
+        closeSurface(surface);
+      } catch (err) {
+        console.error(`Failed to close subagent surface ${surface} on shutdown: ${err}`);
+      }
+    }
+    pendingCleanups.clear();
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -1893,6 +1998,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: result.sessionFile,
                   ...(result.sessionId ? { sessionId: result.sessionId } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.interrupted ? { interrupted: true } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
                 },
@@ -2263,7 +2369,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = wrapLaunchCommand(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2338,6 +2444,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+                  ...(result.interrupted ? { interrupted: true } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2428,7 +2535,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // like the in-process extension. Failure: surface the failure reason.
         let header: string;
         if (failed) {
-          const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
+          const reason = details.interrupted
+            ? "interrupted (pane closed)"
+            : errorMessage
+              ? "failed (provider/agent error)"
+              : `failed (exit ${exitCode})`;
           header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
         } else {
           const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
