@@ -89,9 +89,10 @@ if (!backends.length) console.log("Rex unavailable: lifecycle cases require a li
 
 for (const backend of backends) {
   describe(`subagent-lifecycle [${backend}] model=${TEST_MODEL}`, { timeout: PI_TIMEOUT * 24 }, () => {
-    let env: TestEnv;
+    let env: TestEnv | undefined;
     let outside: { session: string; block: string };
     beforeEach(() => {
+      env = undefined;
       outside = { session: process.env.REX_SESSION!, block: process.env.REX_BLOCK! };
       env = createTestEnv({ isolateRex: true });
       assert.notEqual(env.rexSession, outside.session);
@@ -108,6 +109,7 @@ for (const backend of backends) {
       }
     });
     afterEach(() => {
+      if (!env) return;
       const ownedSession = env.rexSession;
       cleanupTestEnv(env);
       assert.ok(!rexJson(["ls", "--json"]).sessions.some((s: any) => s.session_id === ownedSession), "owned session and descendants must be gone");
@@ -115,6 +117,7 @@ for (const backend of backends) {
     });
 
     it("returns an asynchronous launch acknowledgement, then exactly one persisted parent result", async () => {
+      assert.ok(env);
       const name = `echo-${uniqueId()}`;
       const marker = join(env.dir, "echo.txt");
       const surface = createTrackedSurface(env, "parent");
@@ -136,6 +139,7 @@ for (const backend of backends) {
     });
 
     it("keeps a long active tool call from surfacing a false stalled status", async () => {
+      assert.ok(env);
       const name = `activity-${uniqueId()}`;
       const started = join(env.dir, "started.txt"), marker = join(env.dir, "activity.txt");
       const surface = createTrackedSurface(env, "parent");
@@ -157,6 +161,7 @@ for (const backend of backends) {
     });
 
     it("launches two live agents before either result and delivers both to the parent", async () => {
+      assert.ok(env);
       const a = `parallel-a-${uniqueId()}`, b = `parallel-b-${uniqueId()}`;
       const surface = createTrackedSurface(env, "parent");
       const task = `Call subagent twice NOW, before waiting for either result: ` + JSON.stringify([
@@ -178,6 +183,7 @@ for (const backend of backends) {
     });
 
     it("resumes by name with the original session, restricted loadout and special-character cwd", async () => {
+      assert.ok(env);
       const name = `resume-${uniqueId()}`;
       const cwd = join(env.dir, "cwd 'quoted' space"); mkdirSync(cwd);
       const surface = createTrackedSurface(env, "parent");
@@ -206,6 +212,7 @@ for (const backend of backends) {
     });
 
     it("delivers an ordinary ask_question and safely replies to the still-running child", async () => {
+      assert.ok(env);
       const name = `question-${uniqueId()}`;
       const marker = join(env.dir, "answer.txt");
       const surface = createTrackedSurface(env, "parent");
@@ -223,6 +230,7 @@ for (const backend of backends) {
     });
 
     it("keeps interactive Pi alive after a response, steers literal text, and collects a clean user exit", async () => {
+      assert.ok(env);
       const name = `interactive-${uniqueId()}`;
       const marker = join(env.dir, "literal.txt"), injection = join(env.dir, "MUST_NOT_EXIST");
       const surface = createTrackedSurface(env, "parent");
@@ -250,6 +258,7 @@ for (const backend of backends) {
     });
 
     it("keeps an autonomous coordinator alive while a nested child is pending in its tab", async () => {
+      assert.ok(env);
       const name = `coordinator-${uniqueId()}`, nested = `nested-${uniqueId()}`;
       const marker = join(env.dir, "nested.txt");
       const surface = createTrackedSurface(env, "parent");
@@ -269,6 +278,7 @@ for (const backend of backends) {
     });
 
     it("reports manual pane closure as interruption exactly once and permits saved-session follow-up", async () => {
+      assert.ok(env);
       const name = `interrupted-${uniqueId()}`, marker = join(env.dir, "recovered.txt");
       const surface = createTrackedSurface(env, "parent");
       const session = startPi(surface, env.dir, parentTask({ name, agent: "test-interactive", task:
@@ -296,6 +306,7 @@ for (const backend of backends) {
     });
 
     it("uses profile-selected fork lineage, project discovery and system-prompt identity", async () => {
+      assert.ok(env);
       const name = `fork-${uniqueId()}`, marker = join(env.dir, "fork.txt");
       const surface = createTrackedSurface(env, "parent");
       const session = startPi(surface, env.dir,

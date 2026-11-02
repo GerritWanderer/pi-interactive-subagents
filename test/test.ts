@@ -2988,7 +2988,7 @@ describe("integration harness profile guards", () => {
     }
   });
 
-  it("replaces or adds frontmatter settings with a literal special-character TEST_MODEL", async () => {
+  it("replaces or adds LF and CRLF frontmatter settings with a literal special-character TEST_MODEL", async () => {
     const model = "test/model-$&-$$-$`-$'";
     const previousModel = process.env.PI_TEST_MODEL;
     try {
@@ -3009,12 +3009,15 @@ describe("integration harness profile guards", () => {
         const body = "Preserve these body examples:\nmodel: body/model\nthinking: high";
         for (const [name, frontmatter] of Object.entries(profiles)) {
           writeAgentFile(agentsSrc, name, frontmatter, body);
+          const content = readFileSync(join(agentsSrc, `${name}.md`), "utf8");
+          writeFileSync(join(agentsSrc, `${name}-crlf.md`), content.replace(/\n/g, "\r\n"));
         }
+        const names = Object.keys(profiles).flatMap((name) => [name, `${name}-crlf`]);
         writeFileSync(join(agentsSrc, "ignored.txt"), "not an agent");
         const env = harness.createTestEnv({ agentsSrc });
         try {
-          assert.deepEqual(assertProfiles(env.dir, harness.TEST_MODEL).sort(), Object.keys(profiles).map((name) => `${name}.md`).sort());
-          for (const name of Object.keys(profiles)) {
+          assert.deepEqual(assertProfiles(env.dir, harness.TEST_MODEL).sort(), names.map((name) => `${name}.md`).sort());
+          for (const name of names) {
             const file = `${name}.md`;
             const copied = readFileSync(join(env.dir, ".pi/agents", file), "utf8");
             assert.ok(copied.endsWith(`\n\n${body}\n`), `${file} body must be unchanged`);

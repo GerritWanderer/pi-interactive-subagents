@@ -142,7 +142,7 @@ export function createTestEnv(opts?: { isolateRex?: boolean; agentsSrc?: string 
           cpSync(join(agentsSrc, file), target);
           // Rewrite only frontmatter: body examples must not override this guard.
           // The approved model applies to parents AND profile-selected children.
-          const content = readFileSync(target, "utf8").replace(
+          const content = readFileSync(target, "utf8").replace(/\r\n/g, "\n").replace(
             /^---\n((?:[^\n]*\n)*?)---(?=\n|$)/,
             (_match, frontmatter: string) => {
               frontmatter = /^model:/m.test(frontmatter)
