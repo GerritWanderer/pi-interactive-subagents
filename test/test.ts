@@ -1,10 +1,14 @@
-import { describe, it, before, after, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import {
+  visibleWidth, detectCapabilities, getCapabilities, setCapabilityOverrides,
+  resetCapabilitiesCache, getTerminalColorMode, hyperlink,
+} from "@earendil-works/pi-tui";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -30,7 +34,14 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/herdr.ts";
+import {
+  shellEscape, __rexTest__, disposeRexSurfaces, registerSurfaceHandle, unregisterSurfaceHandle,
+} from "../pi-extension/subagents/rex.ts";
+import { planEqualShares, type RexLayoutNode } from "../pi-extension/subagents/rex-sizing.ts";
+import { createTestEnv, cleanupTestEnv, TEST_MODEL } from "./integration/harness.ts";
+
+// A cosmetic timer from one fixture must not run with the next fixture's executor.
+afterEach(() => disposeRexSurfaces());
 import {
   advanceStatusState,
   capStatusLines,
@@ -57,17 +68,6 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension from "../pi-extension/subagents/tools/safe-bash.ts";
-import { __pollForExitTest__, __layoutTest__ } from "../pi-extension/subagents/herdr.ts";
-import {
-  exitStateOf,
-  freshTabId,
-  isHerdrDesktopEnv,
-  lastLines,
-  launchArgv,
-  runArgs,
-  terminalName,
-  uniqueTerminalName,
-} from "../pi-extension/subagents/herdr-desktop.ts";
 
 // --- Helpers ---
 
@@ -1887,16 +1887,11 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("herdr.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
+describe("rex.ts interpretExitSidecar", () => {
+  const { interpretExitSidecar } = __rexTest__;
 
-  it("no longer decodes ping payloads (ask_question keeps the session open instead)", () => {
-    // ask_question writes a `.ask` signal, not a `.exit` ping sidecar, so an
-    // unknown `type: "ping"` payload now falls through to a clean done.
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      { reason: "done", exitCode: 0 },
-    );
+  it("rejects obsolete ping payloads (ask_question uses .ask, not .exit)", () => {
+    assert.equal(interpretExitSidecar({ type: "ping" }).reason, "error");
   });
 
   it("decodes done payloads", () => {
@@ -1928,9 +1923,13 @@ describe("herdr.ts interpretExitSidecar", () => {
     assert.match(result.errorMessage ?? "", /no errorMessage/);
   });
 
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  it("rejects unknown payload shapes instead of claiming success", () => {
+    for (const payload of [{}, null]) {
+      const result = interpretExitSidecar(payload);
+      assert.equal(result.reason, "error");
+      assert.equal(result.exitCode, 1);
+      assert.match(result.errorMessage!, /Unrecognized or corrupt/);
+    }
   });
 });
 describe("commands", () => {
@@ -2518,6 +2517,12 @@ describe("subagent interruption", () => {
         summary: "Process observation unavailable",
         observationFailure: true,
       },
+      {
+        summary: "Observation disposed during session shutdown or reload.",
+        observationFailure: true,
+        outcome: "interrupted" as const,
+        error: "cancelled",
+      },
     ]) {
       const presentation = subagentsModule.__test__.resolveResultPresentation(
         { exitCode: 1, elapsed: 10, ...result },
@@ -2528,6 +2533,76 @@ describe("subagent interruption", () => {
       assert.match(presentation, /pane was kept open/i);
       assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
       assert.doesNotMatch(presentation, /Follow up with subagent_message/);
+    }
+  });
+
+  it("does not invite resume while an in-memory or persistent observation guard is active", async () => {
+    const { writeLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "guarded.jsonl");
+      for (const guard of ["in-memory", "disk-only"]) {
+        try {
+          if (guard === "in-memory") testApi.lostObservationSessions.add(resolve(sessionFile));
+          else writeLostObservationMarker(sessionFile);
+          for (const { result, expected } of [
+            { result: { outcome: "success" as const }, expected: /completed \(10s\)\.\n\nReal result/ },
+            { result: { outcome: "failure" as const }, expected: /failed \(exit code 42\)/ },
+            {
+              result: { outcome: "failure" as const, errorMessage: "Anthropic 529 Overloaded" },
+              expected: /failed after 10s[\s\S]*Error: Anthropic 529 Overloaded/,
+            },
+            {
+              result: { outcome: "interrupted" as const, errorMessage: "Pane closed externally" },
+              expected: /was interrupted after 10s[\s\S]*Pane closed externally/,
+            },
+            {
+              result: { outcome: "interrupted" as const, error: "cancelled" },
+              expected: /was cancelled after 10s/,
+            },
+            { result: { outcome: "cancelled" as const }, expected: /was cancelled after 10s/ },
+          ]) {
+            const presentation = testApi.resolveResultPresentation(
+              { exitCode: result.outcome === "success" ? 0 : 42, elapsed: 10, summary: "Real result", sessionFile, ...result },
+              "guarded-worker",
+            );
+            assert.match(presentation, expected);
+            assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+            assert.doesNotMatch(presentation, /infrastructure observation failure|pane was kept open/i);
+            assert.doesNotMatch(presentation, /resume the session with subagent_message|Follow up with subagent_message/);
+          }
+        } finally {
+          testApi.confirmProcessEnded(sessionFile);
+        }
+      }
+    });
+  });
+
+  it("preserves successful presentation despite marker stat errors or a retained guard", async (t) => {
+    const { __setStatSyncOverride } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    const sessionFile = join(tmpdir(), "successful-marker-stat-error.jsonl");
+    let statChecks = 0;
+    t.mock.method(console, "error", () => {});
+    __setStatSyncOverride(() => {
+      statChecks++;
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    });
+    try {
+      for (const guarded of [false, true]) {
+        if (guarded) testApi.lostObservationSessions.add(resolve(sessionFile));
+        const presentation = testApi.resolveResultPresentation(
+          { exitCode: 0, elapsed: 12, summary: "Completed work", outcome: "success", sessionFile },
+          "successful-worker",
+        );
+        assert.match(presentation, /Sub-agent "successful-worker" completed \(12s\)\.\n\nCompleted work/);
+        assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+        assert.doesNotMatch(presentation, /infrastructure observation failure|Follow up with subagent_message/);
+      }
+      assert.equal(statChecks, 1, "check the disk guard unless the in-memory guard already blocks resume");
+    } finally {
+      __setStatSyncOverride(null);
+      testApi.lostObservationSessions.delete(resolve(sessionFile));
     }
   });
 
@@ -2654,46 +2729,6 @@ describe("subagent status renderer", () => {
   });
 });
 
-describe("subagent startup delay", () => {
-  // The delay only applies outside the Herdr desktop app, which these tests may run in.
-  const originalTerminalId = process.env.HC_TERMINAL_ID;
-  beforeEach(() => {
-    delete process.env.HC_TERMINAL_ID;
-  });
-  after(() => {
-    if (originalTerminalId != null) process.env.HC_TERMINAL_ID = originalTerminalId;
-  });
-
-  it("defaults to 500ms when no env var is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-
-  it("uses PI_SUBAGENT_SHELL_READY_DELAY_MS when it is set", () => {
-    const testApi = (subagentsModule as any).__test__;
-    assert.ok(testApi, "expected subagents test helpers to be exported");
-    assert.equal(typeof testApi.getShellReadyDelayMs, "function");
-
-    const original = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
-    try {
-      assert.equal(testApi.getShellReadyDelayMs(), 2500);
-    } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
-      else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
-    }
-  });
-});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -2856,131 +2891,7 @@ describe("subagent display helpers", () => {
   });
 });
 
-describe("herdr.ts layout", () => {
-  const { planEvenSplits, chooseSplitDirection, chooseSurfaceKind } = __layoutTest__;
-  const rect = (x: number, y: number, width: number, height: number) => ({ x, y, width, height });
-  const pane = (pane_id: string, r: ReturnType<typeof rect>) => ({ pane_id, focused: false, rect: r });
-
-  // Real snapshot shape from `herdr pane layout` after splitting w1:p1 right
-  // three times: panes 18/18/24/60 wide, tree left-nested under the root.
-  const lopsided = {
-    zoomed: false,
-    area: rect(0, 0, 120, 40),
-    focused_pane_id: "w1:p1",
-    panes: [
-      pane("w1:p1", rect(0, 0, 18, 40)),
-      pane("w1:p4", rect(18, 0, 18, 40)),
-      pane("w1:p3", rect(36, 0, 24, 40)),
-      pane("w1:p2", rect(60, 0, 60, 40)),
-    ],
-    splits: [
-      { id: "split_0_root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) },
-      { id: "split_1_0", direction: "right" as const, ratio: 0.6, rect: rect(0, 0, 60, 40) },
-      { id: "split_2_00", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 36, 40) },
-    ],
-  };
-
-  describe("planEvenSplits", () => {
-    it("targets the pane whose right edge sits on each split boundary, with a ratio delta", () => {
-      const steps = planEvenSplits(lopsided);
-      // root: 3 of 4 columns on the left -> 0.75 (grow from 0.5, owner p3)
-      // split_1_0: 2 of 3 columns -> 0.667 (grow from 0.6, owner p4)
-      // split_2_00: 1 of 2 columns -> 0.5 (already even, skipped)
-      assert.deepEqual(
-        steps.map((s) => [s.pane, s.direction, Number(s.amount.toFixed(3))]),
-        [
-          ["w1:p3", "right", 0.25],
-          ["w1:p4", "right", 0.067],
-        ],
-      );
-    });
-
-    it("shrinks with `left` when the first side is too wide, since herdr ignores the sign of --amount", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 90, 40)), pane("w1:p2", rect(90, 0, 30, 40))],
-        splits: [{ id: "root", direction: "right", ratio: 0.75, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "left", amount: 0.25 }]);
-    });
-
-    it("balances vertical splits with up/down", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 120, 10)), pane("w1:p2", rect(0, 10, 120, 30))],
-        splits: [{ id: "root", direction: "down", ratio: 0.25, rect: rect(0, 0, 120, 40) }],
-      });
-      assert.deepEqual(steps, [{ pane: "w1:p1", direction: "down", amount: 0.25 }]);
-    });
-
-    it("counts stacked panes as one column so a down split inside a column does not skew the share", () => {
-      const steps = planEvenSplits({
-        ...lopsided,
-        panes: [
-          pane("w1:p1", rect(0, 0, 60, 40)),
-          pane("w1:p2", rect(60, 0, 60, 20)),
-          pane("w1:p3", rect(60, 20, 60, 20)),
-        ],
-        splits: [
-          { id: "root", direction: "right", ratio: 0.5, rect: rect(0, 0, 120, 40) },
-          { id: "col", direction: "down", ratio: 0.5, rect: rect(60, 0, 60, 40) },
-        ],
-      });
-      assert.deepEqual(steps, []);
-    });
-
-    it("leaves a tab alone when every split is already even", () => {
-      const even = {
-        ...lopsided,
-        panes: [pane("w1:p1", rect(0, 0, 60, 40)), pane("w1:p2", rect(60, 0, 60, 40))],
-        splits: [{ id: "root", direction: "right" as const, ratio: 0.5, rect: rect(0, 0, 120, 40) }],
-      };
-      assert.deepEqual(planEvenSplits(even), []);
-    });
-  });
-
-  describe("chooseSplitDirection", () => {
-    it("splits a wide pane right and a narrow or tall pane down (herdr geometry rule; cells are ~2:1)", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "auto"), "down"); // 60x40
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "auto"), "down"); // 18x40
-      const wide = { ...lopsided, panes: [pane("w1:p1", rect(0, 0, 175, 64))] };
-      assert.equal(chooseSplitDirection(wide, "w1:p1", "auto"), "right");
-    });
-
-    it("honours an explicit setting and falls back to right without a layout", () => {
-      assert.equal(chooseSplitDirection(lopsided, "w1:p1", "right"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p2", "down"), "down");
-      assert.equal(chooseSplitDirection(undefined, "w1:p1", "auto"), "right");
-      assert.equal(chooseSplitDirection(lopsided, "w1:p99", "auto"), "right");
-    });
-  });
-
-  describe("chooseSurfaceKind", () => {
-    it("gives a main-session subagent its own tab and keeps a nested subagent's children in its tab", () => {
-      assert.equal(chooseSurfaceKind(false, "tab"), "tab");
-      assert.equal(chooseSurfaceKind(true, "tab"), "pane");
-    });
-
-    it("falls back to panes everywhere when PI_SUBAGENT_TOP_LEVEL_SURFACE is pane", () => {
-      assert.equal(chooseSurfaceKind(false, "pane"), "pane");
-      assert.equal(chooseSurfaceKind(true, "pane"), "pane");
-    });
-
-    it("reads nesting from PI_SUBAGENT_NAME", () => {
-      const saved = process.env.PI_SUBAGENT_NAME;
-      try {
-        delete process.env.PI_SUBAGENT_NAME;
-        assert.equal(chooseSurfaceKind(undefined, "tab"), "tab");
-        process.env.PI_SUBAGENT_NAME = "map-auth-flow";
-        assert.equal(chooseSurfaceKind(undefined, "tab"), "pane");
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_NAME", saved);
-      }
-    });
-  });
-});
-
-describe("herdr.ts", () => {
+describe("rex.ts shell quoting", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
@@ -3005,70 +2916,372 @@ describe("herdr.ts", () => {
   });
 });
 
-describe("herdr-desktop.ts", () => {
-  it("detects the desktop app by the HC_TERMINAL_ID herdr-core exports", () => {
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: "t2" }), true);
-    assert.equal(isHerdrDesktopEnv({ HERDR_ENV: "1" }), false);
-    assert.equal(isHerdrDesktopEnv({ HC_TERMINAL_ID: " " }), false);
+describe("Rex equal-share sizing (public session.view layout)", () => {
+  const pane = (block_id: string): RexLayoutNode => ({ block_id, rect: [0, 0, 1, 1] });
+  const split = (direction: "horizontal" | "vertical", ratio: number, before: RexLayoutNode, after: RexLayoutNode): RexLayoutNode => ({
+    rect: [0, 0, 1, 1], split: { split_id: "split:fixture", direction, ratio, before, after },
+  });
+  const a = pane("block:a"), b = pane("block:b"), c = pane("block:c"), d = pane("block:d");
+
+  it("balances repeated halvings into four equal columns using absolute border ratios", () => {
+    const layout = split("horizontal", 0.5,
+      split("horizontal", 0.6, split("horizontal", 0.5, a, b), c), d);
+    assert.deepEqual(planEqualShares(layout), [
+      { direction: "horizontal", before_block_id: "block:b", after_block_id: "block:c", ratio: 2 / 3 },
+      { direction: "horizontal", before_block_id: "block:c", after_block_id: "block:d", ratio: 3 / 4 },
+    ]);
+    assert.equal(planEqualShares(split("horizontal", 0.75, a, b))[0].ratio, 0.5, "also shrinks the before share");
   });
 
-  it("turns a subagent name into a valid hc terminal name", () => {
-    assert.equal(terminalName("Scout: Map the API!"), "scout-map-the-api");
-    assert.equal(terminalName("worker_2"), "worker_2");
-    assert.equal(terminalName("a".repeat(40))?.length, 32, "hc caps names at 32 characters");
-    assert.equal(terminalName("x".repeat(31) + "-y"), "x".repeat(31), "no trailing dash after the cut");
-    assert.equal(terminalName("!!!"), null, "nothing usable is left");
-  });
-
-  it("skips names live terminals already hold, within hc's 32 characters", () => {
-    assert.equal(uniqueTerminalName("scout", new Set()), "scout");
-    assert.equal(uniqueTerminalName("scout", new Set(["scout", "scout-2"])), "scout-3");
-    const long = "x".repeat(32);
-    assert.equal(uniqueTerminalName(long, new Set([long])), "x".repeat(30) + "-2");
-  });
-
-  it("starts subagents without notes, focus or a tie to the parent's lifetime", () => {
-    const args = runArgs({
-      cwd: "/repo", space: "sp1", tab: "tb1", name: "scout", argv: ["bash", "/s.sh"],
-    });
-    assert.deepEqual(args, [
-      "run", "--bg", "--keep", "--no-notify", "--outlive-parent",
-      "--cwd", "/repo", "--name", "scout",
-      "--label", "herdr.space=sp1", "--label", "herdr.tab=tb1",
-      "--", "bash", "/s.sh",
+  it("balances stacked rows and counts side-by-side panes as one row", () => {
+    const layout = split("vertical", 0.5, a,
+      split("vertical", 0.5, split("horizontal", 0.5, b, c), d));
+    assert.deepEqual(planEqualShares(layout), [
+      { direction: "vertical", before_block_id: "block:a", after_block_id: "block:b", ratio: 1 / 3 },
     ]);
   });
 
-  it("runs the launch script through the login shell, so the child gets the person's PATH", () => {
-    assert.deepEqual(
-      launchArgv("/tmp/it's.sh", { shell: "/bin/zsh", platform: "darwin" }),
-      ["/bin/zsh", "-l", "-i", "-c", "exec bash '/tmp/it'\\''s.sh'"],
-    );
-    assert.equal(launchArgv("/s.sh", { platform: "linux" })[0], "/bin/sh", "no $SHELL falls back to sh");
-    assert.deepEqual(launchArgv("C:\\s.sh", { platform: "win32" }), ["bash", "C:\\s.sh"]);
+  it("counts stacked panes as one column in mixed-axis trees", () => {
+    assert.deepEqual(planEqualShares(split("horizontal", 0.5, a, split("vertical", 0.5, b, c))), []);
+    const layout = split("horizontal", 0.5,
+      split("vertical", 0.7, split("horizontal", 0.5, a, b), c), d);
+    assert.deepEqual(planEqualShares(layout), [
+      { direction: "vertical", before_block_id: "block:b", after_block_id: "block:c", ratio: 0.5 },
+      { direction: "horizontal", before_block_id: "block:c", after_block_id: "block:d", ratio: 2 / 3 },
+    ]);
   });
 
-  it("knows a subagent ended from herdr-core's record, not its screen", () => {
-    assert.deepEqual(exitStateOf({ state: "live" }), { finished: false });
-    assert.deepEqual(exitStateOf({ state: "finished", exit_code: 0 }), { finished: true, exitCode: 0 });
-    assert.deepEqual(
-      exitStateOf({ state: "finished", exit_code: null }),
-      { finished: true, exitCode: 1 },
-      "a killed terminal has no exit code and counts as a failure",
-    );
+  it("leaves a single pane, empty, already equal, and insignificant corrections alone", () => {
+    for (const layout of [a, null, undefined, split("horizontal", 0.5, a, b), split("vertical", 0.504, a, b)]) {
+      assert.deepEqual(planEqualShares(layout), []);
+    }
   });
 
-  it("makes a tab id the app has not seen, so it opens a new tab", () => {
-    const id = freshTabId();
-    assert.match(id, /^tb[0-9a-f]{32}$/);
-    assert.notEqual(id, freshTabId());
+  it("abandons malformed layouts rather than applying a partial plan", () => {
+    assert.deepEqual(planEqualShares(split("horizontal", 0.3,
+      split("vertical", 0.1, a, b), {})), []);
+  });
+});
+
+describe("integration harness profile guards", () => {
+  function assertProfiles(dir: string, model: string): string[] {
+    const agentsDir = join(dir, ".pi/agents");
+    const files = readdirSync(agentsDir).filter((file) => file.endsWith(".md"));
+    assert.ok(files.length > 0);
+    for (const file of files) {
+      const content = readFileSync(join(agentsDir, file), "utf8");
+      const frontmatter = content.match(/^---\n([\s\S]*?)\n---(?=\n|$)/)?.[1];
+      assert.ok(frontmatter, `${file} must have frontmatter`);
+      assert.deepEqual(frontmatter.match(/^model:.*$/gm), [`model: ${model}`], file);
+      assert.deepEqual(frontmatter.match(/^thinking:.*$/gm), ["thinking: off"], file);
+    }
+    return files;
+  }
+
+  it("rewrites every copied test profile with TEST_MODEL and thinking off", () => {
+    const env = createTestEnv();
+    try {
+      const source = fileURLToPath(new URL("./integration/agents", import.meta.url));
+      assert.deepEqual(assertProfiles(env.dir, TEST_MODEL), readdirSync(source).filter((file) => file.endsWith(".md")));
+    } finally {
+      cleanupTestEnv(env);
+    }
   });
 
-  it("keeps only the last lines of what hc read prints", () => {
-    const screen = "one\ntwo\nthree\n__SUBAGENT_DONE_0__\n\n\n";
-    assert.equal(lastLines(screen, 2), "three\n__SUBAGENT_DONE_0__\n");
-    assert.equal(lastLines(screen, 0), "__SUBAGENT_DONE_0__\n", "at least one line");
+  it("replaces or adds LF and CRLF frontmatter settings with a literal special-character TEST_MODEL", async () => {
+    const model = "test/model-$&-$$-$`-$'";
+    const previousModel = process.env.PI_TEST_MODEL;
+    try {
+      process.env.PI_TEST_MODEL = model;
+      // TEST_MODEL is read at module initialization; use a fresh module instance.
+      const harness: typeof import("./integration/harness.ts") = await import(
+        new URL("./integration/harness.ts?profile-guard-test", import.meta.url).href
+      );
+      assert.equal(harness.TEST_MODEL, model);
+      withTempDir((agentsSrc) => {
+        const profiles = {
+          "existing-thinking": "model: unapproved/model\nthinking: high",
+          "missing-thinking": "model: unapproved/model",
+          "missing-model": "thinking: high",
+          "missing-both": "description: no model or thinking",
+          "empty-frontmatter": "",
+        };
+        const body = "Preserve these body examples:\nmodel: body/model\nthinking: high";
+        for (const [name, frontmatter] of Object.entries(profiles)) {
+          writeAgentFile(agentsSrc, name, frontmatter, body);
+          const content = readFileSync(join(agentsSrc, `${name}.md`), "utf8");
+          writeFileSync(join(agentsSrc, `${name}-crlf.md`), content.replace(/\n/g, "\r\n"));
+        }
+        const names = Object.keys(profiles).flatMap((name) => [name, `${name}-crlf`]);
+        writeFileSync(join(agentsSrc, "ignored.txt"), "not an agent");
+        const env = harness.createTestEnv({ agentsSrc });
+        try {
+          assert.deepEqual(assertProfiles(env.dir, harness.TEST_MODEL).sort(), names.map((name) => `${name}.md`).sort());
+          for (const name of names) {
+            const file = `${name}.md`;
+            const copied = readFileSync(join(env.dir, ".pi/agents", file), "utf8");
+            assert.ok(copied.endsWith(`\n\n${body}\n`), `${file} body must be unchanged`);
+            assert.ok(!readFileSync(join(agentsSrc, file), "utf8").includes(model), `${file} source must be unchanged`);
+          }
+          assert.equal(existsSync(join(env.dir, ".pi/agents/ignored.txt")), false);
+        } finally {
+          harness.cleanupTestEnv(env);
+        }
+      });
+    } finally {
+      restoreEnvVar("PI_TEST_MODEL", previousModel);
+    }
   });
+});
+
+describe("integration harness setup rollback", () => {
+  let originalEnv: NodeJS.ProcessEnv;
+  let savedContext: NodeJS.ProcessEnv;
+  let dir: string | undefined;
+  let calls: string[][];
+  let response: unknown;
+  let newError: Error | undefined;
+  let killError: Error | undefined;
+
+  beforeEach(() => {
+    originalEnv = process.env;
+    process.env = {
+      ...originalEnv,
+      REX_SESSION: "session:caller",
+      REX_BLOCK: "block:caller",
+      PI_SUBAGENT_SETUP_TEST: "caller",
+    };
+    savedContext = { ...process.env };
+    dir = undefined;
+    calls = [];
+    response = { session_id: "session:owned", initial_windows: [{ block_ids: ["block:owned"] }] };
+    newError = undefined;
+    killError = undefined;
+    __rexTest__.setRexExecutor((args) => {
+      calls.push(args);
+      if (args[0] === "new") {
+        dir = args[args.indexOf("-c") + 1];
+        assert.equal(existsSync(join(dir, ".pi", "agents")), true);
+        assert.deepEqual(process.env, savedContext, "context must not change before Rex setup");
+        if (newError) throw newError;
+        return JSON.stringify(response) ?? "";
+      }
+      assert.deepEqual(args, ["kill", "session:owned"]);
+      if (killError) throw killError;
+      return "";
+    });
+  });
+
+  afterEach(() => {
+    __rexTest__.setRexExecutor(null);
+    process.env = originalEnv;
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const malformedResponses = [
+    ["null response", null, false],
+    ["missing session ID", { initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["numeric session ID", { session_id: 42, initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["blank session ID", { session_id: "  ", initial_windows: [{ block_ids: ["block:owned"] }] }, false],
+    ["missing windows", { session_id: "session:owned" }, true],
+    ["empty windows", { session_id: "session:owned", initial_windows: [] }, true],
+    ["non-array windows", { session_id: "session:owned", initial_windows: { 0: { block_ids: ["block:owned"] } } }, true],
+    ...[
+      ["missing block IDs", {}],
+      ["null block IDs", { block_ids: null }],
+      ["empty block IDs", { block_ids: [] }],
+      ["non-array block IDs", { block_ids: "block:owned" }],
+      ["null block ID", { block_ids: [null] }],
+      ["numeric block ID", { block_ids: [42] }],
+      ["object block ID", { block_ids: [{}] }],
+      ["empty block ID", { block_ids: [""] }],
+      ["blank block ID", { block_ids: ["  "] }],
+    ].map(([name, window]) => [name, { session_id: "session:owned", initial_windows: [window] }, true]),
+  ] as const;
+
+  for (const [name, malformed, ownsSession] of malformedResponses) {
+    it(`rolls back ${name} without mutating caller context`, () => {
+      response = malformed;
+      const writes: PropertyKey[] = [];
+      process.env = new Proxy(process.env, {
+        set(target, key, value) {
+          writes.push(key);
+          return Reflect.set(target, key, value);
+        },
+        deleteProperty(target, key) {
+          writes.push(key);
+          return Reflect.deleteProperty(target, key);
+        },
+      });
+
+      assert.throws(() => createTestEnv({ isolateRex: true }), /Invalid Rex test session response/);
+      assert.equal(calls.length, ownsSession ? 2 : 1);
+      assert.equal(existsSync(dir!), false, "failed fixture directory must be removed");
+      assert.deepEqual(process.env, savedContext);
+      assert.deepEqual(writes, [], "invalid responses must be rejected before environment mutations");
+    });
+  }
+
+  it("removes the fixture directory when rex new throws", () => {
+    newError = new Error("rex new failed");
+    assert.throws(() => createTestEnv({ isolateRex: true }), (error) => error === newError);
+    assert.equal(calls.length, 1, "no session ID is available to kill");
+    assert.equal(existsSync(dir!), false);
+    assert.deepEqual(process.env, savedContext);
+  });
+
+  for (const killFails of [false, true]) {
+    it(`restores partially modified context when setup fails${killFails ? " even if session kill fails" : ""}`, (t) => {
+      const setupError = new Error("environment setup failed");
+      const warning = t.mock.method(console, "warn", () => {});
+      if (killFails) killError = new Error("kill failed");
+      process.env = new Proxy(process.env, {
+        set(target, key, value) {
+          if (key === "REX_BLOCK" && value === "block:owned") {
+            assert.equal(target.REX_SESSION, "session:owned");
+            assert.equal(target.PI_SUBAGENT_SETUP_TEST, undefined);
+            throw setupError;
+          }
+          return Reflect.set(target, key, value);
+        },
+      });
+
+      assert.throws(() => createTestEnv({ isolateRex: true }), (error) => error === setupError);
+      assert.equal(calls.length, 2);
+      assert.equal(existsSync(dir!), false);
+      assert.deepEqual(process.env, savedContext);
+      assert.equal(warning.mock.callCount(), killFails ? 1 : 0);
+      if (killFails) {
+        assert.deepEqual(warning.mock.calls[0].arguments, ["Failed to kill Rex test session:", killError]);
+      }
+    });
+  }
+
+  it("returns a valid isolated fixture and restores context during normal cleanup", () => {
+    const env = createTestEnv({ isolateRex: true });
+    assert.equal(env.rexSession, "session:owned");
+    assert.equal(process.env.REX_SESSION, "session:owned");
+    assert.equal(process.env.REX_BLOCK, "block:owned");
+    assert.equal(process.env.PI_SUBAGENT_SETUP_TEST, undefined);
+    cleanupTestEnv(env);
+    assert.equal(calls.length, 2);
+    assert.equal(existsSync(env.dir), false);
+    assert.deepEqual(process.env, savedContext);
+  });
+});
+
+describe("integration harness cleanup", () => {
+  for (const killFails of [false, true]) {
+    it(`kills the owned session even if surface disposal throws${killFails ? " and kill fails" : ""}`, (t) => {
+      const root = createTestDir();
+      const dir = join(root, "project");
+      const tempFile = join(root, "tracked.tmp");
+      mkdirSync(dir);
+      writeFileSync(tempFile, "test");
+      const originalEnv = process.env;
+      process.env = { ...originalEnv, REX_SESSION: "session:owned", REX_BLOCK: "block:owned" };
+      const disposeError = new Error("surface disposal failed");
+      const killError = new Error("session kill failed");
+      const warning = t.mock.method(console, "warn", () => {});
+      let killCalls = 0;
+      registerSurfaceHandle({
+        id: "harness-disposal-failure",
+        name: "harness-disposal-failure",
+        kind: "tab",
+        sessionId: "session:owned",
+        // Force the real disposer to fail while inspecting a tracked handle.
+        get status(): "reserved" { throw disposeError; },
+      });
+      __rexTest__.setRexExecutor((args) => {
+        assert.deepEqual(args, ["kill", "session:owned"]);
+        killCalls++;
+        if (killFails) throw killError;
+        return "";
+      });
+
+      try {
+        assert.doesNotThrow(() => cleanupTestEnv({
+          dir,
+          surfaces: [],
+          tempFiles: [tempFile],
+          rexSession: "session:owned",
+          savedContext: { REX_SESSION: originalEnv.REX_SESSION, REX_BLOCK: originalEnv.REX_BLOCK },
+        }));
+        assert.equal(killCalls, 1);
+        assert.equal(existsSync(dir), false);
+        assert.equal(existsSync(tempFile), false);
+        assert.deepEqual({ ...process.env }, { ...originalEnv });
+        assert.equal(warning.mock.callCount(), killFails ? 2 : 1);
+        assert.deepEqual(warning.mock.calls[0].arguments, ["Failed to dispose Rex surfaces:", disposeError]);
+        if (killFails) {
+          assert.deepEqual(warning.mock.calls[1].arguments, ["Failed to kill Rex test session:", killError]);
+        }
+      } finally {
+        unregisterSurfaceHandle("harness-disposal-failure");
+        __rexTest__.setRexExecutor(null);
+        process.env = originalEnv;
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const reason of ["session already closed", "RPC error"]) {
+    it(`cleans local resources and restores context after ${reason}`, (t) => {
+      const root = mkdtempSync(join(tmpdir(), "pi-cleanup-test-"));
+      const dir = join(root, "project");
+      const tempFile = join(root, "tracked.tmp");
+      mkdirSync(dir);
+      writeFileSync(join(dir, "project.tmp"), "test");
+      writeFileSync(tempFile, "test");
+      const savedContext = {
+        REX_SESSION: "session:caller",
+        REX_BLOCK: "block:caller",
+        PI_SUBAGENT_CLEANUP_TEST: undefined,
+      };
+      const originalContext = Object.fromEntries(
+        Object.keys(savedContext).map((key) => [key, process.env[key]]),
+      );
+      const error = new Error(reason);
+      const warning = t.mock.method(console, "warn", () => {});
+      let killCalls = 0;
+      __rexTest__.setRexExecutor((args) => {
+        assert.deepEqual(args, ["kill", "session:owned"]);
+        killCalls++;
+        throw error;
+      });
+
+      try {
+        process.env.REX_SESSION = "session:owned";
+        process.env.REX_BLOCK = "block:owned";
+        process.env.PI_SUBAGENT_CLEANUP_TEST = "child";
+        assert.doesNotThrow(() => cleanupTestEnv({
+          dir,
+          surfaces: [],
+          // A missing file must not prevent removal of later tracked files.
+          tempFiles: [join(root, "already-removed.tmp"), tempFile],
+          rexSession: "session:owned",
+          savedContext,
+        }));
+
+        assert.equal(killCalls, 1);
+        assert.equal(existsSync(dir), false, "project directory must be removed");
+        assert.equal(existsSync(tempFile), false, "external temp file must be removed");
+        for (const [key, value] of Object.entries(savedContext)) {
+          assert.equal(process.env[key], value, `${key} must be restored`);
+        }
+        assert.equal(warning.mock.callCount(), 1);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to kill Rex test session/);
+        assert.equal(warning.mock.calls[0].arguments[1], error);
+      } finally {
+        __rexTest__.setRexExecutor(null);
+        for (const [key, value] of Object.entries(originalContext)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("rex.ts unit tests", () => {
@@ -3509,8 +3722,12 @@ describe("rex.ts unit tests", () => {
       assert.throws(() => closeSurface("tab-partial-fail"), /RPC connection failure/);
       const { getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
       assert.ok(getSurfaceHandle("tab-partial-fail"), "handle must remain registered when close fails");
-      unregisterSurfaceHandle("tab-partial-fail");
     } finally {
+      for (const id of ["tab-lone", "tab-multi", "tab-err", "tab-partial-zero", "tab-partial-one", "tab-partial-multi", "tab-partial-fail"]) {
+        unregisterSurfaceHandle(id);
+      }
+      __rexTest__.setRexContextOverride(null);
+      __rexTest__.setCommandAvailabilityOverride(null);
       __rexTest__.setRexExecutor(null);
     }
   });
@@ -3652,6 +3869,75 @@ describe("rex.ts unit tests", () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  for (const { label, failedRename } of [
+    { label: "literal 'agent' $name", failedRename: undefined },
+    { label: "literal 'agent' $name", failedRename: "block" },
+    { label: "-agent-name", failedRename: undefined },
+    { label: "-agent-name", failedRename: "window" },
+    { label: "-agent-name", failedRename: "block" },
+    { label: "--dash-name", failedRename: undefined },
+    { label: "--dash-name", failedRename: "window" },
+    { label: "--dash-name", failedRename: "block" },
+  ] as const) {
+    it(`labels the returned top-level command pane ${JSON.stringify(label)}${failedRename ? ` and preserves it if ${failedRename} labeling fails` : " without relying on focus"}`, async (t) => {
+      const { createSurface, sendLongCommand, closeSurface, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+      const dir = mkdtempSync(join(tmpdir(), "rex-label-"));
+      const renameError = new Error("rename unavailable");
+      const warning = t.mock.method(console, "warn", () => {});
+      const savedName = process.env.PI_SUBAGENT_NAME;
+      const savedTop = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      delete process.env.PI_SUBAGENT_NAME;
+      delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+      const calls: string[][] = [];
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexContextOverride({ session: "session:label", block: "block:anchor" });
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args[0] === "window" && args[1] === "new") return JSON.stringify({ window_id: "window:label", block_ids: ["block:created"] });
+        if ((args[0] === "block" || args[0] === "window") && args[1] === "rename") {
+          assert.equal(getSurfaceHandle(surface)?.status, "launched", "command must be marked launched before labeling");
+          if (args[0] === failedRename) throw renameError;
+        }
+        if (args[0] === "block" && args[1] === "inspect") return JSON.stringify({ block: { window_id: "window:label" } });
+        if (args[0] === "window" && args[1] === "inspect") return JSON.stringify({ layers: [{ blocks: [{ block_id: "block:created" }] }] });
+        return "{}";
+      });
+      const surface = createSurface(label);
+      try {
+        const scriptPath = join(dir, "launch.sh");
+        assert.equal(sendLongCommand(surface, "true", { scriptPath }), scriptPath);
+        assert.equal(getSurfaceHandle(surface)?.status, "launched");
+        assert.equal(getSurfaceHandle(surface)?.windowId, "window:label");
+        assert.equal(getSurfaceHandle(surface)?.blockId, "block:created");
+        assert.equal(getSurfaceHandle(surface)?.name, label, "the original name must be preserved in the handle");
+        assert.equal(calls.some((c) => c[1] === "close" || c[1] === "kill"), false,
+          "labeling must not close or kill the launched surface");
+        assert.equal(warning.mock.callCount(), failedRename ? 1 : 0);
+        if (failedRename) {
+          assert.deepEqual(warning.mock.calls[0].arguments,
+            [`Failed to set ${failedRename === "window" ? "tab" : "pane"} label for subagent "${label}":`, renameError]);
+        }
+        assert.deepEqual(calls.find((c) => c[0] === "window" && c[1] === "new"),
+          ["window", "new", "-s", "session:label", label.startsWith("-") ? `subagent${label}` : label,
+            "--focus=false", "--keep-open", "--json", "--", "bash", "-l", scriptPath]);
+        const tabRenames = calls.filter((c) => c[0] === "window" && c[1] === "rename");
+        assert.deepEqual(tabRenames, label.startsWith("-")
+          ? [["window", "rename", "-s", "session:label", "--", "window:label", label]]
+          : [], "only leading-dash labels should need a tab rename, targeting the returned window ID");
+        assert.deepEqual(calls.find((c) => c[0] === "block" && c[1] === "rename"),
+          ["block", "rename", "-s", "session:label", "--", "block:created", label]);
+      } finally {
+        closeSurface(surface);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME; else process.env.PI_SUBAGENT_NAME = savedName;
+        if (savedTop === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE; else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTop;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("launch failure cleans up created resources if Rex returns IDs on error.stdout", async () => {
     const { createSurface, sendLongCommand, getSurfaceHandle, __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
@@ -5207,6 +5493,302 @@ describe("resumed infrastructure failure delivery", () => {
   }
 });
 
+describe("subagent watcher disposal", () => {
+  for (const reason of ["session_shutdown", "reload", "cancellation"] as const) {
+    it(`${reason} ${reason === "cancellation" ? "closes" : "preserves"} a live watched child's pane`, async (t) => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const testApi = subagentsModule.__test__;
+      const { hasLostObservationMarker, readLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const { api, registeredTools } = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(api);
+      const dir = createTestDir();
+      const ctx = {
+        hasUI: false,
+        sessionManager: {
+          getSessionDir: () => dir,
+          getSessionId: () => "main-sess",
+        },
+      };
+      handlers.get("session_start")!({}, ctx);
+      const controller = new AbortController();
+      const id = `live-watcher-${reason}`;
+      const running = {
+        id, name: id, task: "keep running", surface: id,
+        startTime: Date.now(), sessionFile: join(dir, "child.jsonl"),
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        abortController: controller,
+      };
+      writeFileSync(running.sessionFile, JSON.stringify(SESSION_HEADER) + "\n");
+      registerName(join(dir, "artifacts", "main-sess"), id, {
+        sessionFile: running.sessionFile, sessionId: "sess-child",
+      });
+      const calls: string[][] = [];
+      let processExited = false;
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      // The child's coordinates must come from its handle, not the current parent.
+      __rexTest__.setRexContextOverride({ session: "session:parent", block: "block:parent" });
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args.at(-1) === "process") {
+          assert.ok(args.includes("block:live-child"));
+          assert.ok(args.includes("session:test"));
+          return JSON.stringify({ last_exit: processExited ? { exit_code: 0 } : null });
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({
+        id, name: id, kind: "split", status: "launched",
+        sessionId: "session:test", blockId: "block:live-child",
+      });
+      testApi.runningSubagents.set(id, running);
+      const watcher = testApi.watchSubagent(running, controller.signal);
+
+      try {
+        assert.equal(calls.filter((args) => args.at(-1) === "process").length, 1,
+          "the watcher must observe a live child before disposal");
+        if (reason === "session_shutdown") {
+          handlers.get("session_shutdown")!({}, {});
+          assert.equal(controller.signal.aborted, true, "shutdown also aborts the per-agent controller");
+          assert.equal(hasLostObservationMarker(running.sessionFile), true,
+            "shutdown must persist the guard before watcher continuations run");
+        } else if (reason === "reload") {
+          // Match module reload: abort the previous runtime, then replace the
+          // global controller before the old watcher's catch branch executes.
+          const key = Symbol.for("pi-subagents/poll-abort-controller");
+          (globalThis as any)[key].abort();
+          (globalThis as any)[key] = new AbortController();
+        } else {
+          controller.abort();
+        }
+        const watcherResult = await watcher;
+        const presentation = testApi.resolveResultPresentation(watcherResult, id);
+        assert.equal(watcherResult.outcome, "interrupted");
+        if (reason === "cancellation") {
+          assert.equal(watcherResult.error, "cancelled");
+          assert.notEqual(watcherResult.observationFailure, true);
+          assert.match(presentation, /You can resume the session with subagent_message/);
+        } else {
+          assert.equal(watcherResult.error, "observation_lost");
+          assert.equal(watcherResult.observationFailure, true);
+          assert.equal(watcherResult.summary,
+            "Observation disposed during session shutdown or reload. The pane was kept open and resume is blocked until process exit is confirmed.");
+          assert.ok(presentation.includes(watcherResult.summary));
+          assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+          assert.doesNotMatch(presentation, /was cancelled|You can resume|Follow up with subagent_message/);
+        }
+        assert.equal(testApi.runningSubagents.has(id), false, "disposed watchers must stop tracking");
+        const closes = calls.filter((args) => args[1] === "close");
+        assert.equal(closes.length, reason === "cancellation" ? 1 : 0,
+          "only explicit cancellation may request pane closure");
+        assert.equal(!!getSurfaceHandle(id), reason !== "cancellation",
+          "shutdown/reload must retain the live pane's handle");
+        assert.equal(testApi.pendingCleanups.has(id), false, "disposal must not enqueue a close retry");
+        const callsAfterDisposal = calls.length;
+        t.mock.timers.tick(5000);
+        await Promise.resolve();
+        assert.equal(calls.length, callsAfterDisposal, "disposal must stop background polling");
+
+        if (reason === "cancellation") {
+          assert.equal(hasLostObservationMarker(running.sessionFile), false);
+          assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), false);
+        } else {
+          const marker = readLostObservationMarker(running.sessionFile);
+          assert.equal(marker?.blockId, "block:live-child");
+          assert.equal(marker?.sessionId, "session:test");
+          assert.equal(marker?.surface, id);
+          assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), true);
+
+          handlers.get("session_start")!({}, ctx);
+          const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+          for (const guard of ["in-memory", "disk-only"]) {
+            if (guard === "disk-only") {
+              // A replacement runtime has no running map or lost-observation memory.
+              testApi.lostObservationSessions.clear();
+              testApi.lostObservationEntries.clear();
+            }
+            const result = await messageTool.execute(
+              `resume-${guard}`, { name: id, message: "continue" }, undefined, undefined, ctx,
+            );
+            assert.match(result.details.error, /Cannot resume.*process may still be active/,
+              `${guard} guard must refuse unsafe name-based resume`);
+            assert.equal(hasLostObservationMarker(running.sessionFile), true);
+            assert.ok(getSurfaceHandle(id), "a refused resume must preserve the live child");
+            assert.equal(calls.some((args) => args[0] === "split" || args[1] === "new"), false,
+              "refused resume must not create another process surface");
+            assert.equal(testApi.runningSubagents.size, 0);
+          }
+
+          processExited = true;
+          testApi.reconcileLostObservations(running.sessionFile);
+          assert.equal(hasLostObservationMarker(running.sessionFile), false,
+            "confirmed process exit must clear the persisted guard");
+          assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), false);
+          assert.equal(testApi.lostObservationEntries.has(resolve(running.sessionFile)), false);
+          assert.equal(getSurfaceHandle(id), undefined, "only confirmed exit may close the retained pane");
+        }
+      } finally {
+        handlers.get("session_shutdown")!({}, {});
+        controller.abort();
+        await watcher;
+        testApi.lostObservationSessions.delete(resolve(running.sessionFile));
+        testApi.lostObservationEntries.delete(resolve(running.sessionFile));
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("subagent watcher exit during shutdown", () => {
+  for (const { label, exitCode, errorMessage } of [
+    { label: "completed", exitCode: 0, errorMessage: undefined },
+    { label: "nonzero exit", exitCode: 42, errorMessage: undefined },
+    { label: "provider error", exitCode: 1, errorMessage: "Anthropic 529 Overloaded after 3 retries" },
+  ]) {
+    it(`preserves a ${label} result when confirmProcessEnded cannot remove its marker`, async (t) => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const { lostObservationMarkerPath, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(api);
+      handlers.get("session_start")!({}, { hasUI: false });
+      const dir = createTestDir();
+      const id = "completed-marker-removal-failed";
+      const now = Date.now();
+      t.mock.method(Date, "now", () => now);
+      const warning = t.mock.method(console, "warn", () => {});
+      const sessionFile = createSessionFile(dir, [SESSION_HEADER, {
+        ...ASSISTANT_MSG,
+        message: { ...ASSISTANT_MSG.message, model: "test-model", usage: { input: 100, output: 50 } },
+      }]);
+      const expectedStats = summarizeSessionStats(sessionFile);
+      const running = {
+        id, name: id, task: "finished", surface: id, startTime: now - 12_000,
+        sessionFile, interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: now - 12_000 }),
+      };
+      registerSurfaceHandle({
+        id, name: id, kind: "split", status: "launched",
+        sessionId: "session:test", blockId: "block:completed-child",
+      });
+      // A directory at the marker path reliably makes non-recursive removal
+      // throw, including when tests run with elevated filesystem privileges.
+      mkdirSync(lostObservationMarkerPath(sessionFile));
+      testApi.lostObservationSessions.add(resolve(sessionFile));
+      testApi.lostObservationEntries.set(resolve(sessionFile), {
+        sessionFile, surface: id, blockId: "block:completed-child", sessionId: "session:test",
+      });
+      testApi.runningSubagents.set(id, running);
+      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: exitCode, error: errorMessage } }));
+
+      try {
+        const result = await testApi.watchSubagent(running, new AbortController().signal);
+        assert.equal(result.outcome, exitCode === 0 ? "success" : "failure");
+        assert.equal(result.summary, "Here is my plan...");
+        assert.equal(result.exitCode, exitCode);
+        assert.equal(result.errorMessage, errorMessage);
+        assert.notEqual(result.observationFailure, true);
+        assert.equal(result.elapsed, 12);
+        assert.equal(result.sessionId, SESSION_HEADER.id);
+        assert.deepEqual(result.stats, expectedStats);
+        assert.equal(result.error, undefined);
+        assert.equal(warning.mock.callCount(), 1);
+        assert.match(String(warning.mock.calls[0].arguments[0]), /Failed to clear lost-observation marker/);
+        assert.equal(testApi.runningSubagents.has(id), false);
+        assert.equal(testApi.lostObservationSessions.has(resolve(sessionFile)), true);
+        assert.equal(testApi.lostObservationEntries.has(resolve(sessionFile)), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true, "failed removal must retain the persistent resume guard");
+        assert.equal(getSurfaceHandle(id), undefined, "a real process exit must close its pane despite marker cleanup failure");
+        const presentation = testApi.resolveResultPresentation(result, id);
+        if (exitCode === 0) {
+          assert.match(presentation, /completed/);
+        } else {
+          if (errorMessage) {
+            assert.match(presentation, /failed after 12s[\s\S]*provider\/agent error/);
+            assert.ok(presentation.includes(`Error: ${errorMessage}`));
+          } else {
+            assert.match(presentation, /failed \(exit code 42\)/);
+            assert.match(presentation, /Here is my plan/);
+          }
+        }
+        assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
+        assert.doesNotMatch(presentation, /resume the session with subagent_message|Follow up with subagent_message/);
+        assert.doesNotMatch(presentation, /infrastructure observation failure|pane was kept open/i);
+      } finally {
+        handlers.get("session_shutdown")!({}, {});
+        testApi.runningSubagents.delete(id);
+        testApi.lostObservationSessions.delete(resolve(sessionFile));
+        testApi.lostObservationEntries.delete(resolve(sessionFile));
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const exitObserved of [true, false]) {
+    it(`clears a shutdown guard when exit is confirmed by ${exitObserved ? "polling" : "reconciliation"}`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const { hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(api);
+      handlers.get("session_start")!({}, { hasUI: false });
+      const dir = createTestDir();
+      const id = "exited-during-shutdown";
+      const running = {
+        id, name: id, task: "finished", surface: id,
+        startTime: Date.now(), sessionFile: join(dir, "child.jsonl"),
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+      };
+      registerSurfaceHandle({
+        id, name: id, kind: "split", status: "launched",
+        sessionId: "session:test", blockId: "block:exited-child",
+      });
+      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: exitObserved ? { exit_code: 0 } : null }));
+      testApi.runningSubagents.set(id, running);
+      const watcher = testApi.watchSubagent(running, new AbortController().signal);
+
+      try {
+        // The watcher has not resumed from its await, whether polling resolved
+        // or is about to reject because of shutdown.
+        handlers.get("session_shutdown")!({}, {});
+        assert.equal(hasLostObservationMarker(running.sessionFile), true);
+        if (!exitObserved) {
+          __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
+          testApi.reconcileLostObservations(running.sessionFile);
+        }
+        const result = await watcher;
+        assert.equal(result.outcome, exitObserved ? "success" : "interrupted");
+        assert.equal(hasLostObservationMarker(running.sessionFile), false);
+        assert.equal(testApi.lostObservationSessions.has(resolve(running.sessionFile)), false);
+        assert.equal(testApi.lostObservationEntries.has(resolve(running.sessionFile)), false);
+      } finally {
+        handlers.get("session_shutdown")!({}, {});
+        await watcher;
+        testApi.runningSubagents.delete(id);
+        testApi.lostObservationSessions.delete(resolve(running.sessionFile));
+        testApi.lostObservationEntries.delete(resolve(running.sessionFile));
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("lost-observation reconciliation timers", () => {
   for (const parentState of ["parked", "active", "reactivated", "resume-guard"]) {
     it(`reconciles the last child with parent state ${parentState} without spurious wakeups`, async () => {
@@ -5292,6 +5874,184 @@ describe("lost-observation reconciliation timers", () => {
     });
   }
 
+  it("retains unqueryable guards without retrying and unrefs queryable retries", async (t) => {
+    const { writeLostObservationMarker, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+    const testApi = subagentsModule.__test__;
+    const { api } = createMockExtensionApi();
+    let shutdown: () => void = () => {};
+    api.on = (event: string, handler: () => void) => {
+      if (event === "session_shutdown") shutdown = handler;
+    };
+    subagentsModule.default(api);
+    shutdown();
+    const savedLost = new Set(testApi.lostObservationSessions);
+    const savedEntries = new Map(testApi.lostObservationEntries);
+    const dir = createTestDir();
+    const scheduled = t.mock.method(globalThis, "setTimeout");
+    let processQueries = 0;
+    let processExited = false;
+
+    try {
+      testApi.lostObservationSessions.clear();
+      testApi.lostObservationEntries.clear();
+      __rexTest__.setRexExecutor(() => {
+        processQueries++;
+        return JSON.stringify({ last_exit: processExited ? { exit_code: 0 } : null });
+      });
+      const unqueryable = [
+        { blockId: undefined, sessionId: "session:mock" },
+        { blockId: "", sessionId: "session:mock" },
+        { blockId: " \t ", sessionId: "session:mock" },
+        { blockId: "block:mock", sessionId: "" },
+        { blockId: "block:mock", sessionId: " \t " },
+      ];
+      const guardedSessions = unqueryable.map((coordinates, i) => {
+        const sessionFile = join(dir, `unqueryable-${i}.jsonl`);
+        writeLostObservationMarker(sessionFile, coordinates);
+        testApi.lostObservationSessions.add(sessionFile);
+        testApi.lostObservationEntries.set(sessionFile, { sessionFile, surface: "", ...coordinates });
+        return sessionFile;
+      });
+
+      for (let i = 0; i < 3; i++) testApi.reconcileLostObservations();
+      assert.equal(processQueries, 0, "missing coordinates must not be queried");
+      assert.equal(scheduled.mock.callCount(), 0, "unqueryable entries must not schedule retry timers");
+
+      const queryableSession = join(dir, "queryable.jsonl");
+      testApi.lostObservationSessions.add(queryableSession);
+      testApi.lostObservationEntries.set(queryableSession, {
+        sessionFile: queryableSession, surface: "", blockId: "block:mock", sessionId: "session:mock",
+      });
+      testApi.reconcileLostObservations();
+      assert.equal(processQueries, 1);
+      assert.equal(scheduled.mock.callCount(), 1, "queryable entries still need background reconciliation");
+      const retryTimer = scheduled.mock.calls[0].result;
+      assert.ok(retryTimer);
+      assert.equal(retryTimer.hasRef(), false, "retries must not keep Node alive");
+
+      processExited = true;
+      testApi.reconcileLostObservations();
+      assert.equal(processQueries, 2);
+      assert.equal(scheduled.mock.callCount(), 1, "no new timer is needed after the last queryable entry ends");
+      assert.equal(testApi.lostObservationEntries.size, guardedSessions.length);
+      for (const sessionFile of guardedSessions) {
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true, "unqueryable guards must stay on disk");
+      }
+    } finally {
+      shutdown();
+      testApi.lostObservationSessions.clear();
+      for (const value of savedLost) testApi.lostObservationSessions.add(value);
+      testApi.lostObservationEntries.clear();
+      for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
+      __rexTest__.setRexContextOverride(null);
+      __rexTest__.setCommandAvailabilityOverride(null);
+      __rexTest__.setRexExecutor(null);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const queryFails of [false, true]) {
+    it(`bounds automatic retries for ${queryFails ? "failed queries" : "active processes"} without releasing the resume guard`, async (t) => {
+      const { writeLostObservationMarker, hasLostObservationMarker } = await import("../pi-extension/subagents/session.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      let shutdown = () => {};
+      api.on = (event: string, handler: () => void) => {
+        if (event === "session_shutdown") shutdown = handler;
+      };
+      subagentsModule.default(api);
+      shutdown();
+      const savedLost = new Set(testApi.lostObservationSessions);
+      const savedEntries = new Map(testApi.lostObservationEntries);
+      const dir = createTestDir();
+      const sessionFile = join(dir, "bounded-retries.jsonl");
+      const coordinates = { blockId: "block:bounded-retries", sessionId: "session:mock" };
+      let processQueries = 0;
+      let exited = false;
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const scheduled = t.mock.method(globalThis, "setTimeout");
+      __rexTest__.setRexExecutor(() => {
+        processQueries++;
+        if (queryFails && !exited) throw new Error("server unavailable");
+        return JSON.stringify({ last_exit: exited ? { exit_code: 0 } : null });
+      });
+
+      try {
+        testApi.lostObservationSessions.clear();
+        testApi.lostObservationEntries.clear();
+        writeLostObservationMarker(sessionFile, coordinates);
+        testApi.lostObservationSessions.add(sessionFile);
+        testApi.lostObservationEntries.set(sessionFile, { sessionFile, surface: "", ...coordinates });
+        testApi.reconcileLostObservations();
+        const limit = testApi.MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS;
+        for (let i = 0; i < limit + 5; i++) t.mock.timers.tick(1000);
+        assert.equal(processQueries, limit, "automatic polling must stop at the per-entry limit");
+        assert.equal(scheduled.mock.callCount(), limit - 1, "exhausted entries must not schedule further timers");
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+        assert.equal(testApi.lostObservationEntries.has(sessionFile), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true);
+
+        testApi.reconcileLostObservations();
+        assert.equal(processQueries, limit, "unrelated background calls must not reset an exhausted budget");
+        testApi.reconcileLostObservations(sessionFile);
+        assert.equal(processQueries, limit + 1, "on-demand resume checks must bypass the limit");
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), true);
+        assert.equal(hasLostObservationMarker(sessionFile), true, "inconclusive resume checks must retain both guards");
+        assert.equal(scheduled.mock.callCount(), limit - 1, "on-demand checks must not restart exhausted polling");
+
+        exited = true;
+        testApi.reconcileLostObservations(sessionFile);
+        assert.equal(processQueries, limit + 2);
+        assert.equal(testApi.lostObservationSessions.has(sessionFile), false);
+        assert.equal(testApi.lostObservationEntries.has(sessionFile), false);
+        assert.equal(hasLostObservationMarker(sessionFile), false, "confirmed exit must still clear both guards on demand");
+      } finally {
+        shutdown();
+        testApi.lostObservationSessions.clear();
+        for (const value of savedLost) testApi.lostObservationSessions.add(value);
+        testApi.lostObservationEntries.clear();
+        for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("unrefs both initial and subsequent cleanup retry timers", async (t) => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    const testApi = subagentsModule.__test__;
+    const { api } = createMockExtensionApi();
+    let shutdown = () => {};
+    api.on = (event: string, handler: () => void) => {
+      if (event === "session_shutdown") shutdown = handler;
+    };
+    subagentsModule.default(api);
+    shutdown();
+    const scheduled = t.mock.method(globalThis, "setTimeout");
+    t.mock.method(console, "error", () => {});
+    const id = "unref-cleanup-retry";
+    registerSurfaceHandle({ id, name: id, kind: "split", status: "launched", sessionId: "session:mock", blockId: "block:retry" });
+    __rexTest__.setRexExecutor((args) => {
+      if (args[1] === "close") throw new Error("server unavailable");
+      return "{}";
+    });
+    const retryTimers = () => scheduled.mock.calls.filter((call) => call.arguments[1] === 1000).map((call) => call.result);
+    try {
+      testApi.safeCloseSurface(id);
+      assert.equal(retryTimers().length, 1);
+      assert.equal(retryTimers()[0]!.hasRef(), false, "initial cleanup retry must be unref'ed");
+      clearTimeout(retryTimers()[0]);
+      testApi.processPendingCleanups();
+      assert.equal(retryTimers().length, 2);
+      assert.equal(retryTimers()[1]!.hasRef(), false, "subsequent cleanup retries must be unref'ed");
+    } finally {
+      shutdown();
+      unregisterSurfaceHandle(id);
+      __rexTest__.setRexExecutor(null);
+    }
+  });
+
   it("keeps one retry chain across direct calls and cancels it on shutdown", async (t) => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
     const testApi = subagentsModule.__test__;
@@ -5337,6 +6097,434 @@ describe("lost-observation reconciliation timers", () => {
       __rexTest__.setRexExecutor(null);
     }
   });
+});
+
+describe("Rex sizing lifecycle and bounded diagnostics", () => {
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 140));
+  const leaf = (block_id: string) => ({ block_id, rect: [0, 0, 1, 1] });
+  const layout = { rect: [0, 0, 1, 1], split: {
+    split_id: "split:fixture", direction: "horizontal", ratio: 0.8,
+    before: leaf("block:a"), after: leaf("block:b"),
+  } };
+  const view = { active_window_id: "window:unrelated", windows: [
+    { window_id: "window:target", layers: [
+      { kind: "tiled", layout },
+      { kind: "floating", layout: { ...layout, split: { ...layout.split, before: leaf("block:float-a"), after: leaf("block:float-b") } } },
+    ] },
+    { window_id: "window:unrelated", layers: [{ kind: "tiled", layout: { ...layout,
+      split: { ...layout.split, before: leaf("block:other-a"), after: leaf("block:other-b") } } }] },
+  ] };
+
+  afterEach(() => {
+    disposeRexSurfaces();
+    __rexTest__.setRexExecutor(null);
+    __rexTest__.setRexContextOverride(undefined);
+    __rexTest__.setCommandAvailabilityOverride(undefined);
+  });
+
+  it("debounces by session/window and targets only tiled borders in the remembered tab", async () => {
+    const { scheduleTabSizing } = await import("../pi-extension/subagents/rex.ts");
+    const calls: string[][] = [];
+    const servers: unknown[] = [];
+    __rexTest__.setRexContextOverride({ server: "server:original" });
+    __rexTest__.setRexExecutor((args, options) => {
+      calls.push(args);
+      servers.push(options?.server);
+      return JSON.stringify(args[0] === "session" ? view : { revision: 1 });
+    });
+    for (let i = 0; i < 5; i++) scheduleTabSizing("session:test", "window:target");
+    assert.equal(__rexTest__.sizingPassCount(), 1);
+    __rexTest__.setRexContextOverride({ server: "server:later", session: "session:later" });
+    await pause();
+    assert.equal(calls.length, 2, "one fresh inspection and one border change");
+    assert.deepEqual(calls[0], ["session", "inspect", "session:test", "--json"]);
+    assert.deepEqual(JSON.parse(calls[1][3]), {
+      session_id: "session:test", direction: "horizontal", before_block_id: "block:a", after_block_id: "block:b", ratio: 0.5,
+    });
+    assert.deepEqual(servers, ["server:original", "server:original"]);
+    assert.equal(__rexTest__.sizingPassCount(), 0);
+  });
+
+  for (const lookupFails of [false, true]) {
+    it(`bounds split-launch tab lookup and ${lookupFails ? "preserves the launch on timeout" : "schedules sizing on success"}`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle, sendLongCommand } = await import("../pi-extension/subagents/rex.ts");
+      const id = `launch-lookup-${lookupFails}`;
+      const dir = mkdtempSync(join(tmpdir(), "rex-launch-lookup-"));
+      const scriptPath = join(dir, "launch.sh");
+      const calls: string[][] = [];
+      const lookupTimeouts: (number | undefined)[] = [];
+      __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexExecutor((args, options) => {
+        calls.push(args);
+        if (args[0] === "split") return JSON.stringify({ block_ids: ["block:launched"] });
+        if (args[0] === "block" && args[1] === "inspect") {
+          lookupTimeouts.push(options?.timeoutMs);
+          if (lookupFails) throw new Error("lookup timed out");
+          return JSON.stringify({ block: { window_id: "window:target" } });
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "split", name: id, sessionId: "session:test", anchorBlockId: "block:anchor", status: "reserved" });
+      try {
+        assert.equal(sendLongCommand(id, "echo launched", { scriptPath }), scriptPath);
+        assert.deepEqual(lookupTimeouts, [3000], "split-launch tab lookup must not use the 15-second default");
+        assert.deepEqual(calls.map((args) => args.slice(0, 2)), [["split", "-s"], ["block", "inspect"]]);
+        assert.equal(getSurfaceHandle(id)?.status, "launched");
+        assert.equal(getSurfaceHandle(id)?.blockId, "block:launched");
+        assert.equal(getSurfaceHandle(id)?.windowId, lookupFails ? undefined : "window:target");
+        assert.equal(__rexTest__.sizingPassCount(), lookupFails ? 0 : 1);
+      } finally {
+        unregisterSurfaceHandle(id);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("remembers a split's tab before closing and rebalances survivors", async () => {
+    const { registerSurfaceHandle, closeSurface } = await import("../pi-extension/subagents/rex.ts");
+    const calls: string[][] = [];
+    let closed = false;
+    __rexTest__.setRexExecutor((args) => {
+      calls.push(args);
+      if (args[0] === "block" && args[1] === "inspect") {
+        assert.equal(closed, false, "window lookup must precede removal");
+        return JSON.stringify({ block: { window_id: "window:target" } });
+      }
+      if (args[0] === "block" && args[1] === "close") closed = true;
+      return JSON.stringify(args[0] === "session" ? view : {});
+    });
+    registerSurfaceHandle({ id: "close-sizing", kind: "split", name: "close-sizing", sessionId: "session:test", windowId: "window:old-before-move", blockId: "block:removed", status: "launched" });
+    closeSurface("close-sizing");
+    await pause();
+    assert.equal(closed, true);
+    assert.equal(calls.filter((c) => c[0] === "api").length, 1);
+    assert.equal(JSON.parse(calls.at(-1)![3]).before_block_id, "block:a");
+  });
+
+  for (const refreshFails of [false, true]) {
+    it(`bounds pre-close tab lookup and reuses its ${refreshFails ? "failed" : "successful"} result during retries`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, closeSurface, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const id = `close-lookup-${refreshFails}`;
+      let lookups = 0;
+      let closes = 0;
+      __rexTest__.setRexExecutor((args, options) => {
+        if (args[0] === "block" && args[1] === "inspect") {
+          lookups++;
+          assert.equal(options?.timeoutMs, 3000, "pre-close tab refresh must not use the 15-second default");
+          if (refreshFails) throw new Error("lookup timed out");
+          return JSON.stringify({ block: { window_id: "window:target" } });
+        }
+        if (args[0] === "block" && args[1] === "close") {
+          closes++;
+          if (closes < 3) throw new Error("transient close failure");
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "split", name: id, sessionId: "session:test", windowId: "window:old-before-move", blockId: "block:removed", status: "launched" });
+      try {
+        for (let i = 0; i < 2; i++) {
+          assert.throws(() => closeSurface(id), /transient close failure/);
+          assert.ok(getSurfaceHandle(id));
+          assert.equal(lookups, 1, "cleanup retries must not repeat the tab lookup");
+        }
+        closeSurface(id);
+        assert.equal(lookups, 1);
+        assert.equal(closes, 3);
+        assert.equal(getSurfaceHandle(id), undefined);
+      } finally {
+        unregisterSurfaceHandle(id);
+      }
+    });
+  }
+
+  it("balances a confirmed externally removed pane's remembered tab, but skips unknown transport failures", async () => {
+    const { registerSurfaceHandle, closeSurface } = await import("../pi-extension/subagents/rex.ts");
+    for (const missing of [true, false]) {
+      let resizes = 0;
+      __rexTest__.setRexExecutor((args) => {
+        if (args[0] === "block" && args[1] === "inspect") {
+          throw new Error(missing ? "block target block:removed not found" : "connection lost");
+        }
+        if (args[0] === "session") return JSON.stringify(view);
+        if (args[0] === "api") resizes++;
+        return "{}";
+      });
+      registerSurfaceHandle({ id: "already-removed", kind: "split", name: "already-removed", sessionId: "session:test", windowId: "window:target", blockId: "block:removed", status: "launched" });
+      closeSurface("already-removed");
+      await pause();
+      assert.equal(resizes, missing ? 1 : 0);
+    }
+  });
+
+  it("abandons missing/stale layouts and failed resizes without unhandled work", async () => {
+    const { scheduleTabSizing } = await import("../pi-extension/subagents/rex.ts");
+    for (const mode of ["missing", "inspect-failed", "resize-failed"]) {
+      let resizes = 0;
+      __rexTest__.setRexExecutor((args) => {
+        if (args[0] === "session") {
+          if (mode === "inspect-failed") throw new Error("disconnected");
+          return JSON.stringify(mode === "missing" ? { windows: [] } : view);
+        }
+        resizes++;
+        throw new Error("bad_request: split changed since inspection");
+      });
+      scheduleTabSizing("session:test", "window:target");
+      await pause();
+      assert.equal(resizes, mode === "resize-failed" ? 1 : 0);
+      assert.equal(__rexTest__.sizingPassCount(), 0);
+    }
+  });
+
+  it("shutdown cancels sizing and unlaunched reservations, permits a new session, and is idempotent", async () => {
+    const { scheduleTabSizing, registerSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+    const handlers = new Map<string, Function>();
+    const { api } = createMockExtensionApi();
+    api.on = (event: string, handler: Function) => { handlers.set(event, handler); };
+    (subagentsModule as any).default(api);
+    let requests = 0;
+    __rexTest__.setRexExecutor(() => { requests++; return JSON.stringify(view); });
+    registerSurfaceHandle({ id: "shutdown-reservation", kind: "tab", name: "unused", sessionId: "session:test", status: "reserved" });
+    scheduleTabSizing("session:test", "window:target");
+    handlers.get("session_shutdown")!({}, {});
+    handlers.get("session_shutdown")!({}, {});
+    assert.equal(getSurfaceHandle("shutdown-reservation"), undefined);
+    assert.equal(__rexTest__.sizingPassCount(), 0);
+    await pause();
+    assert.equal(requests, 0);
+    scheduleTabSizing("session:test", "window:missing");
+    await pause();
+    assert.equal(requests, 1, "a subsequent session can schedule work");
+  });
+
+  it("reload disposal aborts an in-flight inspection before any resize", async () => {
+    const { scheduleTabSizing } = await import("../pi-extension/subagents/rex.ts");
+    let signal: AbortSignal | undefined;
+    __rexTest__.setRexExecutor((args, options) => {
+      assert.equal(args[0], "session");
+      signal = options?.signal;
+      (globalThis as any)[Symbol.for("pi-subagents/rex-dispose")]();
+      return JSON.stringify(view);
+    });
+    scheduleTabSizing("session:test", "window:target");
+    await pause();
+    assert.equal(signal?.aborted, true);
+    assert.equal(__rexTest__.sizingPassCount(), 0);
+  });
+
+  it("bounds large scrollback diagnostics to two reads and never captures for normal completion", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, readScreen, readScreenAsync, pollForExit, DIAGNOSTIC_MAX_BYTES } = await import("../pi-extension/subagents/rex.ts");
+    const id = "bounded-diagnostics";
+    registerSurfaceHandle({ id, kind: "split", name: id, blockId: "block:large", sessionId: "session:test", status: "launched" });
+    __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    const text = 'long output with "quotes" and \\backslashes\n'.repeat(1_000_000) + "last line\n";
+    let calls = 0;
+    __rexTest__.setRexExecutor((args, options) => {
+      calls++;
+      assert.equal(options?.timeoutMs, 3000);
+      const payload = JSON.parse(args[7]);
+      assert.equal(payload.max_bytes, DIAGNOSTIC_MAX_BYTES);
+      if (args[6] === "format") return JSON.stringify({ content: text.slice(0, 100), id: 17, total: text.length });
+      assert.equal(args[6], "blob_read");
+      assert.equal(payload.id, 17);
+      assert.equal(payload.offset, text.length - Math.floor(DIAGNOSTIC_MAX_BYTES / 2));
+      const data = text.slice(payload.offset);
+      assert.ok(Buffer.byteLength(JSON.stringify(data)) <= DIAGNOSTIC_MAX_BYTES,
+        "the tail must leave room for JSON escaping within the bounded reply");
+      return JSON.stringify({ data, eof: true });
+    });
+    try {
+      assert.equal(readScreen(id, 1), "last line");
+      assert.equal(await readScreenAsync(id, 1), "last line");
+      assert.equal(calls, 4);
+      __rexTest__.setRexExecutor((args) => {
+        assert.equal(args[6], "process", "normal completion must never read scrollback");
+        return JSON.stringify({ last_exit: { exit_code: 0 } });
+      });
+      assert.equal((await pollForExit(id, new AbortController().signal, { interval: 1 })).reason, "done");
+    } finally { unregisterSurfaceHandle(id); }
+  });
+
+  it("reads nesting and placement settings with safe documented defaults", async () => {
+    const { chooseSurfaceKind, topLevelSurfaceSetting, splitDirectionSetting } = await import("../pi-extension/subagents/rex.ts");
+    const savedName = process.env.PI_SUBAGENT_NAME;
+    const savedTop = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+    const savedDirection = process.env.PI_SUBAGENT_SPLIT_DIRECTION;
+    try {
+      delete process.env.PI_SUBAGENT_NAME;
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "unknown";
+      process.env.PI_SUBAGENT_SPLIT_DIRECTION = "unknown";
+      assert.equal(topLevelSurfaceSetting(), "tab");
+      assert.equal(splitDirectionSetting(), "auto");
+      assert.equal(chooseSurfaceKind(), "tab");
+      process.env.PI_SUBAGENT_NAME = "parent";
+      assert.equal(chooseSurfaceKind(), "pane");
+      process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = "pane";
+      delete process.env.PI_SUBAGENT_NAME;
+      assert.equal(chooseSurfaceKind(), "pane");
+    } finally {
+      restoreEnvVar("PI_SUBAGENT_NAME", savedName);
+      restoreEnvVar("PI_SUBAGENT_TOP_LEVEL_SURFACE", savedTop);
+      restoreEnvVar("PI_SUBAGENT_SPLIT_DIRECTION", savedDirection);
+    }
+  });
+});
+
+describe("Pi 1.4 native Rex capability and status compatibility", () => {
+  const nativeKeys = ["PI_PROGRAM_STATUS", "PI_HYPERLINKS", "PI_IMAGE_PROTOCOL", "PI_TRUE_COLOR"] as const;
+  const terminalKeys = [...nativeKeys, "TERM_PROGRAM", "TERM", "COLORTERM", "TMUX"];
+  let saved: Array<[string, string | undefined]>;
+  beforeEach(() => {
+    saved = terminalKeys.map((key) => [key, process.env[key]]);
+    for (const key of terminalKeys) delete process.env[key];
+    process.env.TERM_PROGRAM = "rex";
+    process.env.TERM = "xterm-256color";
+    setCapabilityOverrides({});
+    resetCapabilitiesCache();
+  });
+  afterEach(() => {
+    for (const [key, value] of saved) restoreEnvVar(key, value);
+    setCapabilityOverrides({});
+    resetCapabilitiesCache();
+  });
+
+  it("uses native automatic Rex detection and auto overrides, not a second renderer", () => {
+    const expected = { images: "kitty", trueColor: true, hyperlinks: true };
+    assert.deepEqual(detectCapabilities(), expected);
+    process.env.PI_HYPERLINKS = "auto";
+    process.env.PI_IMAGE_PROTOCOL = "auto";
+    process.env.PI_TRUE_COLOR = "auto";
+    assert.deepEqual(detectCapabilities(), expected);
+    assert.equal(getTerminalColorMode(), "truecolor");
+    assert.match(hyperlink("Rex", "https://www.superlogical.com/rex"), /\x1b\]8;/);
+  });
+
+  it("honors native environment disablement and explicit image protocol selection", () => {
+    process.env.PI_HYPERLINKS = "0";
+    process.env.PI_IMAGE_PROTOCOL = "none";
+    process.env.PI_TRUE_COLOR = "0";
+    assert.deepEqual(detectCapabilities(), { images: null, trueColor: false, hyperlinks: false });
+    assert.equal(getTerminalColorMode(), "256color");
+    assert.equal(getCapabilities().hyperlinks, false);
+    process.env.PI_IMAGE_PROTOCOL = "iterm2";
+    assert.equal(detectCapabilities().images, "iterm2");
+  });
+
+  it("lets Pi settings override conflicting environment choices without writing settings", () => {
+    process.env.PI_HYPERLINKS = "1";
+    process.env.PI_IMAGE_PROTOCOL = "kitty";
+    process.env.PI_TRUE_COLOR = "1";
+    const settings = SettingsManager.inMemory({ terminal: { hyperlinks: false, images: false, trueColor: false } });
+    setCapabilityOverrides(settings.getTerminalCapabilityOverrides());
+    assert.deepEqual(getCapabilities(), { images: null, trueColor: false, hyperlinks: false });
+    // Auto settings defer to native environment/detection; they are not forced values.
+    const automatic = SettingsManager.inMemory({ terminal: { hyperlinks: "auto", images: "auto", trueColor: "auto" } });
+    setCapabilityOverrides(automatic.getTerminalCapabilityOverrides());
+    assert.deepEqual(getCapabilities(), { images: "kitty", trueColor: true, hyperlinks: true });
+  });
+
+  it("preserves explicit native overrides verbatim in server-launched wrappers and leaves auto unset", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { registerSurfaceHandle, unregisterSurfaceHandle, sendLongCommand } = await import("../pi-extension/subagents/rex.ts");
+    const dir = createTestDir();
+    const id = "native-overrides";
+    __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    __rexTest__.setRexExecutor(() => JSON.stringify({ window_id: "window:child", block_ids: ["block:child"] }));
+    try {
+      for (const explicit of [false, true]) {
+        registerSurfaceHandle({ id, kind: "tab", name: id, sessionId: "session:test", status: "reserved" });
+        if (explicit) {
+          process.env.PI_PROGRAM_STATUS = "0";
+          process.env.PI_HYPERLINKS = "0";
+          process.env.PI_IMAGE_PROTOCOL = "none";
+          // Do not interpret/execute unexpected values; let Pi handle them.
+          process.env.PI_TRUE_COLOR = "auto'; $(touch should-not-exist)";
+        }
+        const script = sendLongCommand(id, explicit ? 'echo "$PI_TRUE_COLOR"' : "exit 0", { scriptPath: join(dir, "launch.sh") });
+        const text = readFileSync(script, "utf8");
+        for (const key of nativeKeys) {
+          if (explicit) assert.ok(text.includes(`export ${key}=${shellEscape(process.env[key]!)}`));
+          else assert.equal(text.includes(key), false, "automatic detection must remain unset");
+        }
+        assert.equal(text.includes("PI_PROGRAM_STATUS=1"), false, "must not force status on");
+        if (explicit) {
+          const output = execFileSync("bash", [script], {
+            cwd: dir,
+            encoding: "utf8",
+            // Require the wrapper to restore the value, rather than inherit it.
+            env: { ...process.env, PI_TRUE_COLOR: undefined },
+          });
+          assert.equal(existsSync(join(dir, "should-not-exist")), false, "must not execute the injected command");
+          assert.equal(output, "auto'; $(touch should-not-exist)\n");
+        }
+      }
+    } finally {
+      unregisterSurfaceHandle(id);
+      __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of ["automatic-unavailable", "disabled", "forced-but-unavailable", "query-failed", "native-report"] as const) {
+    it(`uses the target's actual status for ${mode}, without changing Pi environment/settings`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, sendMessage } = await import("../pi-extension/subagents/rex.ts");
+      const dir = createTestDir();
+      const settingsFile = join(dir, "settings.json");
+      const settings = '{"terminal":{"hyperlinks":false,"images":false,"trueColor":false}}\n';
+      writeFileSync(settingsFile, settings);
+      const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = dir;
+      if (mode === "disabled" || mode === "native-report") process.env.PI_PROGRAM_STATUS = "0";
+      if (mode === "forced-but-unavailable") process.env.PI_PROGRAM_STATUS = "1";
+      const envBefore = { ...process.env };
+      const calls: string[][] = [];
+      const id = `native-status-${mode}`;
+      __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args.at(-1) === "program_status") {
+          if (mode === "query-failed") throw new Error("server disconnected");
+          return JSON.stringify({ records: mode === "native-report" ? [
+            { state: "idle", app: "pi", updated_at: "2026-11-02T00:00:00Z" },
+          ] : [] });
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "tab", name: id, sessionId: "session:test", blockId: "block:child", status: "launched" });
+      try {
+        if (mode === "native-report") {
+          // The parent's disabled status is not evidence that the child's report is absent.
+          sendMessage(id, "/hotkeys");
+          assert.equal(calls.filter((args) => args.includes("block.event")).length, 2);
+        } else {
+          assert.throws(() => sendMessage(id, "do not submit"), (error: Error) => {
+            assert.match(error.message, /Cannot deliver message safely/);
+            assert.match(error.message, /PI_PROGRAM_STATUS \(0 disables reports\)/);
+            assert.match(error.message, /OSC 7501/);
+            assert.match(error.message, /interact with the child manually; no input was sent/);
+            return true;
+          });
+          assert.equal(calls.some((args) => args.includes("block.event")), false);
+        }
+        // An assertion failure must not dump unrelated provider credentials.
+        assert.ok(JSON.stringify({ ...process.env }) === JSON.stringify(envBefore), "adapter must not change process environment");
+        assert.equal(readFileSync(settingsFile, "utf8"), settings);
+        assert.equal(statSync(settingsFile).isFile(), true);
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", savedAgentDir);
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("safe_bash tool", () => {

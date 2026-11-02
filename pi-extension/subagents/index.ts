@@ -17,7 +17,6 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  needsShellReadyDelay,
   createSurface,
   sendMessage,
   sendLongCommand,
@@ -29,6 +28,7 @@ import {
   queryBlockProcess,
   getSurfaceHandle,
   getRexContext,
+  disposeRexSurfaces,
 } from "./rex.ts";
 
 import {
@@ -538,22 +538,9 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
   }
 }
 
-/**
- * Wait long enough for a freshly created pane to finish shell startup.
- *
- * Some environments do extra shell-init work before the prompt is ready
- * (for example direnv/devenv), so the delay is configurable for users who hit
- * dropped commands. Keep the historical default at 500ms.
- */
+/** Preserve the real command status independently of the compatibility sentinel. */
 export function wrapLaunchCommand(baseCommand: string): string {
   return `${baseCommand}; status=$?; echo "__SUBAGENT_DONE_\${status}__"; exit "$status"`;
-}
-
-function getShellReadyDelayMs(): number {
-  if (!needsShellReadyDelay()) return 0;
-  const raw = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS?.trim();
-  const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
 function muxUnavailableResult() {
@@ -606,31 +593,40 @@ function resolveResultPresentation(
   >,
   name: string,
 ): string {
+  if (result.observationFailure === true) {
+    return (
+      `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
+      `${result.summary}\n\n` +
+      `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
+    );
+  }
+
+  // Marker cleanup can fail even after observing a real exit. A retained guard
+  // blocks resume, but must not replace the actual result with observation loss.
+  const resumeBlocked = result.sessionFile &&
+    (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile));
   // Name is the persistent handle: the same name steers a running subagent or
-  // resumes a finished one, so follow-ups always reference it.
-  const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  // resumes a finished one, so safe follow-ups always reference it.
+  const sessionRef = resumeBlocked
+    ? `\n\nResume is blocked until the previous process is confirmed finished.`
+    : `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  const resumeHint = resumeBlocked
+    ? sessionRef.trimStart()
+    : `You can resume the session with subagent_message.${sessionRef}`;
 
   if (result.outcome === "interrupted" || (result.outcome as string) === "cancelled") {
     const isCancelled = result.error === "cancelled" || (result.outcome as string) === "cancelled";
     if (isCancelled) {
       return (
         `Sub-agent "${name}" was cancelled after ${formatElapsed(result.elapsed)}.\n\n` +
-        `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
+        `The session data was preserved. ${resumeHint}`
       );
     }
     const detail = result.errorMessage ? `\n\n${result.errorMessage}` : "";
     return (
       `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
       `(pane closed externally before completion).${detail}\n\n` +
-      `The session data was preserved. You can resume the session with subagent_message.${sessionRef}`
-    );
-  }
-
-  if (result.observationFailure === true) {
-    return (
-      `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
-      `${result.summary}\n\n` +
-      `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
+      `The session data was preserved. ${resumeHint}`
     );
   }
 
@@ -643,8 +639,8 @@ function resolveResultPresentation(
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
-      `The subagent did not produce a result. You can retry by spawning a new ` +
-      `subagent or resume the session with subagent_message.${sessionRef}`
+      `The subagent did not produce a result. You can retry by spawning a new subagent` +
+      (resumeBlocked ? `.${sessionRef}` : ` or resume the session with subagent_message.${sessionRef}`)
     );
   }
 
@@ -718,8 +714,11 @@ interface LostObservationEntry {
   surface: string;
   blockId?: string;
   sessionId: string;
+  /** Background attempts only; exhausting the budget must never release the resume guard. */
+  automaticAttempts?: number;
 }
 const lostObservationEntries = new Map<string, LostObservationEntry>();
+const MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS = 10;
 
 /** Clear the lost-observation state (both persistent marker and in-memory guard) when confirmed ended.
  * Throws if clearing the disk marker fails, preserving the in-memory guard.
@@ -730,7 +729,50 @@ export function confirmProcessEnded(sessionFile: string): void {
   lostObservationEntries.delete(resolve(sessionFile));
 }
 
+const guardedSubagentRuns = new WeakSet<RunningSubagent>();
+
+/** Preserve resume safety without starting new work in a disposed runtime. */
+function recordLostObservation(running: RunningSubagent): Error | null {
+  const { sessionFile, surface } = running;
+  if (!sessionFile || guardedSubagentRuns.has(running)) return null;
+
+  // Shutdown records synchronously; its later watcher rejection must not
+  // recreate a guard that reconciliation has already cleared.
+  guardedSubagentRuns.add(running);
+
+  const resolvedPath = resolve(sessionFile);
+  const surfaceHandle = getSurfaceHandle(surface);
+  const entry = {
+    sessionFile,
+    surface,
+    blockId: surfaceHandle?.blockId,
+    sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
+  };
+  lostObservationSessions.add(resolvedPath);
+  lostObservationEntries.set(resolvedPath, entry);
+  try {
+    writeLostObservationMarker(sessionFile, entry);
+    return null;
+  } catch (err) {
+    console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, err);
+    return err instanceof Error ? err : new Error(String(err));
+  }
+}
+
 let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleLostObservationReconciliation(): void {
+  // Missing coordinates and exhausted retry budgets retain their safety guards,
+  // but must not keep an automatic polling loop alive.
+  const hasQueryableEntry = Array.from(lostObservationEntries.values()).some(
+    (entry) => entry.blockId?.trim() && entry.sessionId?.trim() &&
+      (entry.automaticAttempts ?? 0) < MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS,
+  );
+  if (hasQueryableEntry && !reconcileRetryTimer) {
+    reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
+    reconcileRetryTimer.unref?.();
+  }
+}
 
 export function reconcileLostObservations(sessionPathCheck?: string): void {
   if (reconcileRetryTimer) {
@@ -750,8 +792,15 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
   }
 
   let reconciled = false;
+  const requestedPath = sessionPathCheck ? resolve(sessionPathCheck) : undefined;
   for (const [sessionPath, entry] of lostObservationEntries) {
     if (!entry.blockId?.trim() || !entry.sessionId?.trim()) continue;
+    // Explicit resume checks can always query their target, even after its
+    // background budget is exhausted. Failed queries also consume that budget.
+    if (sessionPath !== requestedPath) {
+      if ((entry.automaticAttempts ?? 0) >= MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS) continue;
+      entry.automaticAttempts = (entry.automaticAttempts ?? 0) + 1;
+    }
     try {
       const proc = queryBlockProcess(entry.blockId, entry.sessionId);
       if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
@@ -761,9 +810,7 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
       }
     } catch {}
   }
-  if (lostObservationEntries.size > 0 && !reconcileRetryTimer) {
-    reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
-  }
+  scheduleLostObservationReconciliation();
   if (
     reconciled &&
     sessionPathCheck === undefined &&
@@ -824,6 +871,7 @@ function processPendingCleanups(): void {
   }
   if (pendingCleanups.size > 0 && !cleanupRetryTimer) {
     cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+    cleanupRetryTimer.unref?.();
   }
 }
 
@@ -838,6 +886,7 @@ function safeCloseSurface(surface: string): void {
     }
     if (!cleanupRetryTimer) {
       cleanupRetryTimer = setTimeout(processPendingCleanups, 1000);
+      cleanupRetryTimer.unref?.();
     }
   }
 }
@@ -1318,7 +1367,6 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 
 export const __test__ = {
   borderLine,
-  getShellReadyDelayMs,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1343,6 +1391,7 @@ export const __test__ = {
   lostObservationEntries,
   confirmProcessEnded,
   reconcileLostObservations,
+  MAX_AUTOMATIC_RECONCILIATION_ATTEMPTS,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -1742,8 +1791,11 @@ async function watchSubagent(
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
+  // Capture this runtime's signal: reload installs a new global controller before
+  // the old watcher's rejection is handled.
+  const moduleSignal = getModuleAbortSignal();
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1752,6 +1804,18 @@ async function watchSubagent(
         deliverPendingQuestion(running);
       },
     });
+
+    // Shutdown may have recorded a guard after polling confirmed exit but
+    // before this continuation ran. The process is now known to have ended.
+    if (lostObservationSessions.has(resolve(sessionFile))) {
+      try {
+        confirmProcessEnded(sessionFile);
+      } catch (err) {
+        // Marker cleanup is not process observation: preserve the completed
+        // result and leave the resume guard in place if disk removal failed.
+        console.warn(`Failed to clear lost-observation marker for ${sessionFile}:`, err);
+      }
+    }
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -1851,16 +1915,22 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    if (signal.aborted) {
-      safeCloseSurface(surface);
+    if (signal.aborted || moduleSignal.aborted) {
+      // Shutdown/reload only disposes observation; the child may still be live.
+      // Only an explicit watcher cancellation may close its pane here.
+      if (moduleSignal.aborted) recordLostObservation(running);
+      else safeCloseSurface(surface);
       runningSubagents.delete(running.id);
       return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: moduleSignal.aborted
+          ? "Observation disposed during session shutdown or reload. The pane was kept open and resume is blocked until process exit is confirmed."
+          : "Subagent cancelled.",
+        ...(moduleSignal.aborted ? { observationFailure: true } : {}),
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
-        error: "cancelled",
+        error: moduleSignal.aborted ? "observation_lost" : "cancelled",
         outcome: "interrupted",
         sessionFile,
       };
@@ -1869,31 +1939,8 @@ async function watchSubagent(
     if (isRexInfrastructureError(err)) {
       // Sustained infrastructure failure observing the process.
       // Do NOT kill or close a potentially live agent!
-      let markerError: any = null;
-      if (sessionFile) {
-        const resolvedPath = resolve(sessionFile);
-        lostObservationSessions.add(resolvedPath);
-        const surfaceHandle = getSurfaceHandle(surface);
-        lostObservationEntries.set(resolvedPath, {
-          sessionFile,
-          surface,
-          blockId: surfaceHandle?.blockId,
-          sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
-        });
-        try {
-          writeLostObservationMarker(sessionFile, {
-            blockId: surfaceHandle?.blockId,
-            sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
-            surface,
-          });
-        } catch (mErr: any) {
-          markerError = mErr;
-          console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, mErr);
-        }
-        if (!reconcileRetryTimer) {
-          reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
-        }
-      }
+      const markerError = recordLostObservation(running);
+      scheduleLostObservationReconciliation();
       runningSubagents.delete(running.id);
       const errorMsg = markerError
         ? `${err?.message ?? String(err)} (and failed to persist safety marker: ${markerError?.message ?? String(markerError)})`
@@ -1958,6 +2005,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
     }
     pendingCleanups.clear();
+    // Close retries above can schedule a final cosmetic pass: dispose afterwards.
+    disposeRexSurfaces();
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1968,6 +2017,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+    // Persist guards synchronously before clearing live tracking: shutdown can
+    // complete before the aborted watchers' promise continuations run.
+    for (const agent of runningSubagents.values()) recordLostObservation(agent);
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {

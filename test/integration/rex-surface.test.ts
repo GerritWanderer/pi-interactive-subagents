@@ -31,7 +31,53 @@ import {
   queryBlockProcess,
   queryProgramStatus,
   sendMessage,
+  getSurfaceHandle,
+  rexJson,
+  rexExec,
+  rexBin,
+  buildRexArgs,
+  setRexExecutor,
+  scheduleTabSizing,
+  disposeRexSurfaces,
+  pollForExit,
+  __rexTest__,
 } from "../../pi-extension/subagents/rex.ts";
+import { planEqualShares } from "../../pi-extension/subagents/rex-sizing.ts";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Deliberate top-level identities, independent of the test runner's ancestry.
+function mainSurface(env: TestEnv, name: string): string {
+  const savedName = process.env.PI_SUBAGENT_NAME;
+  const savedTop = process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+  delete process.env.PI_SUBAGENT_NAME;
+  delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+  try { return createTrackedSurface(env, name); }
+  finally {
+    if (savedName === undefined) delete process.env.PI_SUBAGENT_NAME;
+    else process.env.PI_SUBAGENT_NAME = savedName;
+    if (savedTop === undefined) delete process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE;
+    else process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTop;
+  }
+}
+
+async function waitForBalanced(session: string, windowId: string): Promise<any> {
+  const deadline = Date.now() + 5000;
+  do {
+    const view = rexJson(["session", "inspect", session, "--json"]);
+    const window = view.windows.find((w: any) => w.window_id === windowId);
+    const layout = window?.layers?.find((l: any) => l.kind === "tiled")?.layout;
+    if (layout && planEqualShares(layout).length === 0 && __rexTest__.sizingPassCount() === 0) return window;
+    await sleep(50);
+  } while (Date.now() < deadline);
+  assert.fail(`Timed out balancing ${windowId}`);
+}
+
+function layoutLeaves(node: any): any[] {
+  return node?.split ? [...layoutLeaves(node.split.before), ...layoutLeaves(node.split.after)] : node?.block_id ? [node] : [];
+}
 
 const backends = getAvailableBackends();
 
@@ -51,6 +97,98 @@ for (const backend of backends) {
     after(() => {
       cleanupTestEnv(env);
     });
+
+    for (const mode of ["automatic", "disabled", "settings-override"] as const) {
+      it(`source-loaded Pi uses native capabilities/status (${mode}), without model requests or config changes`, async () => {
+        const initialFocus = getFocusedSurface();
+        const dir = mkdtempSync(join(env.dir, "native-pi-"));
+        const agentDir = join(dir, "agent");
+        mkdirSync(agentDir);
+        const disabled = mode === "settings-override";
+        const settings = JSON.stringify({
+          theme: "dark", tuiMode: "regular", quietStartup: true,
+          lastChangelogVersion: execFileSync("pi", ["--version"], { encoding: "utf8" }).trim(),
+          terminal: { hyperlinks: disabled ? false : "auto", images: disabled ? false : "auto", trueColor: disabled ? false : "auto" },
+        });
+        const settingsFile = join(agentDir, "settings.json");
+        writeFileSync(settingsFile, settings);
+        const source = fileURLToPath(new URL("../../pi-extension/subagents/index.ts", import.meta.url));
+        const fixture = fileURLToPath(new URL("./fixtures/native-pi.ts", import.meta.url));
+        const { shellEscape } = await import("../../pi-extension/subagents/rex.ts");
+        const log = join(dir, "native-output.log");
+        const surface = mainSurface(env, `native-pi-${mode}`);
+        // Scrub inherited identities/overrides in this isolated fixture only. In
+        // production, explicit user overrides are preserved by sendLongCommand.
+        const unset = "unset PI_SUBAGENT_NAME PI_SUBAGENT_AUTO_EXIT PI_SUBAGENT_ALLOWED PI_SUBAGENT_AGENT PI_SUBAGENT_SESSION PI_SUBAGENT_ID PI_SUBAGENT_ACTIVITY_FILE PI_SUBAGENT_SURFACE PI_PROGRAM_STATUS PI_HYPERLINKS PI_IMAGE_PROTOCOL PI_TRUE_COLOR TMUX STY;";
+        const overrides = mode === "disabled" ? "PI_PROGRAM_STATUS=0" : disabled ? "PI_HYPERLINKS=1 PI_IMAGE_PROTOCOL=kitty PI_TRUE_COLOR=1" : "";
+        sendLongCommand(surface, `${unset}\nexec env PI_CODING_AGENT_DIR=${shellEscape(agentDir)} PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 PI_TUI_WRITE_LOG=${shellEscape(log)} ${overrides} pi -ne -e ${shellEscape(source)} -e ${shellEscape(fixture)} --no-skills --no-prompt-templates --no-themes --no-session`, {
+          cwd: dir, scriptPath: join(dir, "launch.sh"),
+        });
+        const handle = getSurfaceHandle(surface)!;
+        try {
+          const stateFile = join(dir, "native-state.json");
+          const deadline = Date.now() + 15_000;
+          while (!existsSync(stateFile) && Date.now() < deadline) await sleep(100);
+          assert.ok(existsSync(stateFile), `Pi startup failed: ${await readScreenAsync(surface, 60)}`);
+          const state = JSON.parse(readFileSync(stateFile, "utf8"));
+          assert.equal(state.termProgram, "rex", "must exercise real Rex environment detection");
+          assert.ok(state.tools.includes("subagent"), "workspace source must be loaded");
+          assert.deepEqual(state.capabilities, disabled
+            ? { images: null, trueColor: false, hyperlinks: false }
+            : { images: "kitty", trueColor: true, hyperlinks: true });
+          assert.equal(state.programStatus, mode === "disabled" ? "0" : null);
+          await waitForScreen(surface, /NATIVE_REX_COLOR/, 10_000);
+          const stream = readFileSync(log, "utf8");
+          if (disabled) {
+            assert.doesNotMatch(stream, /\x1b\]8;;https:\/\/www\.superlogical\.com\/rex/);
+            assert.doesNotMatch(stream, /\x1b_G/);
+            assert.doesNotMatch(stream, /\x1b\[38;2;18;52;86m/);
+          } else {
+            assert.match(stream, /\x1b\]8;;https:\/\/www\.superlogical\.com\/rex/);
+            assert.match(stream, /\x1b\[38;2;18;52;86m/);
+            assert.match(stream, /\x1b_G[^\x1b]*a=T/, "Pi's Image component must transmit Kitty graphics");
+            // Rex's own capture confirms the link/color reached its terminal model.
+            const html = rexExec(["capture", "-s", handle.sessionId, "-b", handle.blockId!, "--format=html", "--trim"]);
+            assert.match(html, /NATIVE_REX_LINK/);
+            assert.match(html, /href="https:\/\/www\.superlogical\.com\/rex"/);
+            assert.match(html, /(?:#123456|rgb\(18,\s*52,\s*86\))/i);
+          }
+          if (mode === "disabled") {
+            assert.deepEqual(queryProgramStatus(handle.blockId!, handle.sessionId), []);
+            assert.throws(() => sendMessage(surface, "/hotkeys"), /PI_PROGRAM_STATUS.*OSC 7501/);
+            const processState = queryBlockProcess(handle.blockId!, handle.sessionId);
+            assert.notEqual(processState, "not_found");
+            assert.equal(processState !== "not_found" && processState.last_exit, null);
+          } else {
+            let records = queryProgramStatus(handle.blockId!, handle.sessionId);
+            const statusDeadline = Date.now() + 5000;
+            while (!records.some((record) => record.app === "pi" && record.state === "idle") && Date.now() < statusDeadline) {
+              await sleep(100);
+              records = queryProgramStatus(handle.blockId!, handle.sessionId);
+            }
+            assert.ok(records.some((record) => record.app === "pi" && record.state === "idle"), JSON.stringify(records));
+            sendMessage(surface, "/hotkeys");
+            await waitForScreen(surface, /Slash commands/, 10_000);
+            if (mode === "automatic") {
+              sendMessage(surface, "/native-smoke-dialog");
+              let blockedRecords = queryProgramStatus(handle.blockId!, handle.sessionId);
+              const blockedDeadline = Date.now() + 5000;
+              while (!blockedRecords.some((record) => record.state === "blocked") && Date.now() < blockedDeadline) {
+                await sleep(100);
+                blockedRecords = queryProgramStatus(handle.blockId!, handle.sessionId);
+              }
+              assert.ok(blockedRecords.some((record) => record.state === "blocked"), JSON.stringify(blockedRecords));
+              assert.throws(() => sendMessage(surface, "must not reach dialog"), /blocked on a .*dialog/);
+            }
+          }
+          assert.equal(existsSync(join(dir, "unexpected-provider-request")), false);
+          assert.equal(readFileSync(settingsFile, "utf8"), settings, "Pi choices must not be rewritten");
+          assert.equal(getFocusedSurface(), initialFocus);
+        } finally {
+          closeSurface(surface);
+        }
+      });
+    }
 
     it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
       const initialFocus = getFocusedSurface();
@@ -99,6 +237,8 @@ for (const backend of backends) {
 
       const topTab = getSurfaceTab(top);
       assert.ok(topTab, "expected to read top surface window id");
+      const labeled = rexJson(["block", "inspect", "-s", ctx.session!, topHandle!.blockId!, "--json"]);
+      assert.equal(labeled.block.label, "tab-top-level", "the command pane must share the named tab's agent label");
 
       // Verify top-level window is different from the spawner's window
       const rexModule = await import("../../pi-extension/subagents/rex.ts");
@@ -136,6 +276,40 @@ for (const backend of backends) {
         else process.env.REX_BLOCK = savedBlock;
       }
     });
+
+    for (const label of ["-agent-name", "--dash-name"]) {
+      it(`preserves the leading-dash label ${JSON.stringify(label)} on tabs and nested panes`, async () => {
+        const initialFocus = getFocusedSurface();
+        const top = mainSurface(env, label);
+        let nested: string | undefined;
+        try {
+          sendLongCommand(top, 'echo "DASH_TOP_READY"');
+          await waitForScreen(top, /DASH_TOP_READY/, 10_000, 20);
+          const topHandle = getSurfaceHandle(top)!;
+          assert.equal(topHandle.kind, "tab");
+          assert.equal(topHandle.name, label);
+          const view = rexJson(["session", "inspect", topHandle.sessionId, "--json"]);
+          const tab = view.windows.find((w: any) => w.window_id === topHandle.windowId);
+          assert.equal(tab?.label, label, "the temporary tab label must be replaced with the exact requested name");
+          const pane = rexJson(["block", "inspect", "-s", topHandle.sessionId, topHandle.blockId!, "--json"]);
+          assert.equal(pane.block.label, label, "the command pane must retain the leading dashes");
+
+          nested = createTrackedSurfaceSplit(env, label, "right", top);
+          sendLongCommand(nested, 'echo "DASH_NESTED_READY"');
+          await waitForScreen(nested, /DASH_NESTED_READY/, 10_000, 20);
+          const nestedHandle = getSurfaceHandle(nested)!;
+          assert.equal(nestedHandle.kind, "split");
+          assert.equal(nestedHandle.name, label);
+          const nestedPane = rexJson(["block", "inspect", "-s", nestedHandle.sessionId, nestedHandle.blockId!, "--json"]);
+          assert.equal(nestedPane.block.label, label, "split labels must also retain the leading dashes");
+          assert.equal(nestedPane.block.window_id, topHandle.windowId);
+          assert.equal(getFocusedSurface(), initialFocus, "labeling must not change focus");
+        } finally {
+          if (nested) closeSurface(nested);
+          closeSurface(top);
+        }
+      });
+    }
 
     it("launches command directly, reads output, queries process, and closes cleanly", async () => {
       const surface = createTrackedSurface(env, "exec-test");
@@ -555,6 +729,113 @@ for (const backend of backends) {
       // Also verify pure edge cases
       assert.equal(chooseSplitDirection({ columns: 160, rows: 40 }, "auto"), "right");
       assert.equal(chooseSplitDirection({ columns: 50, rows: 40 }, "auto"), "below");
+    });
+
+    it("balances repeated splits and exits only in the affected tiled tab, preserving focus and floating layers", async () => {
+      const top = mainSurface(env, "sizing-target");
+      const other = mainSurface(env, "sizing-unrelated");
+      sendLongCommand(top, "echo SIZING_PARENT");
+      sendLongCommand(other, "echo SIZING_OTHER");
+      const target = getSurfaceHandle(top)!;
+      const unrelated = getSurfaceHandle(other)!;
+      const session = target.sessionId;
+      const windowId = getSurfaceTab(top)!;
+      const otherWindowId = getSurfaceTab(other)!;
+      const originalFocus = getFocusedSurface();
+      const originalActive = rexJson(["session", "inspect", session, "--json"]).active_window_id;
+      const otherChild = createTrackedSurfaceSplit(env, "unrelated-split", "right", other);
+      sendLongCommand(otherChild, "echo OTHER_CHILD");
+      await waitForBalanced(session, otherWindowId);
+      // Deliberately leave the unrelated tab manually sized and unequal.
+      rexExec(["api", "call", "session.resize_pane", JSON.stringify({
+        session_id: session, direction: "horizontal", before_block_id: unrelated.blockId,
+        after_block_id: getSurfaceHandle(otherChild)!.blockId, ratio: 0.73,
+      })]);
+      const otherBefore = rexJson(["window", "inspect", "-s", session, otherWindowId, "--json"]);
+      const floating = rexJson(["api", "call", "session.new_layer", JSON.stringify({
+        session_id: session, window_id: windowId, focus: false, bounds: [0.1, 0.1, 0.5, 0.5],
+        layout: { split: { direction: "horizontal", ratio: 0.7,
+          before: { block: { flavor: "com.superlogical.terminal.shell", label: "float-before" } },
+          after: { block: { flavor: "com.superlogical.terminal.shell", label: "float-after" } },
+        } },
+      })]);
+      try {
+        const floatBefore = rexJson(["window", "inspect", "-s", session, windowId, "--json"])
+          .layers.find((l: any) => l.layer_id === floating.layer_id);
+        const children: string[] = [];
+        // Repeatedly halve the same anchor, then let one debounced pass balance it.
+        for (let i = 0; i < 3; i++) {
+          const child = createTrackedSurfaceSplit(env, `sizing-child-${i}`, "right", top);
+          children.push(child);
+          sendLongCommand(child, `echo CHILD_${i}`);
+        }
+        let balanced = await waitForBalanced(session, windowId);
+        const leaves = layoutLeaves(balanced.layers.find((l: any) => l.kind === "tiled").layout);
+        assert.equal(leaves.length, 4);
+        for (const leaf of leaves) assert.ok(Math.abs(leaf.rect[2] - 0.25) < 0.01, `expected quarter-width column: ${leaf.rect}`);
+        // Process completion itself does not close panes: cleanup removes the owned resource.
+        assert.equal((await pollForExit(children[1], new AbortController().signal, { interval: 25 })).exitCode, 0);
+        closeSurface(children[1]);
+        balanced = await waitForBalanced(session, windowId);
+        const survivors = layoutLeaves(balanced.layers.find((l: any) => l.kind === "tiled").layout);
+        assert.equal(survivors.length, 3);
+        for (const leaf of survivors) assert.ok(Math.abs(leaf.rect[2] - 1 / 3) < 0.01);
+        assert.deepEqual(balanced.layers.find((l: any) => l.layer_id === floating.layer_id), floatBefore);
+        assert.deepEqual(rexJson(["window", "inspect", "-s", session, otherWindowId, "--json"]), otherBefore);
+        const after = rexJson(["session", "inspect", session, "--json"]);
+        assert.equal(after.active_window_id, originalActive);
+        assert.equal(getFocusedSurface(), originalFocus);
+      } finally {
+        for (const block of floating.block_ids) {
+          try { rexExec(["block", "close", "-s", session, block]); } catch {}
+        }
+      }
+    });
+
+    it("treats stale sizing layouts and resize failures as cosmetic during launch, exit, and cleanup", async () => {
+      const top = mainSurface(env, "sizing-failure-target");
+      sendLongCommand(top, "echo FAILURE_PARENT");
+      const parent = getSurfaceHandle(top)!;
+      const windowId = getSurfaceTab(top)!;
+      let failedResizes = 0;
+      // Delegate real surface operations, injecting only a cosmetic API failure.
+      setRexExecutor((args) => {
+        if (args[0] === "api" && args[2] === "session.resize_pane") {
+          failedResizes++;
+          throw new Error("bad_request: split changed since inspection");
+        }
+        return execFileSync(rexBin(), buildRexArgs(args), { encoding: "utf8", timeout: 5000 });
+      });
+      try {
+        const first = createTrackedSurfaceSplit(env, "sizing-failure-first", "right", top);
+        sendLongCommand(first, "echo FIRST_COMPLETE");
+        const second = createTrackedSurfaceSplit(env, "sizing-failure-second", "right", top);
+        sendLongCommand(second, "echo SECOND_COMPLETE");
+        await sleep(250);
+        assert.ok(failedResizes > 0);
+        assert.equal((await pollForExit(second, new AbortController().signal, { interval: 25 })).reason, "done");
+        assert.match(readScreen(second), /SECOND_COMPLETE/);
+        closeSurface(second);
+        // Close the fixture tab before its pending cosmetic inspection: stale tab is benign.
+        closeSurface(first);
+        closeSurface(top);
+        scheduleTabSizing(parent.sessionId, windowId);
+        await sleep(250);
+        assert.equal(__rexTest__.sizingPassCount(), 0);
+      } finally {
+        disposeRexSurfaces();
+        setRexExecutor(null);
+      }
+    });
+
+    it("bounds large-output diagnostics without depending on scrollback for process completion", async () => {
+      const surface = mainSurface(env, "large-output-fixture");
+      sendLongCommand(surface, `for ((i=0;i<20000;i++)); do printf 'large-output-%08d abcdefghijklmnopqrstuvwxyz\\n' "$i"; done; echo LARGE_OUTPUT_TAIL`);
+      const result = await pollForExit(surface, new AbortController().signal, { interval: 25 });
+      assert.equal(result.reason, "done");
+      const screen = await waitForScreen(surface, /LARGE_OUTPUT_TAIL/, 5000, 3);
+      assert.ok(Buffer.byteLength(screen) <= 64 * 1024);
+      assert.match(screen, /large-output-00019999/);
     });
 
     it("observes process completion, preserves real non-zero exit code, and handles interruption on closed pane", async () => {
