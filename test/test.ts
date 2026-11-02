@@ -6032,6 +6032,7 @@ describe("Pi 1.4 native Rex capability and status compatibility", () => {
   });
 
   it("preserves explicit native overrides verbatim in server-launched wrappers and leaves auto unset", async () => {
+    const { execFileSync } = await import("node:child_process");
     const { registerSurfaceHandle, unregisterSurfaceHandle, sendLongCommand } = await import("../pi-extension/subagents/rex.ts");
     const dir = createTestDir();
     const id = "native-overrides";
@@ -6048,13 +6049,23 @@ describe("Pi 1.4 native Rex capability and status compatibility", () => {
           // Do not interpret/execute unexpected values; let Pi handle them.
           process.env.PI_TRUE_COLOR = "auto'; $(touch should-not-exist)";
         }
-        const script = sendLongCommand(id, "exit 0", { scriptPath: join(dir, "launch.sh") });
+        const script = sendLongCommand(id, explicit ? 'echo "$PI_TRUE_COLOR"' : "exit 0", { scriptPath: join(dir, "launch.sh") });
         const text = readFileSync(script, "utf8");
         for (const key of nativeKeys) {
           if (explicit) assert.ok(text.includes(`export ${key}=${shellEscape(process.env[key]!)}`));
           else assert.equal(text.includes(key), false, "automatic detection must remain unset");
         }
         assert.equal(text.includes("PI_PROGRAM_STATUS=1"), false, "must not force status on");
+        if (explicit) {
+          const output = execFileSync("bash", [script], {
+            cwd: dir,
+            encoding: "utf8",
+            // Require the wrapper to restore the value, rather than inherit it.
+            env: { ...process.env, PI_TRUE_COLOR: undefined },
+          });
+          assert.equal(existsSync(join(dir, "should-not-exist")), false, "must not execute the injected command");
+          assert.equal(output, "auto'; $(touch should-not-exist)\n");
+        }
       }
     } finally {
       unregisterSurfaceHandle(id);
