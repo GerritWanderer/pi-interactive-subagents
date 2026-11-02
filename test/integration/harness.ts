@@ -22,6 +22,7 @@ import {
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import {
   isMuxAvailable,
   createSurface,
@@ -118,6 +119,8 @@ export interface TestEnv {
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
+  /** Unique names of subagents the tests spawn through a real pi (see trackChildName) */
+  childNames: string[];
 }
 
 /**
@@ -138,7 +141,7 @@ export function createTestEnv(): TestEnv {
     }
   }
 
-  return { dir, surfaces: [], tempFiles: [] };
+  return { dir, surfaces: [], tempFiles: [], childNames: [] };
 }
 
 /**
@@ -150,6 +153,7 @@ export function cleanupTestEnv(env: TestEnv): void {
       closeSurface(surface);
     } catch {}
   }
+  closeChildPanes(env);
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
@@ -157,6 +161,39 @@ export function cleanupTestEnv(env: TestEnv): void {
   }
   try {
     rmSync(env.dir, { recursive: true, force: true });
+  } catch {}
+}
+
+/**
+ * Record the name of a subagent a test asks a real pi to spawn. Tests can end
+ * before that pi closes its child's pane, and a killed parent never will, so
+ * cleanup closes panes left behind under these names. Names must be unique to
+ * the test (they embed a uniqueId) so nothing else can match.
+ */
+export function trackChildName(env: TestEnv, name: string): string {
+  env.childNames.push(name);
+  return name;
+}
+
+function closeChildPanes(env: TestEnv): void {
+  if (env.childNames.length === 0) return;
+  const session = process.env.REX_SESSION;
+  if (!session) return;
+  const rexBin = process.env.PI_SUBAGENT_REX_BIN?.trim() || "rex";
+  try {
+    const view = JSON.parse(
+      execFileSync(rexBin, ["session", "inspect", session, "--json"], { encoding: "utf8" }),
+    );
+    for (const window of view?.windows ?? []) {
+      for (const layer of window?.layers ?? []) {
+        for (const block of layer?.blocks ?? []) {
+          if (!env.childNames.includes(block?.label)) continue;
+          try {
+            execFileSync(rexBin, ["block", "close", "-s", session, block.block_id], { stdio: "ignore" });
+          } catch {}
+        }
+      }
+    }
   } catch {}
 }
 

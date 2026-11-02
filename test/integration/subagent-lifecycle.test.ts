@@ -33,6 +33,7 @@ import {
   PI_TIMEOUT,
   type TestEnv,
   findRegisteredSessionFile,
+  trackChildName,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
@@ -73,6 +74,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
+      trackChildName(env, `Echo-${id}`);
       startPi(surface, env.dir, task);
 
       // Verify: subagent created the marker file
@@ -125,6 +127,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
 
+      trackChildName(env, `Status-${id}`);
       startPi(surface, env.dir, task);
 
       const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
@@ -177,6 +180,8 @@ for (const backend of backends) {
         `Call both subagent tools NOW, do not wait between them.`,
       ].join("\n");
 
+      trackChildName(env, `ParaA-${id}`);
+      trackChildName(env, `ParaB-${id}`);
       startPi(surface, env.dir, task);
 
       // Both marker files should appear
@@ -207,6 +212,7 @@ for (const backend of backends) {
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
+      trackChildName(env, `Fork-${id}`);
       startPi(surface, env.dir, task);
 
       // Verify: forked subagent created the file
@@ -261,6 +267,7 @@ for (const backend of backends) {
         `After you receive the sub-agent's result, say ASK_COMPLETE.`,
       ].join("\n");
 
+      trackChildName(env, name);
       startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, new RegExp(answer));
@@ -312,6 +319,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
+      trackChildName(env, `Disco-${id}`);
       startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
@@ -338,6 +346,7 @@ for (const backend of backends) {
         `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
       ].join("\n");
 
+      trackChildName(env, `SysP-${id}`);
       startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
