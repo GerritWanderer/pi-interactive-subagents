@@ -5016,6 +5016,79 @@ describe("resumed infrastructure failure delivery", () => {
   }
 });
 
+describe("subagent watcher disposal", () => {
+  for (const reason of ["session_shutdown", "reload", "cancellation"] as const) {
+    it(`${reason} ${reason === "cancellation" ? "closes" : "preserves"} a live watched child's pane`, async (t) => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, getSurfaceHandle } = await import("../pi-extension/subagents/rex.ts");
+      const testApi = subagentsModule.__test__;
+      const { api } = createMockExtensionApi();
+      const handlers = new Map<string, (...args: any[]) => void>();
+      api.on = (event: string, handler: (...args: any[]) => void) => handlers.set(event, handler);
+      subagentsModule.default(api);
+      handlers.get("session_start")!({}, { hasUI: false });
+      const dir = createTestDir();
+      const controller = new AbortController();
+      const id = `live-watcher-${reason}`;
+      const running = {
+        id, name: id, task: "keep running", surface: id,
+        startTime: Date.now(), sessionFile: join(dir, "child.jsonl"),
+        interactive: false,
+        statusState: createStatusState({ source: "pi", startTimeMs: Date.now() }),
+        abortController: controller,
+      };
+      const calls: string[][] = [];
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args.at(-1) === "process") return JSON.stringify({ last_exit: null });
+        return "{}";
+      });
+      registerSurfaceHandle({
+        id, name: id, kind: "split", status: "launched",
+        sessionId: "session:test", blockId: "block:live-child",
+      });
+      testApi.runningSubagents.set(id, running);
+      const watcher = testApi.watchSubagent(running, controller.signal);
+
+      try {
+        assert.equal(calls.filter((args) => args.at(-1) === "process").length, 1,
+          "the watcher must observe a live child before disposal");
+        if (reason === "session_shutdown") {
+          handlers.get("session_shutdown")!({}, {});
+          assert.equal(controller.signal.aborted, true, "shutdown also aborts the per-agent controller");
+        } else if (reason === "reload") {
+          // Match module reload: abort the previous runtime, then replace the
+          // global controller before the old watcher's catch branch executes.
+          const key = Symbol.for("pi-subagents/poll-abort-controller");
+          (globalThis as any)[key].abort();
+          (globalThis as any)[key] = new AbortController();
+        } else {
+          controller.abort();
+        }
+        await watcher;
+        assert.equal(testApi.runningSubagents.has(id), false, "disposed watchers must stop tracking");
+        const closes = calls.filter((args) => args[1] === "close");
+        assert.equal(closes.length, reason === "cancellation" ? 1 : 0,
+          "only explicit cancellation may request pane closure");
+        assert.equal(!!getSurfaceHandle(id), reason !== "cancellation",
+          "shutdown/reload must retain the live pane's handle");
+        assert.equal(testApi.pendingCleanups.has(id), false, "disposal must not enqueue a close retry");
+        const callsAfterDisposal = calls.length;
+        t.mock.timers.tick(5000);
+        await Promise.resolve();
+        assert.equal(calls.length, callsAfterDisposal, "disposal must stop background polling");
+      } finally {
+        handlers.get("session_shutdown")!({}, {});
+        controller.abort();
+        await watcher;
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe("lost-observation reconciliation timers", () => {
   for (const parentState of ["parked", "active", "reactivated", "resume-guard"]) {
     it(`reconciles the last child with parent state ${parentState} without spurious wakeups`, async () => {

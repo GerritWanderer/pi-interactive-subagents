@@ -1728,8 +1728,11 @@ async function watchSubagent(
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
+  // Capture this runtime's signal: reload installs a new global controller before
+  // the old watcher's rejection is handled.
+  const moduleSignal = getModuleAbortSignal();
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, AbortSignal.any([signal, moduleSignal]), {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
@@ -1837,8 +1840,10 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    if (signal.aborted) {
-      safeCloseSurface(surface);
+    if (signal.aborted || moduleSignal.aborted) {
+      // Shutdown/reload only disposes observation; the child may still be live.
+      // Only an explicit watcher cancellation may close its pane here.
+      if (!moduleSignal.aborted) safeCloseSurface(surface);
       runningSubagents.delete(running.id);
       return {
         name,
