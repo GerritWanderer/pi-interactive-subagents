@@ -2512,10 +2512,11 @@ describe("subagent interruption", () => {
     for (const result of [
       {
         summary: "Infrastructure observation failure: process query timed out. Pane was kept open.",
+        observationFailure: true,
       },
       {
         summary: "Process observation unavailable",
-        error: "Sustained infrastructure failure observing Rex block",
+        observationFailure: true,
       },
     ]) {
       const presentation = subagentsModule.__test__.resolveResultPresentation(
@@ -2527,6 +2528,24 @@ describe("subagent interruption", () => {
       assert.match(presentation, /pane was kept open/i);
       assert.match(presentation, /Resume is blocked until the previous process is confirmed finished/);
       assert.doesNotMatch(presentation, /Follow up with subagent_message/);
+    }
+  });
+
+  it("does not infer observation failure from summary or error text", () => {
+    for (const observationFailure of [undefined, false]) {
+      const presentation = subagentsModule.__test__.resolveResultPresentation(
+        {
+          exitCode: 1,
+          elapsed: 10,
+          summary: "Infrastructure observation failure: quoted agent output",
+          error: "Agent discussed an infrastructure failure",
+          observationFailure,
+        },
+        "worker",
+      );
+      assert.match(presentation, /failed \(exit code 1\)/);
+      assert.match(presentation, /Follow up with subagent_message/);
+      assert.doesNotMatch(presentation, /Resume is blocked/);
     }
   });
 
@@ -4330,7 +4349,7 @@ describe("rex.ts unit tests", () => {
 
         const infraRes = await testApi.watchSubagent(infraRunning, new AbortController().signal);
         assert.equal(infraRes.outcome, "failure");
-        assert.match(infraRes.summary, /Infrastructure observation failure/);
+        assert.equal(infraRes.observationFailure, true);
         assert.match(infraRes.summary, /Pane was kept open/);
         assert.ok(getSurfaceHandle("cleanup-res-surface"), "surface must remain open and tracked on infrastructure error");
 
@@ -4433,7 +4452,7 @@ describe("rex.ts unit tests", () => {
 
           const writeFailRes = await testApi.watchSubagent(failingRunning, new AbortController().signal);
           assert.equal(writeFailRes.outcome, "failure");
-          assert.match(writeFailRes.summary, /Infrastructure observation failure/);
+          assert.equal(writeFailRes.observationFailure, true);
           assert.match(writeFailRes.summary, /failed to persist safety marker/);
           // Infrastructure failure must still be recorded in in-memory guard
           assert.ok(testApi.lostObservationSessions.has(resolve(readOnlySession)));
@@ -5121,77 +5140,89 @@ describe("resumed infrastructure failure delivery", () => {
 });
 
 describe("lost-observation reconciliation timers", () => {
-  it("wakes a parked auto-exit parent when the last unresolved child is reconciled", async () => {
-    const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
-    const testApi = subagentsModule.__test__;
-    const mock = createMockExtensionApi();
-    const handlers = new Map<string, Array<(...args: any[]) => void>>();
-    mock.api.on = (event: string, handler: (...args: any[]) => void) => {
-      if (!handlers.has(event)) handlers.set(event, []);
-      handlers.get(event)!.push(handler);
-    };
-    const emit = (event: string, ...args: any[]) => handlers.get(event)?.forEach((fn) => fn(...args));
-    const savedAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-    const savedRunning = new Map(testApi.runningSubagents);
-    const savedLost = new Set(testApi.lostObservationSessions);
-    const savedEntries = new Map(testApi.lostObservationEntries);
-    const dir = createTestDir();
-    const sessionFile = join(dir, "lost-child.jsonl");
-    let shutdowns = 0;
-    const ctx = { shutdown() { shutdowns++; } };
-    const event = { messages: [{ role: "assistant", stopReason: "stop" }] };
+  for (const parentState of ["parked", "active", "reactivated", "resume-guard"]) {
+    it(`reconciles the last child with parent state ${parentState} without spurious wakeups`, async () => {
+      const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");
+      const testApi = subagentsModule.__test__;
+      const mock = createMockExtensionApi();
+      const handlers = new Map<string, Array<(...args: any[]) => void>>();
+      mock.api.on = (event: string, handler: (...args: any[]) => void) => {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      };
+      const emit = (event: string, ...args: any[]) => handlers.get(event)?.forEach((fn) => fn(...args));
+      const savedAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+      const savedRunning = new Map(testApi.runningSubagents);
+      const savedLost = new Set(testApi.lostObservationSessions);
+      const savedEntries = new Map(testApi.lostObservationEntries);
+      const parkedKey = Symbol.for("pi-subagents/parent-parked-for-children");
+      const savedParked = (globalThis as any)[parkedKey];
+      const dir = createTestDir();
+      const sessionFile = join(dir, "lost-child.jsonl");
+      let shutdowns = 0;
+      const ctx = { shutdown() { shutdowns++; } };
+      const event = { messages: [{ role: "assistant", stopReason: "stop" }] };
 
-    try {
-      testApi.runningSubagents.clear();
-      testApi.lostObservationSessions.clear();
-      testApi.lostObservationEntries.clear();
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      subagentsModule.default(mock.api);
-      subagentDoneExtension(mock.api);
-      testApi.lostObservationSessions.add(sessionFile);
-      testApi.lostObservationEntries.set(sessionFile, {
-        sessionFile,
-        surface: "",
-        blockId: "block:parked-child",
-        sessionId: "session:mock",
-      });
+      try {
+        testApi.runningSubagents.clear();
+        testApi.lostObservationSessions.clear();
+        testApi.lostObservationEntries.clear();
+        process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+        subagentsModule.default(mock.api);
+        subagentDoneExtension(mock.api);
+        testApi.lostObservationSessions.add(sessionFile);
+        testApi.lostObservationEntries.set(sessionFile, {
+          sessionFile,
+          surface: "",
+          blockId: "block:parked-child",
+          sessionId: "session:mock",
+        });
 
-      emit("agent_start");
-      emit("agent_end", event, ctx);
-      assert.equal(shutdowns, 0, "parent must park while process observation is unresolved");
-      assert.equal(runningChildrenCount(), 1);
+        emit("agent_start");
+        assert.equal((globalThis as any)[parkedKey], false, "active parents must not be marked parked");
+        if (parentState !== "active") {
+          emit("agent_end", event, ctx);
+          assert.equal((globalThis as any)[parkedKey], true, "pending children must mark the parent parked");
+          if (parentState === "reactivated") emit("agent_start");
+        }
+        assert.equal(shutdowns, 0, "parent must not exit while process observation is unresolved");
+        assert.equal(runningChildrenCount(), 1);
 
-      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: null }));
-      testApi.reconcileLostObservations();
-      assert.equal(mock.sentMessages.length, 0, "a still-running child must not release the parent");
+        __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: null }));
+        testApi.reconcileLostObservations();
+        assert.equal(mock.sentMessages.length, 0, "a still-running child must not release the parent");
 
-      __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
-      testApi.reconcileLostObservations();
-      assert.equal(runningChildrenCount(), 0);
-      assert.equal(testApi.lostObservationEntries.size, 0);
-      assert.equal(mock.sentMessages.length, 1, "reconciliation must wake the parked parent");
-      assert.deepEqual(mock.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
-      assert.match(mock.sentMessages[0].message.content, /No child subagents remain pending/);
+        __rexTest__.setRexExecutor(() => JSON.stringify({ last_exit: { exit_code: 0 } }));
+        testApi.reconcileLostObservations(parentState === "resume-guard" ? sessionFile : undefined);
+        assert.equal(runningChildrenCount(), 0);
+        assert.equal(testApi.lostObservationEntries.size, 0);
+        const expectedWakeups = parentState === "parked" ? 1 : 0;
+        assert.equal(mock.sentMessages.length, expectedWakeups, "only background reconciliation of a parked parent may wake it");
+        if (expectedWakeups) {
+          assert.deepEqual(mock.sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+          assert.match(mock.sentMessages[0].message.content, /No child subagents remain pending/);
+        }
 
-      // Simulate the turn triggered by delivery of the reconciliation notification.
-      emit("agent_start");
-      emit("agent_end", event, ctx);
-      assert.equal(shutdowns, 1, "the awakened parent must be allowed to auto-exit");
-      testApi.reconcileLostObservations();
-      assert.equal(mock.sentMessages.length, 1, "already-reconciled children must not wake the parent again");
-    } finally {
-      emit("session_shutdown", {});
-      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", savedAutoExit);
-      testApi.runningSubagents.clear();
-      for (const [key, value] of savedRunning) testApi.runningSubagents.set(key, value);
-      testApi.lostObservationSessions.clear();
-      for (const value of savedLost) testApi.lostObservationSessions.add(value);
-      testApi.lostObservationEntries.clear();
-      for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
-      __rexTest__.setRexExecutor(null);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
+        emit("agent_start");
+        emit("agent_end", event, ctx);
+        assert.equal(shutdowns, 1, "the parent must be allowed to auto-exit after reconciliation");
+        testApi.reconcileLostObservations();
+        assert.equal(mock.sentMessages.length, expectedWakeups, "already-reconciled children must not wake the parent again");
+      } finally {
+        emit("session_shutdown", {});
+        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", savedAutoExit);
+        testApi.runningSubagents.clear();
+        for (const [key, value] of savedRunning) testApi.runningSubagents.set(key, value);
+        testApi.lostObservationSessions.clear();
+        for (const value of savedLost) testApi.lostObservationSessions.add(value);
+        testApi.lostObservationEntries.clear();
+        for (const [key, value] of savedEntries) testApi.lostObservationEntries.set(key, value);
+        (globalThis as any)[parkedKey] = savedParked;
+        __rexTest__.setRexExecutor(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 
   it("keeps one retry chain across direct calls and cancels it on shutdown", async (t) => {
     const { __rexTest__ } = await import("../pi-extension/subagents/rex.ts");

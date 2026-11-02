@@ -79,6 +79,7 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
+const PARENT_PARKED_FOR_CHILDREN_KEY = Symbol.for("pi-subagents/parent-parked-for-children");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -598,17 +599,10 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   return ` stalled${detail}${duration} `;
 }
 
-function isInfrastructureObservationFailure(
-  result: Pick<SubagentResult, "summary" | "error">,
-): boolean {
-  return result.summary.startsWith("Infrastructure observation failure:") ||
-    !!result.error?.includes("infrastructure failure");
-}
-
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "outcome" | "error"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "outcome" | "error" | "observationFailure"
   >,
   name: string,
 ): string {
@@ -632,7 +626,7 @@ function resolveResultPresentation(
     );
   }
 
-  if (isInfrastructureObservationFailure(result)) {
+  if (result.observationFailure === true) {
     return (
       `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
       `${result.summary}\n\n` +
@@ -673,6 +667,7 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  observationFailure?: boolean;
   outcome?: "success" | "failure" | "interrupted" | "cancelled";
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
@@ -769,7 +764,12 @@ export function reconcileLostObservations(sessionPathCheck?: string): void {
   if (lostObservationEntries.size > 0 && !reconcileRetryTimer) {
     reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
   }
-  if (reconciled && runningSubagents.size + lostObservationSessions.size === 0) {
+  if (
+    reconciled &&
+    sessionPathCheck === undefined &&
+    (globalThis as any)[PARENT_PARKED_FOR_CHILDREN_KEY] === true &&
+    runningSubagents.size + lostObservationSessions.size === 0
+  ) {
     const content = "All child processes with lost observations are now confirmed ended. No child subagents remain pending.";
     latestPi?.sendMessage(
       {
@@ -1901,6 +1901,7 @@ async function watchSubagent(
         name,
         task,
         summary: `Infrastructure observation failure: ${errorMsg}. Pane was kept open.`,
+        observationFailure: true,
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: errorMsg,
@@ -2603,7 +2604,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
-            const summary = isInfrastructureObservationFailure(result)
+            const summary = result.observationFailure === true
               ? result.summary
               : findLastAssistantMessage(allEntries) ??
                 (result.errorMessage
