@@ -44,6 +44,7 @@ import {
   summarizeSessionStats,
   writeSubagentLoadout,
   writeLostObservationMarker,
+  readLostObservationMarker,
   hasLostObservationMarker,
   clearLostObservationMarker,
   type SessionStats,
@@ -719,7 +720,22 @@ export function confirmProcessEnded(sessionFile: string): void {
   lostObservationEntries.delete(resolve(sessionFile));
 }
 
-export function reconcileLostObservations(): void {
+let reconcileRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function reconcileLostObservations(sessionPathCheck?: string): void {
+  reconcileRetryTimer = null;
+  if (sessionPathCheck && !lostObservationEntries.has(resolve(sessionPathCheck))) {
+    const marker = readLostObservationMarker(sessionPathCheck);
+    if (marker?.blockId) {
+      lostObservationEntries.set(resolve(sessionPathCheck), {
+        sessionFile: sessionPathCheck,
+        surface: marker.surface ?? "",
+        blockId: marker.blockId,
+        sessionId: marker.sessionId ?? "",
+      });
+    }
+  }
+
   for (const [sessionPath, entry] of lostObservationEntries) {
     if (!entry.blockId) continue;
     try {
@@ -727,9 +743,12 @@ export function reconcileLostObservations(): void {
       if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
         confirmProcessEnded(sessionPath);
         lostObservationEntries.delete(sessionPath);
-        safeCloseSurface(entry.surface);
+        if (entry.surface) safeCloseSurface(entry.surface);
       }
     } catch {}
+  }
+  if (lostObservationEntries.size > 0 && !reconcileRetryTimer) {
+    reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
   }
 }
 
@@ -1830,10 +1849,17 @@ async function watchSubagent(
           sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
         });
         try {
-          writeLostObservationMarker(sessionFile);
+          writeLostObservationMarker(sessionFile, {
+            blockId: surfaceHandle?.blockId,
+            sessionId: surfaceHandle?.sessionId ?? getRexContext().session ?? "",
+            surface,
+          });
         } catch (mErr: any) {
           markerError = mErr;
           console.error(`Failed to persist lost-observation marker for ${sessionFile}:`, mErr);
+        }
+        if (!reconcileRetryTimer) {
+          reconcileRetryTimer = setTimeout(reconcileLostObservations, 1000);
         }
       }
       runningSubagents.delete(running.id);
@@ -1883,6 +1909,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
+    if (reconcileRetryTimer) {
+      clearTimeout(reconcileRetryTimer);
+      reconcileRetryTimer = null;
+    }
     if (cleanupRetryTimer) {
       clearTimeout(cleanupRetryTimer);
       cleanupRetryTimer = null;
@@ -2365,7 +2395,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Guard: refuse resume if observation of the previous process was lost and not confirmed exited.
         // First try to reconcile any pending lost observations before enforcing the guard.
-        reconcileLostObservations();
+        reconcileLostObservations(sessionPath);
+
+        // If marker is still on disk, check if it has process coordinates and query directly
+        if (hasLostObservationMarker(sessionPath)) {
+          const marker = readLostObservationMarker(sessionPath);
+          if (marker?.blockId) {
+            try {
+              const proc = queryBlockProcess(marker.blockId, marker.sessionId ?? "");
+              if (proc === "not_found" || (proc && proc.last_exit !== null && proc.last_exit !== undefined)) {
+                confirmProcessEnded(sessionPath);
+                if (marker.surface) safeCloseSurface(marker.surface);
+              }
+            } catch {}
+          }
+        }
 
         // Check both in-memory set and persistent marker sidecar across restarts.
         if (lostObservationSessions.has(resolve(sessionPath)) || hasLostObservationMarker(sessionPath)) {

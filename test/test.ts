@@ -3825,8 +3825,9 @@ describe("rex.ts unit tests", () => {
         return "{}";
       });
 
-      const surfaceId = createSurface("status-preserve-test");
+      let surfaceId: string | undefined;
       try {
+        surfaceId = createSurface("status-preserve-test");
         // Test production wrapper builder wrapLaunchCommand directly
         const wrappedSuccess = testApi.wrapLaunchCommand("true");
         const wrappedFailure = testApi.wrapLaunchCommand("bash -c 'exit 42'");
@@ -3882,7 +3883,7 @@ describe("rex.ts unit tests", () => {
       } finally {
         if (savedName !== undefined) process.env.PI_SUBAGENT_NAME = savedName;
         if (savedTopLevel !== undefined) process.env.PI_SUBAGENT_TOP_LEVEL_SURFACE = savedTopLevel;
-        unregisterSurfaceHandle(surfaceId);
+        if (surfaceId) unregisterSurfaceHandle(surfaceId);
         __rexTest__.setRexExecutor(null);
         __rexTest__.setCommandAvailabilityOverride(undefined);
         __rexTest__.setRexContextOverride(undefined);
@@ -4472,6 +4473,72 @@ describe("rex.ts unit tests", () => {
         });
         testApi.reconcileLostObservations();
         assert.equal(testApi.lostObservationSessions.has(resolve(reconcileSession)), false);
+        assert.equal(hasLostObservationMarker(reconcileSession), false);
+
+        // Finding 1 restart simulation:
+        // Disk marker has blockId and sessionId, but memory has lostObservationEntries/Sessions cleared
+        writeLostObservationMarker(reconcileSession, {
+          blockId: "block:mock-reconcile",
+          sessionId: "session:mock",
+          surface: "reconcile-surface",
+        });
+        testApi.lostObservationSessions.clear();
+        testApi.lostObservationEntries.clear();
+        assert.equal(testApi.lostObservationSessions.size, 0);
+        assert.equal(testApi.lostObservationEntries.size, 0);
+        assert.equal(hasLostObservationMarker(reconcileSession), true);
+
+        // Resume tool handler checks readLostObservationMarker, queries queryBlockProcess, and clears marker
+        const { api: restartApi, registeredTools: restartTools } = createMockExtensionApi();
+        (subagentsModule as any).default(restartApi);
+        const restartMsgTool = restartTools.find((t: any) => t.name === "subagent_message");
+        assert.ok(restartMsgTool);
+
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "block" && args[1] === "call" && args[args.length - 1] === "process") {
+            return JSON.stringify({ last_exit: { exit_code: 0 } });
+          }
+          if (args[0] === "window" && args[1] === "new") {
+            return JSON.stringify({ window_id: "win:resume-reconcile", block_ids: ["blk:resume-reconcile"] });
+          }
+          if (args[0] === "split") {
+            return JSON.stringify({ block_ids: ["blk:resume-reconcile"] });
+          }
+          if (args[0] === "block" && args[1] === "inspect") {
+            return JSON.stringify({ block: { block_id: "blk:resume-reconcile" } });
+          }
+          return "{}";
+        });
+
+        // Add loadout snapshot for reconcileSession so resume can execute
+        writeSubagentLoadout(reconcileSession, {
+          agent: "worker",
+          toolAllowlist: "read",
+          model: null,
+          thinking: null,
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: dir,
+          agentDir: null,
+        });
+
+        const resumeRestartRes = await restartMsgTool.execute(
+          "msg-reconcile-restart",
+          { name: "reconcile-agent", message: "resume after restart" },
+          undefined,
+          undefined,
+          {
+            sessionManager: {
+              getSessionDir: () => dir,
+              getSessionId: () => "main-sess",
+              getSessionFile: () => join(dir, "main.jsonl"),
+            },
+          },
+        );
+
+        assert.doesNotMatch(resumeRestartRes.content[0].text, /observation of its previous run was lost/);
         assert.equal(hasLostObservationMarker(reconcileSession), false);
       } finally {
         testApi.lostObservationSessions?.clear();
