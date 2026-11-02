@@ -64,6 +64,79 @@ pi
 
 Running pi outside Rex disables the `subagent` tools with a clear diagnostic hint.
 
+## Native Pi capabilities & safe steering
+
+**Pi 1.4.0 is the verification baseline.** It added native Rex OSC 8 hyperlinks, truecolor, and inline images (Kitty graphics). Pi—not this extension—detects and renders those capabilities. Pi 1.1.0 introduced native **OSC 7501 program status**; this adapter consumes those reports but does not emit another status stream. Older Pi versions are not categorically rejected, but safe steering requires a trustworthy Pi status record from the target.
+
+Automatic detection is the default. For diagnosis, Pi 1.4.0 documents these overrides:
+
+| Capability | Environment override | Pi setting in `settings.json` |
+| --- | --- | --- |
+| OSC 8 hyperlinks | `PI_HYPERLINKS=1\|0\|auto` | `terminal.hyperlinks: true\|false\|"auto"` |
+| Inline image protocol | `PI_IMAGE_PROTOCOL=kitty\|iterm2\|none\|auto` | `terminal.images: "kitty"\|"iterm2"\|false\|"auto"` |
+| Truecolor | `PI_TRUE_COLOR=1\|0\|auto` | `terminal.trueColor: true\|false\|"auto"` |
+| OSC 7501 program status | `PI_PROGRAM_STATUS=1\|0` | No corresponding Pi 1.4.0 setting documented |
+
+For rendering capabilities, **Pi settings take precedence over environment variables**. Unset/`auto` values defer to native detection. User settings live at `<agent-dir>/settings.json` (default `~/.pi/agent`, overridden by `PI_CODING_AGENT_DIR`); trusted project `.pi/settings.json` overrides user settings. `terminal.showImages: false` independently hides inline images; it is not the protocol selector. The extension's own `config.json` `status.enabled` controls its activity widget, **not** native OSC 7501 reporting. Names such as `PI_TERMINAL_STATUS` and `PI_IMAGE_SUPPORT` are not the documented Pi 1.4.0 overrides—use the names above.
+
+The launch wrapper carries explicitly set native overrides from the spawning Pi into Rex's server-side command environment, including `0`/`none`. It leaves unset values unset in the wrapper so Pi's own settings/detection and Rex's login environment apply. It never rewrites Pi settings or force-enables reporting, and does not infer a child's status from the parent's environment. Only force a capability manually if the **entire terminal path** supports it; escape sequences sent to an unsupported proxy can corrupt rendering.
+
+### OSC 7501 troubleshooting
+
+Pi normally queries terminal support first and reports only after confirmation. `PI_PROGRAM_STATUS=1` skips the query; `PI_PROGRAM_STATUS=0` disables reporting. tmux and screen do not forward this protocol. In native Pi, `working` means a run/compaction is active, `blocked` means a dialog/login is open, `done`/`error` describe a settled run, and `idle` covers startup/cancellation. Reports contain session names, dialog titles, or the first error line, never prompts or model output. A `done` record does **not** mean the Pi process exited.
+
+If `subagent_message` refuses delivery because no trustworthy status exists:
+
+1. Let child startup/negotiation finish, then inspect the explicit target:
+   ```bash
+   rex block call -s "$REX_SESSION" -b CHILD_BLOCK_ID program_status
+   ```
+2. Check **the child Pi's** environment for `PI_PROGRAM_STATUS=0`, and whether a terminal proxy or unsupported reporter prevents OSC 7501. A parent's variable or a forced `1` is not proof of child safety. Check Rex connectivity if the query itself failed.
+3. Respect an intentional disablement. Interact with the child manually rather than bypassing the safety guard. The alternate `cli: claude` path has no Pi reporter supplied by this extension; steering is refused without trustworthy Pi status.
+4. If a blocked dialog is reported, resolve it in the child's pane. Ordinary editor waiting (including an orchestrator's `ask_question` reply) is not a blocked UI dialog and remains steerable.
+
+A refusal sends no paste/Enter and makes no configuration changes. There is no screen-text safety fallback or automatic status-enabling fix.
+
+### Compatibility evidence
+
+`npm run test:surface` includes source-loaded, **no-model** Pi smoke cases: native automatic detection, explicit status disablement, and conflicting rendering environment/settings. It loads `pi -ne -e <workspace>/pi-extension/subagents/index.ts` plus a test-only fixture composed of Pi's native Markdown/Text/Image widgets and a real Pi dialog. No custom renderer or OSC reporter is added to the runtime.
+
+On the tested Linux host with Pi **1.4.0** and Rex CLI/server **0.0.1793420730-g6d0d9a** (API revision **9**), observed checks include automatic Rex detection, link targets and exact RGB color retained in Rex HTML capture, a native PNG Kitty-graphics transmission in Pi's terminal write log, native `idle`/`blocked` reports after negotiation, and safe refusal with reporting disabled. Settings remained byte-for-byte unchanged. These are protocol/render-path observations, **not** a GUI pixel inspection, click-through test, or native macOS-host certification. See [the detailed evidence and operator checklist](docs/native-pi-rex-compatibility.md).
+
+Sources: Pi 1.4.0's [terminal setup](https://github.com/earendil-works/pi/blob/v1.4.0/packages/coding-agent/docs/terminal-setup.md), [environment variables](https://github.com/earendil-works/pi/blob/v1.4.0/packages/coding-agent/docs/environment-variables.md), and [settings](https://github.com/earendil-works/pi/blob/v1.4.0/packages/coding-agent/docs/settings.md); [Rex Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status).
+
+## Rex configuration & keyboard diagnostics
+
+**No custom `init.lua` is required.** Configuration belongs to the **Rex server host and its OS account**, not necessarily the machine running the GUI client. Linux and macOS resolve the file in this order:
+
+1. `REX_CONFIG`, if set in the **server process environment**;
+2. `$XDG_CONFIG_HOME/rex/init.lua`, if `XDG_CONFIG_HOME` is set;
+3. otherwise `~/.config/rex/init.lua`.
+
+Changing a variable in a Pi shell does not change an already-running server's environment. Rex does not watch file edits, and this extension does not edit configuration, rebind keys, reload the server, or spawn agent terminals from config-load Lua.
+
+Read-only diagnostics (no application of bindings):
+
+```bash
+rex config check --json           # local account's file, loaded by this CLI version
+rex config check /path/to/init.lua --json
+rex keymap --json                 # running server's config layer ONLY without --request
+```
+
+`config check` reports the resolved path, existence, bindings/removals/modes/actions, and diagnostics; errors return exit status 1. It **loads Lua**, so validate only trusted files, not arbitrary scripts with side effects. It does not reload the live server and cannot fully validate client-specific action names/unbindings. A different CLI/server version, environment, or unapplied edit can explain different results from `check` and `keymap`.
+
+**Only after an explicit operator decision**, on the server's own machine via its local socket, apply an edit with `rex config reload`. It notifies connected clients immediately; remote reload is refused. Generation advances even on a failed read, which retains the last successfully loaded bindings. Do not treat this as a startup step or run it merely to diagnose a problem.
+
+### Avoid stealing Pi's keys
+
+Rex resolves shortcut layers with highest priority first: **client-recorded shortcuts > server `init.lua` bindings > client-shipped defaults**. Key modes and sequence prefixes can consume the first key before Pi ever receives it, even if a longer sequence is never completed.
+
+Compare Pi's **`/hotkeys`** (active application/editor shortcuts) with Rex's bindings. On Linux/macOS, watch especially `Escape` (abort/cancel), `Ctrl+C` (copy/clear/exit depending on context), `Ctrl+D` (exit on an empty editor), `Shift+Enter`/`Ctrl+J` (newline), `Alt+Enter` (follow-up), `Ctrl+O` (tool expansion), and this extension's `Ctrl+Alt+O` (subagent tools widget). User/platform bindings can differ; `/hotkeys` is authoritative for the running Pi. Avoid assigning these keys as Rex actions or sequence prefixes unless intentionally intercepting them.
+
+**A bare `rex keymap` is not the GUI's full effective keymap**, and `-C` alone does not supply the GUI layers. If you have the actual client's `client.keymap` request, use `rex keymap --request client.json --json` (or `--request -`) to resolve its shipped defaults, declared actions, and recorded shortcuts with the server configuration. Bindings are listed top-of-stack first, mode-qualified where applicable. Otherwise inspect the GUI client's shortcut settings as well; do not conclude that a key reaches Pi just because a bare CLI query omits it. Make any rebinding/reload a separate explicit operator action.
+
+Sources: [Rex configuration](https://www.superlogical.com/rex/docs/customize/config), [shortcut resolution](https://www.superlogical.com/rex/docs/customize/keyboard-shortcuts#how-shortcuts-are-resolved), [sequence conflicts](https://www.superlogical.com/rex/docs/customize/key-sequences#binding-vs-sequence-conflict), current `rex config check --help`, `rex config reload --help`, `rex keymap --help`, and Pi [keybindings](https://github.com/earendil-works/pi/blob/v1.4.0/packages/coding-agent/docs/keybindings.md). Superlogical MCP is a documentation source, not a runtime dependency.
+
 ## Explicit Workspace-Source Startup
 
 To test or run the extension directly from workspace source with extension auto-discovery disabled:

@@ -481,6 +481,12 @@ export function sendLongCommand(
     mkdirSync(dirname(scriptPath), { recursive: true });
 
     const scriptParts = ["#!/bin/bash"];
+    // Rex launches through the server's login environment, not this Pi's env.
+    // Preserve explicit native choices verbatim; leave unset values to Pi/Rex
+    // detection and settings. Never force reporting or write Pi configuration.
+    for (const key of ["PI_PROGRAM_STATUS", "PI_HYPERLINKS", "PI_IMAGE_PROTOCOL", "PI_TRUE_COLOR"] as const) {
+      if (process.env[key] !== undefined) scriptParts.push(`export ${key}=${shellEscape(process.env[key]!)}`);
+    }
     if (options?.scriptPreamble) {
       scriptParts.push(options.scriptPreamble.trimEnd());
     }
@@ -678,6 +684,11 @@ export function sendEnterKeyEvent(blockId: string, session: string): void {
   }
 }
 
+const statusDiagnosticHint =
+  "Check the child Pi's PI_PROGRAM_STATUS (0 disables reports), allow startup negotiation to finish, " +
+  "and verify OSC 7501 support through the terminal path. If reporting is intentionally disabled " +
+  "or the CLI does not report Pi status, interact with the child manually; no input was sent.";
+
 export function validateTrustworthyProgramStatus(
   records: ProgramStatusRecord[],
   expectedApp = "pi",
@@ -685,7 +696,7 @@ export function validateTrustworthyProgramStatus(
   if (!Array.isArray(records) || records.length === 0) {
     return {
       ok: false,
-      error: "No program status records available; cannot verify safety before steering.",
+      error: `No program status records available; cannot verify safety before steering. ${statusDiagnosticHint}`,
     };
   }
 
@@ -727,7 +738,7 @@ export function validateTrustworthyProgramStatus(
   if (!validTarget) {
     return {
       ok: false,
-      error: `No trustworthy program status found confirming ${expectedApp} is running. Steering refused.`,
+      error: `No trustworthy program status found confirming ${expectedApp} is running. Steering refused. ${statusDiagnosticHint}`,
     };
   }
 
@@ -746,7 +757,7 @@ export function sendMessage(surface: string, message: string): void {
   try {
     records = queryProgramStatus(handle.blockId, handle.sessionId);
   } catch (error: any) {
-    throw new Error(`Cannot deliver message safely: unable to query program status (${error?.message})`);
+    throw new Error(`Cannot deliver message safely: unable to query program status (${error?.message}). Check Rex connectivity. ${statusDiagnosticHint}`);
   }
 
   const safety = validateTrustworthyProgramStatus(records, "pi");

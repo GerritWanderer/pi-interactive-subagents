@@ -4,7 +4,11 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import {
+  visibleWidth, detectCapabilities, getCapabilities, setCapabilityOverrides,
+  resetCapabilitiesCache, getTerminalColorMode, hyperlink,
+} from "@earendil-works/pi-tui";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -5972,6 +5976,151 @@ describe("Rex sizing lifecycle and bounded diagnostics", () => {
       restoreEnvVar("PI_SUBAGENT_SPLIT_DIRECTION", savedDirection);
     }
   });
+});
+
+describe("Pi 1.4 native Rex capability and status compatibility", () => {
+  const nativeKeys = ["PI_PROGRAM_STATUS", "PI_HYPERLINKS", "PI_IMAGE_PROTOCOL", "PI_TRUE_COLOR"] as const;
+  const terminalKeys = [...nativeKeys, "TERM_PROGRAM", "TERM", "COLORTERM", "TMUX"];
+  let saved: Array<[string, string | undefined]>;
+  beforeEach(() => {
+    saved = terminalKeys.map((key) => [key, process.env[key]]);
+    for (const key of terminalKeys) delete process.env[key];
+    process.env.TERM_PROGRAM = "rex";
+    process.env.TERM = "xterm-256color";
+    setCapabilityOverrides({});
+    resetCapabilitiesCache();
+  });
+  afterEach(() => {
+    for (const [key, value] of saved) restoreEnvVar(key, value);
+    setCapabilityOverrides({});
+    resetCapabilitiesCache();
+  });
+
+  it("uses native automatic Rex detection and auto overrides, not a second renderer", () => {
+    const expected = { images: "kitty", trueColor: true, hyperlinks: true };
+    assert.deepEqual(detectCapabilities(), expected);
+    process.env.PI_HYPERLINKS = "auto";
+    process.env.PI_IMAGE_PROTOCOL = "auto";
+    process.env.PI_TRUE_COLOR = "auto";
+    assert.deepEqual(detectCapabilities(), expected);
+    assert.equal(getTerminalColorMode(), "truecolor");
+    assert.match(hyperlink("Rex", "https://www.superlogical.com/rex"), /\x1b\]8;/);
+  });
+
+  it("honors native environment disablement and explicit image protocol selection", () => {
+    process.env.PI_HYPERLINKS = "0";
+    process.env.PI_IMAGE_PROTOCOL = "none";
+    process.env.PI_TRUE_COLOR = "0";
+    assert.deepEqual(detectCapabilities(), { images: null, trueColor: false, hyperlinks: false });
+    assert.equal(getTerminalColorMode(), "256color");
+    assert.equal(getCapabilities().hyperlinks, false);
+    process.env.PI_IMAGE_PROTOCOL = "iterm2";
+    assert.equal(detectCapabilities().images, "iterm2");
+  });
+
+  it("lets Pi settings override conflicting environment choices without writing settings", () => {
+    process.env.PI_HYPERLINKS = "1";
+    process.env.PI_IMAGE_PROTOCOL = "kitty";
+    process.env.PI_TRUE_COLOR = "1";
+    const settings = SettingsManager.inMemory({ terminal: { hyperlinks: false, images: false, trueColor: false } });
+    setCapabilityOverrides(settings.getTerminalCapabilityOverrides());
+    assert.deepEqual(getCapabilities(), { images: null, trueColor: false, hyperlinks: false });
+    // Auto settings defer to native environment/detection; they are not forced values.
+    const automatic = SettingsManager.inMemory({ terminal: { hyperlinks: "auto", images: "auto", trueColor: "auto" } });
+    setCapabilityOverrides(automatic.getTerminalCapabilityOverrides());
+    assert.deepEqual(getCapabilities(), { images: "kitty", trueColor: true, hyperlinks: true });
+  });
+
+  it("preserves explicit native overrides verbatim in server-launched wrappers and leaves auto unset", async () => {
+    const { registerSurfaceHandle, unregisterSurfaceHandle, sendLongCommand } = await import("../pi-extension/subagents/rex.ts");
+    const dir = createTestDir();
+    const id = "native-overrides";
+    __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+    __rexTest__.setCommandAvailabilityOverride(true);
+    __rexTest__.setRexExecutor(() => JSON.stringify({ window_id: "window:child", block_ids: ["block:child"] }));
+    try {
+      for (const explicit of [false, true]) {
+        registerSurfaceHandle({ id, kind: "tab", name: id, sessionId: "session:test", status: "reserved" });
+        if (explicit) {
+          process.env.PI_PROGRAM_STATUS = "0";
+          process.env.PI_HYPERLINKS = "0";
+          process.env.PI_IMAGE_PROTOCOL = "none";
+          // Do not interpret/execute unexpected values; let Pi handle them.
+          process.env.PI_TRUE_COLOR = "auto'; $(touch should-not-exist)";
+        }
+        const script = sendLongCommand(id, "exit 0", { scriptPath: join(dir, "launch.sh") });
+        const text = readFileSync(script, "utf8");
+        for (const key of nativeKeys) {
+          if (explicit) assert.ok(text.includes(`export ${key}=${shellEscape(process.env[key]!)}`));
+          else assert.equal(text.includes(key), false, "automatic detection must remain unset");
+        }
+        assert.equal(text.includes("PI_PROGRAM_STATUS=1"), false, "must not force status on");
+      }
+    } finally {
+      unregisterSurfaceHandle(id);
+      __rexTest__.setRexExecutor(null);
+      __rexTest__.setCommandAvailabilityOverride(undefined);
+      __rexTest__.setRexContextOverride(undefined);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of ["automatic-unavailable", "disabled", "forced-but-unavailable", "query-failed", "native-report"] as const) {
+    it(`uses the target's actual status for ${mode}, without changing Pi environment/settings`, async () => {
+      const { registerSurfaceHandle, unregisterSurfaceHandle, sendMessage } = await import("../pi-extension/subagents/rex.ts");
+      const dir = createTestDir();
+      const settingsFile = join(dir, "settings.json");
+      const settings = '{"terminal":{"hyperlinks":false,"images":false,"trueColor":false}}\n';
+      writeFileSync(settingsFile, settings);
+      const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = dir;
+      if (mode === "disabled" || mode === "native-report") process.env.PI_PROGRAM_STATUS = "0";
+      if (mode === "forced-but-unavailable") process.env.PI_PROGRAM_STATUS = "1";
+      const envBefore = { ...process.env };
+      const calls: string[][] = [];
+      const id = `native-status-${mode}`;
+      __rexTest__.setRexContextOverride({ session: "session:test", block: "block:anchor" });
+      __rexTest__.setCommandAvailabilityOverride(true);
+      __rexTest__.setRexExecutor((args) => {
+        calls.push(args);
+        if (args.at(-1) === "program_status") {
+          if (mode === "query-failed") throw new Error("server disconnected");
+          return JSON.stringify({ records: mode === "native-report" ? [
+            { state: "idle", app: "pi", updated_at: "2026-11-02T00:00:00Z" },
+          ] : [] });
+        }
+        return "{}";
+      });
+      registerSurfaceHandle({ id, kind: "tab", name: id, sessionId: "session:test", blockId: "block:child", status: "launched" });
+      try {
+        if (mode === "native-report") {
+          // The parent's disabled status is not evidence that the child's report is absent.
+          sendMessage(id, "/hotkeys");
+          assert.equal(calls.filter((args) => args.includes("block.event")).length, 2);
+        } else {
+          assert.throws(() => sendMessage(id, "do not submit"), (error: Error) => {
+            assert.match(error.message, /Cannot deliver message safely/);
+            assert.match(error.message, /PI_PROGRAM_STATUS \(0 disables reports\)/);
+            assert.match(error.message, /OSC 7501/);
+            assert.match(error.message, /interact with the child manually; no input was sent/);
+            return true;
+          });
+          assert.equal(calls.some((args) => args.includes("block.event")), false);
+        }
+        // An assertion failure must not dump unrelated provider credentials.
+        assert.ok(JSON.stringify({ ...process.env }) === JSON.stringify(envBefore), "adapter must not change process environment");
+        assert.equal(readFileSync(settingsFile, "utf8"), settings);
+        assert.equal(statSync(settingsFile).isFile(), true);
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", savedAgentDir);
+        unregisterSurfaceHandle(id);
+        __rexTest__.setRexExecutor(null);
+        __rexTest__.setCommandAvailabilityOverride(undefined);
+        __rexTest__.setRexContextOverride(undefined);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 describe("safe_bash tool", () => {
