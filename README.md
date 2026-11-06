@@ -66,7 +66,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Short descriptive label for the tab/pane and widget, e.g. `auth-token-refactor`. Always set it. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn |
+| `model` | string | agent's model | Override the model for this spawn. Empty or whitespace-only values use the agent's model. |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
 ### Messaging

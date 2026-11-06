@@ -1304,6 +1304,69 @@ describe("subagent discovery", () => {
     assert.equal(testApi.buildSubagentToolAllowlist(""), null);
   });
 
+  for (const { label, override, expectedModel } of [
+    { label: "an omitted override", override: undefined, expectedModel: "github-copilot/gpt-6.1-terra" },
+    { label: "an empty override", override: "", expectedModel: "github-copilot/gpt-6.1-terra" },
+    { label: "a whitespace-only override", override: " \t\n ", expectedModel: "github-copilot/gpt-6.1-terra" },
+    { label: "an explicit override", override: "github-copilot/gpt-6.1-sol", expectedModel: "github-copilot/gpt-6.1-sol" },
+    { label: "a padded override", override: "  github-copilot/gpt-6.1-sol  ", expectedModel: "github-copilot/gpt-6.1-sol" },
+    { label: "an unknown nonempty override", override: "missing-provider/unknown-model", expectedModel: "missing-provider/unknown-model" },
+  ]) {
+    it(`launch resolves the model override for ${label}`, async () => {
+      await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir, globalDir }) => {
+        writeAgentFile(projectAgentsDir, "model-routing-test-agent", [
+          "name: model-routing-test-agent",
+          "model: github-copilot/gpt-6.1-terra",
+          "thinking: high",
+          "tools: read",
+        ].join("\n"));
+        const parentSession = createSessionFile(projectDir, [SESSION_HEADER]);
+        const sessionDir = join(globalDir, "sessions");
+        const ctx = {
+          cwd: projectDir,
+          sessionManager: {
+            getSessionFile: () => parentSession,
+            getSessionId: () => "model-routing-parent",
+            getSessionDir: () => sessionDir,
+          },
+        };
+        __rexTest__.setCommandAvailabilityOverride(true);
+        __rexTest__.setRexContextOverride({ session: "session:model-routing", block: "block:anchor" });
+        __rexTest__.setRexExecutor((args) => {
+          if (args[0] === "window" && args[1] === "new") {
+            return JSON.stringify({ window_id: "window:model-routing", block_ids: ["block:model-routing"] });
+          }
+          if (args[0] === "split") return JSON.stringify({ block_ids: ["block:model-routing"] });
+          return "{}";
+        });
+        let running: any;
+        try {
+          running = await testApi.launchSubagent({
+            agent: "model-routing-test-agent",
+            name: "model-routing-test",
+            task: "Test model selection.",
+            ...(override === undefined ? {} : { model: override }),
+          }, ctx);
+          const loadout = readSubagentLoadout(running.sessionFile);
+          assert.ok(loadout);
+          assert.equal(loadout.model, expectedModel, "Snapshot must use the resolved model");
+          assert.equal(loadout.thinking, "high");
+          const script = readFileSync(running.launchScriptFile, "utf8");
+          assert.ok(script.includes(`--model ${shellEscape(`${expectedModel}:high`)}`), script);
+          const replay: string[] = [];
+          testApi.applySandboxToParts(replay, loadout, { artifactDir: sessionDir, name: "model-replay" });
+          assert.equal(replay[replay.indexOf("--model") + 1], shellEscape(`${expectedModel}:high`));
+        } finally {
+          if (running) testApi.runningSubagents.delete(running.id);
+          disposeRexSurfaces();
+          __rexTest__.setRexExecutor(null);
+          __rexTest__.setCommandAvailabilityOverride(undefined);
+          __rexTest__.setRexContextOverride(undefined);
+        }
+      });
+    });
+  }
+
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
     withTempDir((d) => {
       const parts: string[] = [];
