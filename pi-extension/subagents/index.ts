@@ -586,17 +586,26 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   return ` stalled${detail}${duration} `;
 }
 
+interface ResolvedModelSelection {
+  resolvedModel?: string;
+  resolvedThinking?: string;
+}
+
+function formatModelSelection(selection: ResolvedModelSelection): string {
+  return `Resolved model: ${selection.resolvedModel || "default"}. Thinking: ${selection.resolvedThinking || "default"}.`;
+}
+
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "outcome" | "error" | "observationFailure"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "outcome" | "error" | "observationFailure" | "resolvedModel" | "resolvedThinking"
   >,
   name: string,
 ): string {
   if (result.observationFailure === true) {
     return (
       `Sub-agent "${name}" failed (infrastructure observation failure).\n\n` +
-      `${result.summary}\n\n` +
+      `${result.summary}\n\n${formatModelSelection(result)}\n\n` +
       `The pane was kept open. Resume is blocked until the previous process is confirmed finished.`
     );
   }
@@ -605,8 +614,8 @@ function resolveResultPresentation(
   // blocks resume, but must not replace the actual result with observation loss.
   const resumeBlocked = result.sessionFile &&
     (lostObservationSessions.has(resolve(result.sessionFile)) || hasLostObservationMarker(result.sessionFile));
-  // Name is the persistent handle: the same name steers a running subagent or
-  // resumes a finished one, so safe follow-ups always reference it.
+  // The name is a persistent handle for active and finished sessions.
+  // Use that name for later messages.
   const sessionRef = resumeBlocked
     ? `\n\nResume is blocked until the previous process is confirmed finished.`
     : `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
@@ -619,14 +628,14 @@ function resolveResultPresentation(
     if (isCancelled) {
       return (
         `Sub-agent "${name}" was cancelled after ${formatElapsed(result.elapsed)}.\n\n` +
-        `The session data was preserved. ${resumeHint}`
+        `${formatModelSelection(result)}\n\nThe session data was preserved. ${resumeHint}`
       );
     }
     const detail = result.errorMessage ? `\n\n${result.errorMessage}` : "";
     return (
       `Sub-agent "${name}" was interrupted after ${formatElapsed(result.elapsed)} ` +
       `(pane closed externally before completion).${detail}\n\n` +
-      `The session data was preserved. ${resumeHint}`
+      `${formatModelSelection(result)}\n\nThe session data was preserved. ${resumeHint}`
     );
   }
 
@@ -638,21 +647,21 @@ function resolveResultPresentation(
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
-      `Error: ${result.errorMessage}\n\n` +
+      `Error: ${result.errorMessage}\n\n${formatModelSelection(result)}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new subagent` +
       (resumeBlocked ? `.${sessionRef}` : ` or resume the session with subagent_message.${sessionRef}`)
     );
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}\n\n${formatModelSelection(result)}${sessionRef}`
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
 }
 
 /**
  * Result from running a single subagent.
  */
-interface SubagentResult {
+interface SubagentResult extends ResolvedModelSelection {
   name: string;
   task: string;
   summary: string;
@@ -674,7 +683,7 @@ interface SubagentResult {
 /**
  * State for a launched (but not yet completed) subagent.
  */
-interface RunningSubagent {
+interface RunningSubagent extends ResolvedModelSelection {
   id: string;
   name: string;
   task: string;
@@ -1385,6 +1394,7 @@ export const __test__ = {
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
+  formatModelSelection,
   resolveResumeLaunchBehavior,
   runningSubagents,
   lostObservationSessions,
@@ -1484,9 +1494,6 @@ async function launchSubagent(
     const modeHint = agentDefs?.autoExit
       ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
       : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-    const summaryInstruction = agentDefs?.autoExit
-      ? "Your FINAL assistant message should summarize what you accomplished."
-      : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
     // An agent with a non-empty subagent_agents list is granted the spawning
     // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
     const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
@@ -1496,7 +1503,7 @@ async function launchSubagent(
     const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
     const fullTask = inheritsConversationContext
       ? params.task
-      : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+      : `${roleBlock}\n\n${modeHint}\n\n${params.task}`;
     // ── Claude Code CLI path ──
     if (agentDefs?.cli === "claude") {
       const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -1554,6 +1561,7 @@ async function launchSubagent(
         startTime,
         sessionFile: subagentSessionFile,
         launchScriptFile,
+        resolvedModel: effectiveModel,
         cli: "claude",
         sentinelFile,
         interactive: effectiveInteractive,
@@ -1697,6 +1705,8 @@ async function launchSubagent(
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
+      resolvedModel: effectiveModel,
+      resolvedThinking: effectiveModel ? effectiveThinking : undefined,
       activityFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
@@ -2186,7 +2196,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
-            const presentation = resolveResultPresentation(result, running.name);
+            const presentation = resolveResultPresentation({
+              ...result,
+              resolvedModel: running.resolvedModel,
+              resolvedThinking: running.resolvedThinking,
+            }, running.name);
 
             pi.sendMessage(
               {
@@ -2197,6 +2211,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   name: running.name,
                   task: running.task,
                   agent: running.agent,
+                  resolvedModel: running.resolvedModel ?? null,
+                  resolvedThinking: running.resolvedThinking ?? null,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
@@ -2215,9 +2231,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}\n\n${formatModelSelection(running)}`,
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                details: { name: running.name, task: running.task, error: err?.message,
+                  resolvedModel: running.resolvedModel ?? null, resolvedThinking: running.resolvedThinking ?? null },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -2229,7 +2246,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
+                `Sub-agent "${params.name}" launched and is now running in the background.\n\n${formatModelSelection(running)}\n\n` +
                 `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
                 `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
                 `Until then, move on to other work or tell the user you're waiting.`,
@@ -2240,6 +2257,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             name: params.name,
             task: params.task,
             agent: params.agent,
+            resolvedModel: running.resolvedModel ?? null,
+            resolvedThinking: running.resolvedThinking ?? null,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
             status: "started",
@@ -2628,6 +2647,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             task: message,
+            resolvedModel: loadout.model || undefined,
+            resolvedThinking: loadout.model ? loadout.thinking ?? undefined : undefined,
             surface,
             startTime,
             sessionFile: sessionPath,
@@ -2669,7 +2690,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                     ? `Resumed session exited with code ${result.exitCode}`
                     : "Resumed session exited without new output");
             const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
+              { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId,
+                resolvedModel: running.resolvedModel, resolvedThinking: running.resolvedThinking },
               name,
             );
 
@@ -2681,6 +2703,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: {
                   name,
                   task: message,
+                  resolvedModel: running.resolvedModel ?? null,
+                  resolvedThinking: running.resolvedThinking ?? null,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
@@ -2697,21 +2721,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
+                content: `Resume error: ${err?.message ?? String(err)}\n\n${formatModelSelection(running)}`,
                 display: true,
-                details: { name, error: err?.message },
+                details: { name, error: err?.message,
+                  resolvedModel: running.resolvedModel ?? null, resolvedThinking: running.resolvedThinking ?? null },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
           });
 
         return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
+          content: [{ type: "text", text: `Session "${name}" resumed.\n\n${formatModelSelection(running)}` }],
           details: {
             id,
             name,
             sessionId: resumedSessionId,
             sessionFile: sessionPath,
+            resolvedModel: running.resolvedModel ?? null,
+            resolvedThinking: running.resolvedThinking ?? null,
             launchScriptFile: running.launchScriptFile,
             status: "started",
           },

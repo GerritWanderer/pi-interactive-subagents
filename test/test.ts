@@ -1351,6 +1351,14 @@ describe("subagent discovery", () => {
           assert.ok(loadout);
           assert.equal(loadout.model, expectedModel, "Snapshot must use the resolved model");
           assert.equal(loadout.thinking, "high");
+          assert.equal(running.resolvedModel, expectedModel);
+          assert.equal(running.resolvedThinking, "high");
+          const contextDir = join(sessionDir, "artifacts", "model-routing-parent", "context");
+          const taskFile = readdirSync(contextDir).find((name) => name.endsWith(".md"));
+          assert.ok(taskFile);
+          const task = readFileSync(join(contextDir, taskFile), "utf8");
+          assert.ok(task.includes("Test model selection."));
+          assert.doesNotMatch(task, /Your FINAL assistant message/);
           const script = readFileSync(running.launchScriptFile, "utf8");
           assert.ok(script.includes(`--model ${shellEscape(`${expectedModel}:high`)}`), script);
           const replay: string[] = [];
@@ -1366,6 +1374,14 @@ describe("subagent discovery", () => {
       });
     });
   }
+
+  it("formats resolved launch settings without claiming a runtime selection", () => {
+    assert.equal(
+      testApi.formatModelSelection({ resolvedModel: "github-copilot/gpt-6.1-terra", resolvedThinking: "high" }),
+      "Resolved model: github-copilot/gpt-6.1-terra. Thinking: high.",
+    );
+    assert.equal(testApi.formatModelSelection({}), "Resolved model: default. Thinking: default.");
+  });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {
     withTempDir((d) => {
@@ -1407,7 +1423,7 @@ describe("subagent discovery", () => {
   // `--no-extensions` re-enables only extensions that back a whitelisted tool.
   // pi-anthropic-auth backs none: it wraps the Anthropic transport so a Claude
   // Pro/Max OAuth token bills against the subscription. Left out, an anthropic/
-  // child dies on its first provider request with "You're out of extra usage".
+  // child fails on its first provider request with an extra-usage error.
   function withAnthropicAuthConfigDir(
     credentials: unknown,
     run: (authExtPath: string) => void,
@@ -1677,9 +1693,8 @@ describe("subagent-done.ts", () => {
     });
 
     it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
+      // Auto-exit subagents stop after retry exhaustion so the parent gets the error.
+      // The separate error sidecar carries the detail. An open session would strand the worker.
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
     });
@@ -1845,7 +1860,7 @@ describe("subagent-done.ts", () => {
         assert.equal(payload.question, "Which API base URL?");
         assert.equal(payload.name, "scout-2");
         assert.equal(payload.agent, "scout");
-        // No .exit sidecar — the session is not exiting.
+        // No .exit sidecar. The session stays open.
         assert.ok(!existsSync(`${sessionFile}.exit`));
       } finally {
         restore();
@@ -1853,9 +1868,8 @@ describe("subagent-done.ts", () => {
       }
     });
 
-    // Regression tests for the mid-run reply race: a reply steered in while the
-    // asking run is still open fires `input` but NOT `agent_start`, so the flag
-    // must be cleared on `input` or the session parks forever.
+    // Regression tests cover a mid-run reply race. A reply can fire `input` before `agent_start`.
+    // Clear the flag on `input` or the session can wait forever.
     function setupCapturingExtension(sessionFile: string) {
       const handlers = new Map<string, Array<(...args: any[]) => void>>();
       const tools: any[] = [];
@@ -1917,7 +1931,7 @@ describe("subagent-done.ts", () => {
       try {
         emit("agent_start");
         await ask();
-        // No input yet — the orchestrator has not replied.
+        // No input yet. The orchestrator did not reply.
         let shutdown = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
         assert.equal(shutdown, false, "pending question with no reply must park, not exit");
@@ -1936,7 +1950,7 @@ describe("subagent-done.ts", () => {
         let shutdown1 = false;
         emit("agent_end", { messages: [] }, { shutdown() { shutdown1 = true; } });
         assert.equal(shutdown1, false, "parks while waiting");
-        // Reply arrives as a fresh turn after the subagent had parked.
+        // Reply arrives in a fresh turn after the subagent parks.
         emit("input");
         emit("agent_start");
         let shutdown2 = false;
@@ -2417,8 +2431,7 @@ describe("subagent interruption", () => {
     reserved.clear();
 
     try {
-      // Simulate the first parallel spawn reserving its default name before it
-      // has registered in runningSubagents.
+      // The first parallel spawn reserves its default name before registration.
       reserved.add(testApi.uniqueRunningName("scout")); // "scout"
       // The second spawn, running concurrently, must not reuse it.
       assert.equal(testApi.uniqueRunningName("scout"), "scout-2");
@@ -2687,6 +2700,26 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("includes resolved settings in other failure notices", () => {
+    const testApi = subagentsModule.__test__;
+    for (const extra of [
+      {},
+      { observationFailure: true },
+      { outcome: "interrupted" as const },
+      { outcome: "cancelled" as const },
+    ]) {
+      const presentation = testApi.resolveResultPresentation({
+        exitCode: 1,
+        elapsed: 10,
+        summary: "Synthetic failure",
+        resolvedModel: "github-copilot/test-model",
+        resolvedThinking: "high",
+        ...extra,
+      }, "worker");
+      assert.match(presentation, /Resolved model: github-copilot\/test-model\. Thinking: high\./);
+    }
+  });
+
   it("renders a clear provider/agent error when errorMessage is set", () => {
     // Previously, an overload retry-exhaustion produced exitCode 0 with a
     // stale summary — the orchestrator thought the subagent finished
@@ -2702,6 +2735,8 @@ describe("subagent interruption", () => {
         sessionFile: "/tmp/subagent.jsonl",
         sessionId: "019f-xyz",
         errorMessage: "Anthropic 529 Overloaded after 3 retries",
+        resolvedModel: "anthropic/test-model",
+        resolvedThinking: "high",
       },
       "Worker",
     );
@@ -2709,6 +2744,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(presentation, /Resolved model: anthropic\/test-model\. Thinking: high\./);
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
@@ -5188,6 +5224,9 @@ describe("rex.ts unit tests", () => {
           mockCtx,
         );
         assert.equal(resumeMsgRes.details?.status, "started");
+        assert.equal(resumeMsgRes.details?.resolvedModel, null);
+        assert.equal(resumeMsgRes.details?.resolvedThinking, null);
+        assert.match(resumeMsgRes.content[0].text, /Resolved model: default\. Thinking: default\./);
         assert.ok(resumeMsgRes.details?.launchScriptFile);
         resumedScriptContent = readFileSync(resumeMsgRes.details.launchScriptFile, "utf8");
         assert.ok(
