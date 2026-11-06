@@ -69,6 +69,10 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `model` | string | agent's model | Override the model for this spawn. Empty or whitespace-only values use the agent's model. |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
+Launch and resume acknowledgements show the resolved model and thinking level. Failure messages include the same settings. Tool result details expose them as `resolvedModel` and `resolvedThinking`.
+
+These are launch settings, not provider-confirmed runtime values. An unspecified setting appears as `default` in text and `null` in tool result details.
+
 ### Messaging
 
 `subagent_message` is addressed **by name only**. Names are unique per session and persist after a sub-agent finishes, so the same name works either way:
@@ -146,6 +150,8 @@ You are a specialized agent that does X...
 ### auto-exit
 
 With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
+
+The agent profile and caller define the final response format. The launch wrapper adds lifecycle instructions only. It does not append a separate accomplishment-summary instruction.
 
 Notes:
 
